@@ -75,9 +75,10 @@ fn oled_cmd(product_id: u16) -> u8 {
 pub struct USBDevice {
     /// An exclusive handle to the Keyboard.
     handle: HidDevice,
-    /// The OLED write command byte for Gen 3 (0x0C wired, 0x4C wireless dongle).
     /// The OLED protocol used by this device.
     protocol: DeviceProtocol,
+    /// The OLED write command byte for Gen 3 (0x0C wired, 0x4C wireless
+    /// dongle).
     oled_cmd: u8,
 }
 
@@ -119,17 +120,19 @@ impl USBDevice {
         Ok(())
     }
 
-    /// Convert the row-major Msb0 framebuffer to SSD1306-style page-major format
-    /// and send using the Gen 3 chunked protocol (8 × 641-byte feature reports).
+    /// Convert the row-major Msb0 framebuffer to SSD1306-style page-major
+    /// format and send using the Gen 3 chunked protocol (8 × 641-byte
+    /// feature reports).
     ///
     /// The FrameBuffer stores pixels as a BitArray<[u8; 642], Msb0> with a 0x61
     /// header byte. Each row is 16 bytes (128 pixels / 8 bits). The Gen 3 OLED
-    /// expects SSD1306 page-major format: 5 pages of 128 bytes, each byte holding
-    /// 8 vertical pixels (bit 0 = topmost).
+    /// expects SSD1306 page-major format: 5 pages of 128 bytes, each byte
+    /// holding 8 vertical pixels (bit 0 = topmost).
     ///
     /// The conversion transposes in 8×8 blocks: each iteration reads 8 source
-    /// bytes (one per row in the page, same column-group of 8 pixels) and produces
-    /// 8 destination bytes (one per column, each packing 8 vertical pixels).
+    /// bytes (one per row in the page, same column-group of 8 pixels) and
+    /// produces 8 destination bytes (one per column, each packing 8
+    /// vertical pixels).
     fn draw_gen3(&mut self, display: &FrameBuffer) -> Result<()> {
         let raw = display.framebuffer.as_raw_slice();
         let mut fb = [0u8; 640];
