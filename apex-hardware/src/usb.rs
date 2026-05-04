@@ -15,6 +15,7 @@ pub static STEELSERIES_VENDOR_ID: u16 = 0x1038;
 const OLED_SUBCMD: u8 = 0x01;
 const CHUNK_SIZE: usize = 80;
 const REPORT_SIZE: usize = 641;
+const APEX_PRO_GEN3_REPORT_SIZE: usize = 40 * 128 / 8 + 2;
 const CHUNK_OFFSETS: [u16; 8] = [
     0x0000, 0x0050, 0x00A0, 0x00F0, 0x0140, 0x0190, 0x01E0, 0x0230,
 ];
@@ -31,23 +32,33 @@ enum SupportedDevice {
     ApexPro = 0x1610,
     Apex7TKL = 0x1618,
     Apex5 = 0x161C,
+    ApexProGen3 = 0x1640,
     // Gen 3 devices
     ApexProTKLWirelessGen3 = 0x1646,
     ApexProTKLWirelessGen3Dongle = 0x1644,
 }
 
-/// Gen 3 devices use a different OLED interface and protocol
-fn is_gen3(product_id: u16) -> bool {
-    matches!(product_id, 0x1646 | 0x1644)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceProtocol {
+    Legacy,
+    ApexProGen3,
+    ChunkedGen3,
+}
+
+fn device_protocol(product_id: u16) -> DeviceProtocol {
+    match product_id {
+        0x1640 => DeviceProtocol::ApexProGen3,
+        0x1646 | 0x1644 => DeviceProtocol::ChunkedGen3,
+        _ => DeviceProtocol::Legacy,
+    }
 }
 
 /// Returns the correct HID interface number for the OLED on this device.
-/// Gen 3 devices use interface 3, older devices use interface 1.
+/// Wireless Gen 3 devices use interface 3, older devices use interface 1.
 fn oled_interface(product_id: u16) -> i32 {
-    if is_gen3(product_id) {
-        3
-    } else {
-        1
+    match device_protocol(product_id) {
+        DeviceProtocol::ChunkedGen3 => 3,
+        DeviceProtocol::Legacy | DeviceProtocol::ApexProGen3 => 1,
     }
 }
 
@@ -64,9 +75,9 @@ fn oled_cmd(product_id: u16) -> u8 {
 pub struct USBDevice {
     /// An exclusive handle to the Keyboard.
     handle: HidDevice,
-    /// Whether this is a Gen 3 device (uses chunked OLED protocol).
-    gen3: bool,
     /// The OLED write command byte for Gen 3 (0x0C wired, 0x4C wireless dongle).
+    /// The OLED protocol used by this device.
+    protocol: DeviceProtocol,
     oled_cmd: u8,
 }
 
@@ -85,6 +96,7 @@ impl USBDevice {
             .ok_or_else(|| anyhow!("No supported SteelSeries device found!"))?;
 
         let gen3 = is_gen3(device.product_id());
+        let protocol = device_protocol(device.product_id());
         let oled_cmd = oled_cmd(device.product_id());
 
         // This requires udev rules to be setup properly.
@@ -92,7 +104,7 @@ impl USBDevice {
 
         Ok(Self {
             handle,
-            gen3,
+            protocol,
             oled_cmd,
         })
     }
@@ -172,16 +184,47 @@ impl USBDevice {
 
         Ok(())
     }
+
+    /// Early Gen 3 firmware keeps the single-report transport but expects
+    /// SSD1306 page-major bytes instead of the row-major in-memory framebuffer.
+    fn encode_apex_pro_gen3_report(display: &FrameBuffer) -> [u8; APEX_PRO_GEN3_REPORT_SIZE] {
+        let mut report = [0u8; APEX_PRO_GEN3_REPORT_SIZE];
+        report[0] = 0x61;
+
+        for y in 0..40 {
+            let page = (y / 8) as usize;
+            let bit = (y % 8) as u8;
+            let mask = 1u8 << bit;
+
+            for x in 0..128 {
+                let src_index = 8 + (y * 128 + x) as usize;
+                if display
+                    .framebuffer
+                    .get(src_index)
+                    .map(|bit| *bit)
+                    .unwrap_or(false)
+                {
+                    let dst_index = 1 + page * 128 + x as usize;
+                    report[dst_index] |= mask;
+                }
+            }
+        }
+
+        report
+    }
 }
 
 impl Device for USBDevice {
     fn draw(&mut self, display: &FrameBuffer) -> Result<()> {
-        if self.gen3 {
-            self.draw_gen3(display)
-        } else {
-            Ok(self
+        match self.protocol {
+            DeviceProtocol::Legacy => Ok(self
                 .handle
-                .send_feature_report(display.framebuffer.as_raw_slice())?)
+                .send_feature_report(display.framebuffer.as_raw_slice())?),
+            DeviceProtocol::ApexProGen3 => {
+                let report = Self::encode_apex_pro_gen3_report(display);
+                Ok(self.handle.send_feature_report(&report)?)
+            }
+            DeviceProtocol::ChunkedGen3 => self.draw_gen3(display),
         }
     }
 
