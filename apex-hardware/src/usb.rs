@@ -96,7 +96,6 @@ impl USBDevice {
             })
             .ok_or_else(|| anyhow!("No supported SteelSeries device found!"))?;
 
-        let gen3 = is_gen3(device.product_id());
         let protocol = device_protocol(device.product_id());
         let oled_cmd = oled_cmd(device.product_id());
 
