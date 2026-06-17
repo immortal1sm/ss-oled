@@ -153,10 +153,14 @@ You may change sources by pressing **Alt+Shift+A** or **Alt+Shift+D** (This migh
 
 ## Autostarting
 
+Hotkey support requires autostarting under an interactive daemon, i.e. by your Desktop Environment. You can also build without the `hotkey` feature and run it as a systemd service.
+
+### Desktop Environment
+
 To start on boot the binary must be started under an interactive daemon, i.e. by your Desktop Environment. A systemd service will fail unless compiled without hotkey support. Most DEs support the following method/path but you may have to find your equivalent.
 
--Create `apex-tux.desktop` in `~/.config/autostart`  
--Edit `apex-tux.desktop` to contain:
+- Create `apex-tux.desktop` in `~/.config/autostart`  
+- Edit `apex-tux.desktop` to contain:
 ```shell
 [Desktop Entry]
 Exec=/path/to/apex-tux/apex-tux
@@ -165,6 +169,29 @@ Path=/path/to/apex-tux
 Terminal=true
 Type=Application
 ```
+- Replace path to the apex-tux executable accordingly
+
+### Systemd service
+
+- Create `apex-tux.service` in `/lib/systemd/system/`
+- Edit `apex-tux.service` to contain:
+```ini
+[Unit]
+Description=Linux support for the Apex series OLED screens
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash -c '( cd /path/to/apex-tux; /path/to/apex-tux/target/release/apex-tux ; )'
+Restart=on-abort
+User=YOUR_USERNAME
+
+[Install]
+WantedBy=multi-user.target
+```
+- Replace `YOUR_USERNAME` and `/path/to/apex-tux` path accordingly
+- Enable and start the systemd service by running: `systemctl enable --now apex-tux.service`
+
 
 ## Development
 
