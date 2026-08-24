@@ -3,7 +3,7 @@
 //! covers days 1..=5.
 
 use crate::{
-    providers::weather_data::WeatherCache,
+    providers::weather_data::{Units, WeatherCache},
     render::{
         display::ContentProvider,
         scheduler::{ContentWrapper, FocusChannel, CONTENT_PROVIDERS},
@@ -37,6 +37,7 @@ const SLIDE_STEP_W: i32 = 128 / SLIDE_STEPS as i32; // px per slide frame
 
 struct Forecast {
     cache: std::sync::Arc<WeatherCache>,
+    units: Units,
 }
 
 fn day_name(days_ahead: usize) -> &'static str {
@@ -55,6 +56,7 @@ fn render_day(
     days: &[crate::providers::weather_data::DayForecast],
     idx: usize,
     offset_x: i32,
+    unit_sym: &str,
 ) -> Result<()> {
     let day = match days.get(idx) {
         Some(d) => d,
@@ -77,11 +79,11 @@ fn render_day(
 
     // Hi temp: right column, starts near top. FONT_10X20 renders ~20px tall.
     let tx = 46 + offset_x;
-    let hi = format!("{:.0}\u{00B0}C", day.temp_max);
+    let hi = format!("{:.0}{}", day.temp_max, unit_sym);
     Text::with_baseline(&hi, Point::new(tx, 1), big, Baseline::Top).draw(buffer)?;
 
     // Lo temp directly below hi (y=22..31)
-    let lo = format!("{:.0}\u{00B0}C", day.temp_min);
+    let lo = format!("{:.0}{}", day.temp_min, unit_sym);
     Text::with_baseline(&lo, Point::new(tx, 22), small, Baseline::Top).draw(buffer)?;
 
     // Precip chance on same band as lo, to its right ("72%" ≈ 18px wide,
@@ -129,7 +131,13 @@ impl Forecast {
         let mut buffer = FrameBuffer::new();
         if let Some(data) = self.cache.get() {
             if data.days.len() > 1 {
-                render_day(&mut buffer, &data.days, page + 1, slide_offset.unwrap_or(0))?;
+                render_day(
+                    &mut buffer,
+                    &data.days,
+                    page + 1,
+                    slide_offset.unwrap_or(0),
+                    self.units.symbol(),
+                )?;
             }
         }
         Ok(buffer)
@@ -154,10 +162,22 @@ impl Forecast {
             let out_off = -progress * step_w;
             let in_off = 128 - progress * step_w;
             if out_off > -128 {
-                render_day(&mut buffer, &data.days, out_page + 1, out_off)?;
+                render_day(
+                    &mut buffer,
+                    &data.days,
+                    out_page + 1,
+                    out_off,
+                    self.units.symbol(),
+                )?;
             }
             if in_off < 128 {
-                render_day(&mut buffer, &data.days, in_page + 1, in_off)?;
+                render_day(
+                    &mut buffer,
+                    &data.days,
+                    in_page + 1,
+                    in_off,
+                    self.units.symbol(),
+                )?;
             }
         }
         Ok(buffer)
@@ -229,5 +249,6 @@ fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn
             .map_err(|e| anyhow::anyhow!("forecast config error: {}", e))?,
     );
 
-    Ok(Box::new(Forecast { cache }))
+    let units = Units::from_config(config);
+    Ok(Box::new(Forecast { cache, units }))
 }
