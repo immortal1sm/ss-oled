@@ -331,29 +331,17 @@ impl ContentProvider for MediaPlayerBuilder {
 
                 while let Some(event) = tracker.next().await {
                     log::debug!("MPRIS event: {:?}", event);
-                    // React to MPRIS events. Only fire focus on transitions INTO
-                    // Playing — pause and stop do NOT pull focus (the scheduler
-                    // keeps whatever provider was active and rotates normally).
+                    // React to MPRIS events. Fire focus on ANY PropertiesChanged
+                    // signal — covers track-change, play, pause, and stop. The
+                    // scheduler pulls the OLED to MPRIS so the user can always
+                    // see the current track state without waiting for the
+                    // rotation timer.
                     if matches!(event, apex_music::PlayerEvent::Properties) {
-                        log::info!("MPRIS PropertiesChanged received");
-                        // PropertiesChanged covers track-change AND playback-status
-                        // changes. Check the current status and only fire if we're
-                        // transitioning into Playing.
-                        match player.playback_status().await {
-                            Ok(PlaybackStatus::Playing) => {
-                                log::info!("Status is Playing — sending focus request");
-                                let send_result = focus_tx.send(
-                                    crate::render::scheduler::ProviderWantsFocus
-                                );
-                                log::info!("focus_tx.send result: {:?}", send_result);
-                            }
-                            Ok(other) => {
-                                log::info!("Status is {:?} — skipping focus", other);
-                            }
-                            Err(e) => {
-                                log::warn!("Could not get playback_status: {}", e);
-                            }
-                        }
+                        log::info!("MPRIS PropertiesChanged received — sending focus");
+                        let send_result = focus_tx.send(
+                            crate::render::scheduler::ProviderWantsFocus
+                        );
+                        log::info!("focus_tx.send result: {:?}", send_result);
                     }
 
                     if let Ok(progress) = player.progress().await {
