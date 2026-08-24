@@ -51,10 +51,42 @@ impl Condition {
 
 #[derive(Debug, Clone)]
 pub struct DayForecast {
+    /// ISO date "YYYY-MM-DD" from the API.
+    pub date: String,
     pub condition: Condition,
     pub temp_max: f64,
     pub temp_min: f64,
     pub precip_prob: i64,
+}
+
+impl DayForecast {
+    /// Short day-of-week label: M|T|W|TH|F|ST|S (per user's request).
+    /// Computed locally from the ISO date — no timezone conversion needed
+    /// since the API already returns dates in the requested tz.
+    pub fn day_label(&self) -> &'static str {
+        // Parse Y-M-D and compute weekday via the civil-date algorithm.
+        let mut parts = self.date.split('-');
+        let y: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let m: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let d: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+
+        // Zeller-ish: Sakamoto's algorithm.
+        let t: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+        let y_adj = if m < 3 { y - 1 } else { y };
+        let wd =
+            (y_adj + y_adj / 4 - y_adj / 100 + y_adj / 400 + t[(m - 1) as usize] + d as i32) % 7;
+        let wd = if wd < 0 { wd + 7 } else { wd };
+        // 0=Sunday..6=Saturday
+        match wd {
+            0 => "S",
+            1 => "M",
+            2 => "T",
+            3 => "W",
+            4 => "TH",
+            5 => "F",
+            _ => "ST",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +197,7 @@ impl WeatherCache {
             {
                 for i in 0..times.len() {
                     out.days.push(DayForecast {
+                        date: times[i].as_str().unwrap_or_default().to_string(),
                         condition: codes[i]
                             .as_i64()
                             .map(Condition::from_wmo)
