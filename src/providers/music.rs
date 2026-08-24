@@ -331,13 +331,16 @@ impl ContentProvider for MediaPlayerBuilder {
 
                 while let Some(event) = tracker.next().await {
                     log::debug!("MPRIS event: {:?}", event);
-                    // React to MPRIS events. Fire focus on ANY PropertiesChanged
-                    // signal — covers track-change, play, pause, and stop. The
-                    // scheduler pulls the OLED to MPRIS so the user can always
-                    // see the current track state without waiting for the
-                    // rotation timer.
-                    if matches!(event, apex_music::PlayerEvent::Properties) {
-                        log::info!("MPRIS PropertiesChanged received — sending focus");
+                    // React to MPRIS events. We fire focus on PropertiesChanged
+                    // AND Seeked. The latter catches cases where Firefox
+                    // publishes Seeked without a corresponding PropertiesChanged
+                    // (rare but happens). Timer events don't fire focus.
+                    if matches!(
+                        event,
+                        apex_music::PlayerEvent::Properties
+                            | apex_music::PlayerEvent::Seeked
+                    ) {
+                        log::info!("MPRIS event fired: {:?}", event);
                         let send_result = focus_tx.send(
                             crate::render::scheduler::ProviderWantsFocus
                         );

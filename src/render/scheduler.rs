@@ -271,7 +271,11 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                 // OLED sits on MPRIS for its full 30s dwell
                                 // before rotating away.
                                 *time_last_change.borrow_mut() = Instant::now();
-                                log::info!("Provider focused: mpris2 (was idx {})", active_idx);
+                                log::info!(
+                                    "Provider focused: mpris2 (was idx {}, name={})",
+                                    active_idx,
+                                    provider_names.get(active_idx).map(String::as_str).unwrap_or("?")
+                                );
                             } else {
                                 // No-op: already showing mpris2. We intentionally
                                 // log this at INFO so that running
@@ -307,6 +311,22 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                             .map(String::as_str)
                             .unwrap_or("");
                         let interval_secs = Self::interval_for(&config, active_name);
+
+                        // Heartbeat every 5 seconds: log the current active
+                        // provider so the user can verify which provider is
+                        // currently on the OLED without staring at it.
+                        if elapsed_time.as_secs() % 5 == 0
+                            && elapsed_time.as_millis() % 1000 < 100
+                        {
+                            log::debug!(
+                                "Currently showing {} (idx {}), {}s of {}s elapsed",
+                                active_name,
+                                active_idx,
+                                elapsed_time.as_secs(),
+                                interval_secs
+                            );
+                        }
+
                         if interval_secs > 0
                             && elapsed_time > Duration::from_secs(interval_secs)
                         {
