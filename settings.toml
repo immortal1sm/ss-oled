@@ -1,51 +1,48 @@
+# apex-tux / ss-oled settings example
+#
+# This file lives at ~/.config/apex-tux/settings.toml on the host.
+# apex-tux looks for it there first, then in the current working directory.
+#
+# You can also override individual settings with APEX_<SECTION>__<KEY>
+# environment variables (double underscore between section and key).
+
 [interval]
-# The interval at which the screen should automatically change
-# set to 0 if you don't want it to change automatically
-refresh=45
+# Global default: how long each provider sits on the OLED before rotating
+# to the next one (in seconds). Set to 0 to disable auto-rotation entirely.
+refresh = 30
+
+# Per-provider overrides (optional). Lower values = shorter dwell.
+# The clock lives on the system tray already, so it gets only a quick glance.
+# clock = 5
 
 [clock]
 enabled = true
-# Set this to the highest priority so it will start with the clock
-# priority = 1
-# Enables a twelve hour clock instead of the 24hr one
-# Defaults to your local format if unset
-# twelve_hour = false
+priority = 3                  # shown last in the rotation order
+twelve_hour = false           # 24h format; set true for AM/PM
 
 [mpris2]
 enabled = true
-# Set this so web browsers like Firefox or Chrome don't steal the focus of your real music player
-# You can check what to put here by using tools like D-Feet
-# preferred_player = "Lollypop"
-
-[coindesk]
-enabled = true
-# Valid choices are "gbp", "usd" and "eur"
-# Default is USD
-currency = "eur"
+priority = 1                  # shown first — most useful info on the OLED
+# preferred_player omitted → auto-pick whichever MPRIS publisher appears first
+# preferred_player = "spotify"
 
 [sysinfo]
 enabled = true
-# The polling interval for system stats in milliseconds.
-polling_interval = 1500
-# The maximum value for the net I/O stat bar (in MiB), used for scaling its fill
-# net_load_max = 100
-# The maximum value for the cpu frequency stat bar (in GHz), used for scaling its fill
-# cpu_frequency_max = 7
-# The maximum value for the temperature stat bar (in degC), used for scaling its fill
-# temperature_max = 100
-# Network interface name used in network I/O stat bar
-# To find values for this config in Linux, use the `ip link` command
-# net_interface_name = "eth0"
-# sensor name used in temperature stat bar
-# To find values for this config in Linux, use the `sensors` command
-# sensor_name = "asus_wmi_sensors CPU Temperature"
+priority = 2
+polling_interval = 1500       # ms between CPU/RAM/NET polls
+net_load_max = 100            # MiB/s, scales the network bar fill
+cpu_frequency_max = 5         # GHz, scales CPU frequency bar fill
+temperature_max = 95          # °C, scales the temperature bar fill
+net_interface_name = "enp6s0" # use `ip link` to find yours
+sensor_name = "coretemp Package id 0"  # use `sensors` to find yours
 
 [image]
+# Static or animated GIF displayed as one of the cycling providers.
+# Requires the binary to be built with `--features image`.
 enabled = true
-# /!\
-# Please note that it is a relative path, so once compiled, please 
-# copy the images folder to the current directory
 path = "images/sample_1.gif"
-# This only works if the image feature is passed in the build instructions
-# It supports all those formats : https://github.com/image-rs/image/tree/8824ab3375ddab0fd3429fe3915334523d50c532#supported-image-formats
-# (even in color, but it will only display in black and white)
+
+# NOTE: The MPRIS2 provider renders title (top), artist (second row), and an
+# elapsed/total timer centered between artist and the progress bar at the
+# bottom. Position/Length data comes from MPRIS; if a player doesn't publish
+# track length (e.g. Telegram), only elapsed time is shown.
