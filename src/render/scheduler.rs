@@ -273,7 +273,11 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                 *time_last_change.borrow_mut() = Instant::now();
                                 log::info!("Provider focused: mpris2 (was idx {})", active_idx);
                             } else {
-                                log::debug!("Focus requested but already on mpris2 (no-op)");
+                                // No-op: already showing mpris2. We intentionally
+                                // log this at INFO so that running
+                                // `journalctl --user -u apex-tux -f` shows a
+                                // heartbeat that events are arriving.
+                                log::info!("Focus event on mpris2 (already showing, no-op)");
                             }
                             // Note: we intentionally do NOT reset the dwell
                             // timer when already on mpris2. This lets the
