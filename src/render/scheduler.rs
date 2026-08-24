@@ -243,6 +243,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     }
                 }
                 focus_event = focus_rx.recv() => {
+                    log::info!("Scheduler received focus event: {:?}", focus_event);
                     // A provider asked for focus. Find it by name and jump to it.
                     // The current provider index points into the sorted providers
                     // list; we look up the mpris2 provider's position and set
@@ -260,8 +261,14 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                 *time_last_change.borrow_mut() = Instant::now();
                                 let _ = self.device.clear().await;
                                 info!("Provider focused: mpris2 (was idx {})", active_idx);
+                            } else {
+                                log::info!("Focus requested but already on mpris2");
                             }
+                        } else {
+                            log::warn!("Focus requested but mpris2 not in providers list");
                         }
+                    } else {
+                        log::warn!("Focus event recv error: {:?}", focus_event);
                     }
                 }
                 _ = change.tick() => {
