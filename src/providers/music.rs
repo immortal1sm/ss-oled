@@ -164,14 +164,18 @@ pub struct MediaPlayerRenderer {
 
 impl MediaPlayerRenderer {
     fn new() -> Result<Self> {
-        // Title sits at the top (y=3..13, 10px FONT_6X10).
-        // Artist is dropped further down (y=20..30) for visual separation
-        // — when the artist name is the same length as the title, having
-        // them tight makes them read as one block.
+        // Layout (y coordinates, top-down):
+        //   y=3  ..13   title (FONT_6X10, 10px tall)
+        //   y=13 ..16   3px gap — clearly separates title from artist
+        //   y=16 ..26   artist (FONT_6X10, 10px tall)
+        //   y=26 ..27   1px gap
+        //   y=27 ..33   timer row (FONT_4X6, 6px tall, drawn by update())
+        //   y=34 ..39   progress bar template (5px tall, with 1px line at y=39)
+        // The icon is at x=5..13, so text columns start at x=5+3+24=32.
         let artist = ScrollableBuilder::new()
             .with_text(UNKNOWN_ARTIST)
             .with_custom_spacing(10)
-            .with_position(Point::new(5 + 3 + 24, 20))
+            .with_position(Point::new(5 + 3 + 24, 16))
             .with_projection(Size::new(16 * 6, 10));
         let title = ScrollableBuilder::new()
             .with_text(UNKNOWN_TITLE)
@@ -212,12 +216,19 @@ impl MediaPlayerRenderer {
                 .into_styled(style)
                 .draw(&mut display)?;
 
-            // ----- timer row (NEW) -----
-            // Show "elapsed / total" centered between the artist row
-            // (ends ~y=23) and the progress bar at y=35. Y baseline 25 puts
-            // the 6px FONT_4X6 in the band y=25..31, leaving 4px before
-            // the progress bar.
-            let elapsed_us = progress.position.max(0) as u64;
+            // ----- timer row -----
+            // Positioned at y=27..33 — 1px below artist (y=16..26) and 1px
+            // above progress bar bracket (y=34..39).
+            //
+            // When playback status is Stopped, force elapsed to 0 so the
+            // timer doesn't keep ticking up using stale position data. Some
+            // players (Firefox in particular) keep reporting the last-known
+            // position even when the player is fully stopped, which would
+            // otherwise show the timer advancing on a stopped track.
+            let elapsed_us = match progress.status {
+                PlaybackStatus::Stopped => 0,
+                _ => progress.position.max(0) as u64,
+            };
             let total_us = metadata.length().unwrap_or(0);
             let timer_text = if total_us > 0 {
                 format!("{} / {}", format_mmss(elapsed_us), format_mmss(total_us))
@@ -232,7 +243,7 @@ impl MediaPlayerRenderer {
             let timer_x = (128 - text_width) / 2;
             Text::with_baseline(
                 &timer_text,
-                Point::new(timer_x, 25),
+                Point::new(timer_x, 27),
                 timer_style,
                 Baseline::Top,
             )
