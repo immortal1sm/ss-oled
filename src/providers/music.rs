@@ -22,7 +22,7 @@ use apex_music::{AsyncPlayer, Metadata, PlaybackStatus, Progress};
 use config::Config;
 use embedded_graphics::{
     mono_font::{iso_8859_15, MonoTextStyle},
-    text::{Baseline, Text},
+    text::{renderer::TextRenderer, Baseline, Text},
 };
 use futures::StreamExt;
 use std::{
@@ -111,6 +111,15 @@ static UNKNOWN_ARTIST: &str = "Unknown artist";
 
 const RECONNECT_DELAY: u64 = 5;
 
+/// Format a microsecond count (as returned by MPRIS `Position` and
+/// `mpris:length`) as `M:SS`. Returns `"0:00"` for zero or negative values.
+fn format_mmss(us: u64) -> String {
+    let total_secs = us / 1_000_000;
+    let minutes = total_secs / 60;
+    let seconds = total_secs % 60;
+    format!("{minutes}:{seconds:02}")
+}
+
 #[distributed_slice(CONTENT_PROVIDERS)]
 static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper>> =
     register_callback;
@@ -182,17 +191,48 @@ impl MediaPlayerRenderer {
 
         #[cfg(not(target_os = "windows"))]
         {
+            // ----- progress bar (unchanged position) -----
             let length = metadata.length().unwrap_or(0) as f64;
 
-            let current = progress.position as f64;
+            let current = progress.position.max(0) as f64;
 
-            let completion = (current / length).clamp(0_f64, 1_f64);
+            let completion = if length > 0.0 {
+                (current / length).clamp(0_f64, 1_f64)
+            } else {
+                0_f64
+            };
 
             let pixels = (128_f64 - 2_f64 * 3_f64) * completion;
             let style = PrimitiveStyle::with_stroke(BinaryColor::On, 3);
             Line::new(Point::new(3, 35), Point::new(pixels as i32 + 3, 35))
                 .into_styled(style)
                 .draw(&mut display)?;
+
+            // ----- timer row (NEW) -----
+            // Show "elapsed / total" centered between the artist row
+            // (ends ~y=23) and the progress bar at y=35. Y baseline 25 puts
+            // the 6px FONT_4X6 in the band y=25..31, leaving 4px before
+            // the progress bar.
+            let elapsed_us = progress.position.max(0) as u64;
+            let total_us = metadata.length().unwrap_or(0);
+            let timer_text = if total_us > 0 {
+                format!("{} / {}", format_mmss(elapsed_us), format_mmss(total_us))
+            } else {
+                // Some players (Telegram, certain browser tabs) don't publish
+                // a track length. Show just the elapsed time.
+                format_mmss(elapsed_us)
+            };
+            let timer_style = MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On);
+            let metrics = timer_style.measure_string(&timer_text, Point::zero(), Baseline::Top);
+            let text_width = metrics.bounding_box.size.width as i32;
+            let timer_x = (128 - text_width) / 2;
+            Text::with_baseline(
+                &timer_text,
+                Point::new(timer_x, 25),
+                timer_style,
+                Baseline::Top,
+            )
+            .draw(&mut display)?;
         }
 
         let artists = metadata.artists()?;
