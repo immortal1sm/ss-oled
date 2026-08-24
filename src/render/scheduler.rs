@@ -121,7 +121,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
 
         pin_mut!(rx);
 
-        let (providers, errors): (Vec<_>, Vec<_>) = providers
+        let (named_providers, errors): (Vec<_>, Vec<_>) = providers
             .iter_mut()
             .map(|i| (i.provider_name(), i.proxy_stream()))
             .filter(|(name, _)| {
@@ -131,11 +131,18 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             .map(|(name, i)| {
                 let key = format!("{name}.priority");
                 let prio = config.get_int(&key).unwrap_or(99i64);
-                (name, i, prio)
+                (name.to_string(), i, prio)
             })
             .sorted_by_key(|(_, _, prio)| *prio)
             .map(|(name, i, _)| {
-                i.map_err(|e| anyhow!("Failed to initialize provider: {}. Error: {}", name, e))
+                let name_for_err = name.clone();
+                i.map(|stream| (name, stream)).map_err(|e| {
+                    anyhow!(
+                        "Failed to initialize provider: {}. Error: {}",
+                        name_for_err,
+                        e
+                    )
+                })
             })
             .partition_result();
 
@@ -143,8 +150,15 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             error!("{e}");
         }
 
-        let providers = providers
+        // Split names from streams so we can keep them parallel for per-provider
+        // interval lookups in the change-tick arm.
+        let provider_names: Vec<String> = named_providers
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let providers = named_providers
             .into_iter()
+            .map(|(_, stream)| stream)
             .map(Box::into_pin)
             .map(StreamExt::fuse)
             .collect::<Vec<_>>();
@@ -153,11 +167,13 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
 
         let mut y = multiplex(providers, move || z.load(Ordering::SeqCst));
 
-        //get the interval
-        let interval_between_change = config.get_int("interval.refresh").unwrap_or(30);
-        //flag to know if auto changer is enabled
-        let is_auto_change_enabled = interval_between_change != 0;
-        //the interval to check wether to change the screen or not
+        // Flag to know if auto-change is enabled at all. With per-provider
+        // intervals, "enabled" means any provider has a non-zero interval set.
+        // If everything is 0, we skip the tick to save CPU.
+        let is_auto_change_enabled = config
+            .get_int("interval.refresh")
+            .map(|v| v != 0)
+            .unwrap_or(true);
         let mut change = time::interval(Duration::from_secs(if is_auto_change_enabled {
             1
         } else {
@@ -205,12 +221,23 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                 }
                 _ = change.tick() => {
                     if is_auto_change_enabled {
-                        //get the time since the last update
                         let current_time = Instant::now();
                         let elapsed_time = current_time - *time_last_change.borrow();
-                        //if the last update is over the choosen interval
-                        if elapsed_time > Duration::from_secs(interval_between_change as u64) {
-                            //change the screen
+                        // Look up the dwell time for the CURRENT provider, not a
+                        // global value. Priority of lookup:
+                        //   1. `interval.<provider_name>` (e.g. `interval.clock`)
+                        //   2. `interval.refresh` (global fallback)
+                        // If the resolved interval is 0, that provider is treated
+                        // as "manual only" — never auto-rotated away.
+                        let active_idx = current.load(Ordering::SeqCst);
+                        let active_name = provider_names
+                            .get(active_idx)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let interval_secs = Self::interval_for(&config, active_name);
+                        if interval_secs > 0
+                            && elapsed_time > Duration::from_secs(interval_secs)
+                        {
                             let _ = tx.send(Command::NextSource);
                         }
                     }
@@ -221,5 +248,30 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         self.device.clear().await?;
         self.device.shutdown().await?;
         Ok(())
+    }
+
+    /// Look up the dwell time for a provider, in seconds.
+    ///
+    /// Precedence:
+    /// 1. `interval.<provider_name>` (e.g. `interval.clock = 5`)
+    /// 2. `interval.refresh` (global fallback)
+    /// 3. 30 seconds (hard-coded default if neither key exists)
+    ///
+    /// A value of 0 means "do not auto-rotate this provider away".
+    fn interval_for(config: &Config, provider_name: &str) -> u64 {
+        let key = format!("interval.{provider_name}");
+        config
+            .get_int(&key)
+            .ok()
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64)
+            .or_else(|| {
+                config
+                    .get_int("interval.refresh")
+                    .ok()
+                    .filter(|v| *v >= 0)
+                    .map(|v| v as u64)
+            })
+            .unwrap_or(30)
     }
 }
