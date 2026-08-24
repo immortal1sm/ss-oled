@@ -164,10 +164,14 @@ pub struct MediaPlayerRenderer {
 
 impl MediaPlayerRenderer {
     fn new() -> Result<Self> {
+        // Title sits at the top (y=3..13, 10px FONT_6X10).
+        // Artist is dropped further down (y=20..30) for visual separation
+        // — when the artist name is the same length as the title, having
+        // them tight makes them read as one block.
         let artist = ScrollableBuilder::new()
             .with_text(UNKNOWN_ARTIST)
             .with_custom_spacing(10)
-            .with_position(Point::new(5 + 3 + 24, 3 + 10))
+            .with_position(Point::new(5 + 3 + 24, 20))
             .with_projection(Size::new(16 * 6, 10));
         let title = ScrollableBuilder::new()
             .with_text(UNKNOWN_TITLE)
@@ -315,19 +319,29 @@ impl ContentProvider for MediaPlayerBuilder {
                 pin_mut!(tracker);
 
                 while let Some(event) = tracker.next().await {
+                    log::debug!("MPRIS event: {:?}", event);
                     // React to MPRIS events. Only fire focus on transitions INTO
                     // Playing — pause and stop do NOT pull focus (the scheduler
                     // keeps whatever provider was active and rotates normally).
                     if matches!(event, apex_music::PlayerEvent::Properties) {
+                        log::info!("MPRIS PropertiesChanged received");
                         // PropertiesChanged covers track-change AND playback-status
                         // changes. Check the current status and only fire if we're
                         // transitioning into Playing.
-                        if let Ok(PlaybackStatus::Playing) = player.playback_status().await {
-                            // Drop the result — the receiver may be lagging
-                            // but the next event will catch up.
-                            let _ = focus_tx.send(
-                                crate::render::scheduler::ProviderWantsFocus
-                            );
+                        match player.playback_status().await {
+                            Ok(PlaybackStatus::Playing) => {
+                                log::info!("Status is Playing — sending focus request");
+                                let send_result = focus_tx.send(
+                                    crate::render::scheduler::ProviderWantsFocus
+                                );
+                                log::info!("focus_tx.send result: {:?}", send_result);
+                            }
+                            Ok(other) => {
+                                log::info!("Status is {:?} — skipping focus", other);
+                            }
+                            Err(e) => {
+                                log::warn!("Could not get playback_status: {}", e);
+                            }
                         }
                     }
 
