@@ -159,6 +159,39 @@ In our case we need to set a right value for the sensor(`acpitz temp1`, critical
 You can set your default media player on the `[mpris2]` section.
 
 
+## Behavior (ss-oled fork)
+
+By default (matching upstream), the OLED cycles through enabled providers
+on a fixed timer — every 30 seconds, configurable via `[interval] refresh`.
+
+**ss-oled adds two pieces of behavior on top of that:**
+
+### 1. Per-provider dwell times
+
+You can override the dwell time for any provider individually. Set
+`[interval] clock = 5` to make the clock flash for just 5 seconds while
+the rest keep the global 30s default.
+
+```toml
+[interval]
+refresh = 30      # global fallback
+clock = 5         # clock shows for just 5s
+```
+
+A value of 0 means "do not auto-rotate this provider away".
+
+### 2. Event-driven MPRIS jumps
+
+When using the MPRIS2 provider, the OLED automatically switches to it
+whenever a new track starts or playback resumes from a paused state.
+Pause and stop do NOT trigger the jump — the screen continues showing
+whatever provider was active and rotates normally.
+
+This means: staring at the clock or sysinfo while music plays, then
+hitting "next track" or "play", immediately jumps the OLED to the music
+screen instead of waiting up to 30 seconds for the timer.
+
+
 ## Usage
 
 Simply run the binary under `target/release/apex-tux` and make sure the settings.toml is in your current directory.
