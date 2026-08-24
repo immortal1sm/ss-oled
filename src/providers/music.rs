@@ -160,6 +160,41 @@ pub struct MediaPlayerBuilder {
 pub struct MediaPlayerRenderer {
     artist: StatefulScrollable,
     title: StatefulScrollable,
+    /// Human-readable media source label (e.g. "Firefox", "Spotify"),
+    /// drawn bottom-right of the timer row.
+    source: Option<String>,
+}
+
+/// Map a raw MPRIS bus name (e.g.
+/// "org.mpris.MediaPlayer2.firefox.instance_1_367") to a short friendly label
+/// for the OLED.
+fn friendly_source(bus_name: &str) -> String {
+    let stripped = bus_name
+        .trim_start_matches("org.mpris.MediaPlayer2.")
+        .split('.')
+        .next()
+        .unwrap_or(bus_name)
+        .to_lowercase();
+
+    // Title-case common players so they read nicely on the tiny screen.
+    let label = match stripped.as_str() {
+        "firefox" => "Firefox",
+        "chromium" => "Chromium",
+        "chrome" | "googlechrome" => "Chrome",
+        "spotify" => "Spotify",
+        "vlc" => "VLC",
+        "mpv" => "mpv",
+        "plasma-browser-integration" | "plasma_browser_integration" => "Browser",
+        "kdeconnect" => "Phone",
+        "lollypop" => "Lollypop",
+        "rhythmbox" => "Rhythmbox",
+        "clementine" => "Clementine",
+        "strawberry" => "Strawberry",
+        "audacious" => "Audacious",
+        "cmus" => "cmus",
+        other => other,
+    };
+    label.to_string()
 }
 
 impl MediaPlayerRenderer {
@@ -186,7 +221,19 @@ impl MediaPlayerRenderer {
         Ok(Self {
             artist: artist.try_into()?,
             title: title.try_into()?,
+            source: None,
         })
+    }
+
+    /// Set the media source label shown bottom-right of the timer row.
+    /// Pass an empty string to hide it.
+    pub fn set_source(&mut self, bus_name: &str) {
+        let label = friendly_source(bus_name);
+        if label.is_empty() {
+            self.source = None;
+        } else {
+            self.source = Some(label);
+        }
     }
 
     pub fn update<T: Metadata>(&mut self, progress: &Progress<T>) -> Result<FrameBuffer> {
@@ -248,6 +295,27 @@ impl MediaPlayerRenderer {
                 Baseline::Top,
             )
             .draw(&mut display)?;
+        }
+
+        // ----- media source label (bottom-right of timer row) -----
+        // Right-aligned in FONT_4X6 on the same y band as the timer. The
+        // centered timer leaves enough room for labels up to ~8 chars
+        // ("Firefox", "Spotify"); longer names are simply truncated by the
+        // 128px screen edge.
+        if let Some(src) = &self.source {
+            if !src.is_empty() {
+                let src_style = MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On);
+                let metrics = src_style.measure_string(src, Point::zero(), Baseline::Top);
+                let src_width = metrics.bounding_box.size.width as i32;
+                // Right edge at x=127, on the timer's baseline (y=27).
+                Text::with_baseline(
+                    src,
+                    Point::new(127 - src_width, 27),
+                    src_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)?;
+            }
         }
 
         let artists = metadata.artists()?;
@@ -384,6 +452,9 @@ impl ContentProvider for MediaPlayerBuilder {
 
                 info!("Connected to music player: {:?}", player.name().await);
 
+                // Capture the media source so update() can render it
+                // bottom-right of the timer row.
+                renderer.set_source(&player.name().await);
 
                 let tracker = mpris.stream().await?;
                 pin_mut!(tracker);
