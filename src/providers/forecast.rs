@@ -62,17 +62,18 @@ fn render_day(
     };
 
     // Layout — panel is only 40px tall, everything must end by y=39.
-    // Icon occupies x=0..44 (vertically centered).
-    //   y=0..12    hi temp      — FONT_10X20 glyph box is ~19px; baseline Top at
-    // y=-4 clips ascender padding so it visually spans y=0..18   y=14..23
-    // precip % + page dots row   y=24..33   header       — FONT_6X10 centered
-    // under temps Right column beside icon:
-    //   y=2..21    hi temp      — FONT_10X20
-    //   y=22..31   lo temp      — FONT_6X10
-    //   y=32..41 → clipped; use y=31..40 for header instead
+    //   x=0..44    condition icon (vertically centered)
+    //   x=46+      right column: hi temp y=1..21, lo temp y=22..31,
+    //              precip % beside lo temp
+    //   y=30..39   day header centered at bottom, page dots to its right
     let small = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
     let big = MonoTextStyle::new(&iso_8859_15::FONT_10X20, BinaryColor::On);
     let mid = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
+
+    // Condition icon in the left region (x=0..44), vertically centered.
+    // Static (frame 0) — the forecast pages through days every ~3s, so
+    // animating here would restart each icon's cycle constantly.
+    draw_condition_icon(buffer, day.condition, 0);
 
     // Hi temp: right column, starts near top. FONT_10X20 renders ~20px tall.
     let tx = 46 + offset_x;
