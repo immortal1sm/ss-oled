@@ -295,37 +295,45 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     // (Firefox does this on pause), which keeps the focus
                     // behavior consistent.
                     if focus_event.is_ok() {
-                        let active_idx = current.load(Ordering::SeqCst);
-                        if let Some(target_idx) = provider_names
-                            .iter()
-                            .position(|n| n == "mpris2")
-                        {
-                            if target_idx != active_idx {
-                                current.store(target_idx, Ordering::SeqCst);
-                                let _ = self.device.clear().await;
-                                // Reset dwell on transition only — so the
-                                // OLED sits on MPRIS for its full 30s dwell
-                                // before rotating away.
-                                *time_last_change.borrow_mut() = Instant::now();
-                                log::info!(
-                                    "Provider focused: mpris2 (was idx {}, name={})",
-                                    active_idx,
-                                    provider_names.get(active_idx).map(String::as_str).unwrap_or("?")
-                                );
-                            } else {
-                                // No-op: already showing mpris2. We intentionally
-                                // log this at INFO so that running
-                                // `journalctl --user -u apex-tux -f` shows a
-                                // heartbeat that events are arriving.
-                                log::info!("Focus event on mpris2 (already showing, no-op)");
-                            }
-                            // Note: we intentionally do NOT reset the dwell
-                            // timer when already on mpris2. This lets the
-                            // normal rotation cycle continue so other
-                            // providers get screen time even when music is
-                            // active.
+                        // Lock semantics: a locked provider is pinned
+                        // absolutely — even MPRIS/media-key focus jumps are
+                        // suppressed so the screen shows exactly what the
+                        // user chose, no surprises.
+                        if provider_locked {
+                            log::debug!("Focus event ignored (provider locked)");
                         } else {
-                            log::warn!("Focus requested but mpris2 not in providers list");
+                            let active_idx = current.load(Ordering::SeqCst);
+                            if let Some(target_idx) = provider_names
+                                .iter()
+                                .position(|n| n == "mpris2")
+                            {
+                                if target_idx != active_idx {
+                                    current.store(target_idx, Ordering::SeqCst);
+                                    let _ = self.device.clear().await;
+                                    // Reset dwell on transition only — so the
+                                    // OLED sits on MPRIS for its full 30s dwell
+                                    // before rotating away.
+                                    *time_last_change.borrow_mut() = Instant::now();
+                                    log::info!(
+                                        "Provider focused: mpris2 (was idx {}, name={})",
+                                        active_idx,
+                                        provider_names.get(active_idx).map(String::as_str).unwrap_or("?")
+                                    );
+                                } else {
+                                    // No-op: already showing mpris2. We intentionally
+                                    // log this at INFO so that running
+                                    // `journalctl --user -u apex-tux -f` shows a
+                                    // heartbeat that events are arriving.
+                                    log::info!("Focus event on mpris2 (already showing, no-op)");
+                                }
+                                // Note: we intentionally do NOT reset the dwell
+                                // timer when already on mpris2. This lets the
+                                // normal rotation cycle continue so other
+                                // providers get screen time even when music is
+                                // active.
+                            } else {
+                                log::warn!("Focus requested but mpris2 not in providers list");
+                            }
                         }
                     } else {
                         log::warn!("Focus event recv error: {:?}", focus_event);
