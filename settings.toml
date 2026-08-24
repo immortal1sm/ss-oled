@@ -42,7 +42,8 @@ sensor_name = "coretemp Package id 0"  # use `sensors` to find yours
 enabled = true
 path = "images/sample_1.gif"
 
-# NOTE: The MPRIS2 provider renders title (top), artist (second row), and an
-# elapsed/total timer centered between artist and the progress bar at the
-# bottom. Position/Length data comes from MPRIS; if a player doesn't publish
-# track length (e.g. Telegram), only elapsed time is shown.
+# NOTE: The MPRIS2 provider renders title (top), artist (second row), an
+# elapsed/total timer centered between artist and the progress bar
+# (e.g. "1:23 / 3:45"), and the progress bar at the bottom. Position and
+# Length data come from MPRIS. If a player doesn't publish track length
+# (e.g. Telegram, some browser tabs), only elapsed time is shown.
