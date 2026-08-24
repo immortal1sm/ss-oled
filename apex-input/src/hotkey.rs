@@ -14,9 +14,10 @@ impl InputManager {
     pub fn new(sender: broadcast::Sender<Command>) -> Result<Self> {
         let hkm = GlobalHotKeyManager::new().unwrap();
 
-        let modifiers = Some(Modifiers::ALT | Modifiers::CONTROL);
+        let modifiers = Some(Modifiers::CONTROL | Modifiers::SHIFT);
 
-        // User-requested bindings (all with Ctrl+Alt):
+        // Bindings (all with Ctrl+Shift — Ctrl+Alt+Numpad keys collided with
+        // OS/KDE shortcuts on the user's system):
         //   Numpad/  next provider
         //   Numpad*  previous provider
         //   Numpad-  lock provider (no auto-rotate; / and * still move)
