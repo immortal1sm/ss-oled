@@ -1,6 +1,7 @@
-use crate::{
-    render::{display::ContentProvider, image, scheduler::ContentWrapper},
-    scheduler::CONTENT_PROVIDERS,
+use crate::render::{
+    display::ContentProvider,
+    image,
+    scheduler::{ContentWrapper, FocusChannel, CONTENT_PROVIDERS},
 };
 use anyhow::Result;
 use apex_hardware::FrameBuffer;
@@ -18,11 +19,12 @@ use tokio::{
 
 #[doc(hidden)]
 #[distributed_slice(CONTENT_PROVIDERS)]
-pub static PROVIDER_INIT: fn(&Config) -> Result<Box<dyn ContentWrapper>> = register_callback;
+pub static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper>> =
+    register_callback;
 
 #[doc(hidden)]
 #[allow(clippy::unnecessary_wraps)]
-fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
+fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn ContentWrapper>> {
     info!("Registering Image display source.");
 
     let image_path = config

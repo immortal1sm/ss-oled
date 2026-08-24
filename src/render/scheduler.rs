@@ -30,8 +30,21 @@ use tokio::{
 pub const TICK_LENGTH: usize = 50;
 pub const TICKS_PER_SECOND: usize = 1000 / TICK_LENGTH;
 
+/// Signal a provider can send to ask the scheduler to switch to it.
+///
+/// Used by the MPRIS provider to pull focus onto the OLED display whenever a
+/// track changes or playback resumes. Pause/stop do NOT fire this signal —
+/// the scheduler continues with whatever provider was active and rotates
+/// normally.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderWantsFocus;
+
+/// Broadcast channel between providers and the scheduler. Capacity 16 is
+/// plenty for our use case (at most a few events per second).
+pub type FocusChannel = broadcast::Sender<ProviderWantsFocus>;
+
 #[distributed_slice]
-pub static CONTENT_PROVIDERS: [fn(&Config) -> Result<Box<dyn ContentWrapper>>] = [..];
+pub static CONTENT_PROVIDERS: [fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper>>] = [..];
 
 #[distributed_slice]
 pub static NOTIFICATION_PROVIDERS: [fn() -> Result<Box<dyn NotificationWrapper>>] = [..];
@@ -87,10 +100,15 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         rx: broadcast::Receiver<Command>,
         mut config: Config,
     ) -> Result<()> {
+        // Channel providers use to request the scheduler focus on them.
+        // We subscribe below (focus_rx) and react by jumping the active
+        // provider index to the requester.
+        let (focus_tx, _) = broadcast::channel::<ProviderWantsFocus>(16);
+
         #[cfg(not(target_os = "macos"))]
         let mut providers = CONTENT_PROVIDERS
             .iter()
-            .map(|f| (f)(&mut config))
+            .map(|f| (f)(&mut config, focus_tx.clone()))
             .collect::<Result<Vec<_>>>()?;
 
         #[cfg(target_os = "macos")]
@@ -116,12 +134,17 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
 
         let mut notifications = stream::select_all(notifications.into_iter());
 
+        // Subscribe to provider focus requests. Held outside the loop so we
+        // don't create a new receiver on every iteration.
+        let focus_rx = focus_tx.subscribe();
+        pin_mut!(focus_rx);
+
         let current = Arc::new(AtomicUsize::new(0));
         info!("Found {} registered providers", providers.len());
 
         pin_mut!(rx);
 
-        let (providers, errors): (Vec<_>, Vec<_>) = providers
+        let (named_providers, errors): (Vec<_>, Vec<_>) = providers
             .iter_mut()
             .map(|i| (i.provider_name(), i.proxy_stream()))
             .filter(|(name, _)| {
@@ -131,11 +154,18 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             .map(|(name, i)| {
                 let key = format!("{name}.priority");
                 let prio = config.get_int(&key).unwrap_or(99i64);
-                (name, i, prio)
+                (name.to_string(), i, prio)
             })
             .sorted_by_key(|(_, _, prio)| *prio)
             .map(|(name, i, _)| {
-                i.map_err(|e| anyhow!("Failed to initialize provider: {}. Error: {}", name, e))
+                let name_for_err = name.clone();
+                i.map(|stream| (name, stream)).map_err(|e| {
+                    anyhow!(
+                        "Failed to initialize provider: {}. Error: {}",
+                        name_for_err,
+                        e
+                    )
+                })
             })
             .partition_result();
 
@@ -143,8 +173,15 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             error!("{e}");
         }
 
-        let providers = providers
+        // Split names from streams so we can keep them parallel for per-provider
+        // interval lookups in the change-tick arm.
+        let provider_names: Vec<String> = named_providers
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let providers = named_providers
             .into_iter()
+            .map(|(_, stream)| stream)
             .map(Box::into_pin)
             .map(StreamExt::fuse)
             .collect::<Vec<_>>();
@@ -153,11 +190,13 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
 
         let mut y = multiplex(providers, move || z.load(Ordering::SeqCst));
 
-        //get the interval
-        let interval_between_change = config.get_int("interval.refresh").unwrap_or(30);
-        //flag to know if auto changer is enabled
-        let is_auto_change_enabled = interval_between_change != 0;
-        //the interval to check wether to change the screen or not
+        // Flag to know if auto-change is enabled at all. With per-provider
+        // intervals, "enabled" means any provider has a non-zero interval set.
+        // If everything is 0, we skip the tick to save CPU.
+        let is_auto_change_enabled = config
+            .get_int("interval.refresh")
+            .map(|v| v != 0)
+            .unwrap_or(true);
         let mut change = time::interval(Duration::from_secs(if is_auto_change_enabled {
             1
         } else {
@@ -203,14 +242,47 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                         self.device.draw(content).await?;
                     }
                 }
+                focus_event = focus_rx.recv() => {
+                    // A provider asked for focus. Find it by name and jump to it.
+                    // The current provider index points into the sorted providers
+                    // list; we look up the mpris2 provider's position and set
+                    // `current` to it. If we're already showing mpris2, no-op.
+                    if focus_event.is_ok() {
+                        let active_idx = current.load(Ordering::SeqCst);
+                        if let Some(target_idx) = provider_names
+                            .iter()
+                            .position(|n| n == "mpris2")
+                        {
+                            if target_idx != active_idx {
+                                current.store(target_idx, Ordering::SeqCst);
+                                // Reset the dwell timer so we don't immediately
+                                // rotate away from the freshly-focused provider.
+                                *time_last_change.borrow_mut() = Instant::now();
+                                let _ = self.device.clear().await;
+                                info!("Provider focused: mpris2 (was idx {})", active_idx);
+                            }
+                        }
+                    }
+                }
                 _ = change.tick() => {
                     if is_auto_change_enabled {
-                        //get the time since the last update
                         let current_time = Instant::now();
                         let elapsed_time = current_time - *time_last_change.borrow();
-                        //if the last update is over the choosen interval
-                        if elapsed_time > Duration::from_secs(interval_between_change as u64) {
-                            //change the screen
+                        // Look up the dwell time for the CURRENT provider, not a
+                        // global value. Priority of lookup:
+                        //   1. `interval.<provider_name>` (e.g. `interval.clock`)
+                        //   2. `interval.refresh` (global fallback)
+                        // If the resolved interval is 0, that provider is treated
+                        // as "manual only" — never auto-rotated away.
+                        let active_idx = current.load(Ordering::SeqCst);
+                        let active_name = provider_names
+                            .get(active_idx)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let interval_secs = Self::interval_for(&config, active_name);
+                        if interval_secs > 0
+                            && elapsed_time > Duration::from_secs(interval_secs)
+                        {
                             let _ = tx.send(Command::NextSource);
                         }
                     }
@@ -221,5 +293,30 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         self.device.clear().await?;
         self.device.shutdown().await?;
         Ok(())
+    }
+
+    /// Look up the dwell time for a provider, in seconds.
+    ///
+    /// Precedence:
+    /// 1. `interval.<provider_name>` (e.g. `interval.clock = 5`)
+    /// 2. `interval.refresh` (global fallback)
+    /// 3. 30 seconds (hard-coded default if neither key exists)
+    ///
+    /// A value of 0 means "do not auto-rotate this provider away".
+    fn interval_for(config: &Config, provider_name: &str) -> u64 {
+        let key = format!("interval.{provider_name}");
+        config
+            .get_int(&key)
+            .ok()
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64)
+            .or_else(|| {
+                config
+                    .get_int("interval.refresh")
+                    .ok()
+                    .filter(|v| *v >= 0)
+                    .map(|v| v as u64)
+            })
+            .unwrap_or(30)
     }
 }
