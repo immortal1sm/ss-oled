@@ -253,6 +253,13 @@ impl MediaPlayerRenderer {
         let artists = metadata.artists()?;
         let title = metadata.title()?;
 
+        // Some sources (YouTube via plasma-browser-integration, monochrome.tf,
+        // and many other web players) publish the full "title - artist" or
+        // "title • artist" string in xesam:title and leave xesam:artist
+        // empty. When that happens, split the combined string so the two
+        // OLED rows each get a sensible value instead of an empty artist row.
+        let (title, artists) = Self::split_combined_metadata(&title, &artists);
+
         if let Ok(false) = self.artist.update(&artists) {
             if artists.len() > 16 {
                 self.artist.text.scroll();
@@ -269,6 +276,58 @@ impl MediaPlayerRenderer {
         self.artist.text.draw(&mut display)?;
 
         Ok(display)
+    }
+}
+
+impl MediaPlayerRenderer {
+    /// If the artist field is blank but the title embeds the artist after a
+    /// separator, split them apart. Handles the common web-player patterns:
+    ///   "Song Title - Artist Name"
+    ///   "Song Title – Artist Name"  (en dash)
+    ///   "Song Title • Artist Name"
+    ///   "Artist Name - Song Title"  (reversed: artist first)
+    ///
+    /// Only splits when xesam:artist is empty/whitespace — real metadata is
+    /// trusted as-is. Returns (title_for_row1, artist_for_row2).
+    fn split_combined_metadata(title: &str, artist: &str) -> (String, String) {
+        if !artist.trim().is_empty() {
+            // Real artist data exists; trust it.
+            return (title.to_string(), artist.to_string());
+        }
+
+        let t = title.trim();
+        if t.is_empty() {
+            return (t.to_string(), String::new());
+        }
+
+        // Separator candidates, in priority order. The bullet is checked
+        // first because it's unambiguous; dashes are ambiguous with song
+        // titles containing dashes ("Smells Like Teen Spirit - ..."), so we
+        // take the LAST dash occurrence for those, which matches how
+        // "Title - Artist" is conventionally written.
+        const BULLETS: [&str; 3] = ["•", "·", "‧"];
+        for sep in BULLETS {
+            if let Some(pos) = t.find(sep) {
+                let title_part = t[..pos].trim();
+                let artist_part = t[pos + sep.len()..].trim();
+                if !title_part.is_empty() && !artist_part.is_empty() {
+                    return (title_part.to_string(), artist_part.to_string());
+                }
+            }
+        }
+
+        for sep in [" - ", " – "] {
+            if let Some(pos) = t.rfind(sep) {
+                let title_part = t[..pos].trim();
+                let artist_part = t[pos + sep.len()..].trim();
+                if !title_part.is_empty() && !artist_part.is_empty() {
+                    return (title_part.to_string(), artist_part.to_string());
+                }
+            }
+        }
+
+        // Nothing separable — show the title as-is on row 1.
+        (t.to_string(), String::new())
     }
 }
 
