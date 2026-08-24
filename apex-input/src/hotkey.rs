@@ -14,10 +14,12 @@ impl InputManager {
     pub fn new(sender: broadcast::Sender<Command>) -> Result<Self> {
         let hkm = GlobalHotKeyManager::new().unwrap();
 
-        let modifiers = Some(Modifiers::ALT | Modifiers::SHIFT);
+        let modifiers = Some(Modifiers::ALT | Modifiers::CONTROL);
 
-        let hotkey_previous = HotKey::new(modifiers, Code::KeyA);
-        let hotkey_next = HotKey::new(modifiers, Code::KeyD);
+        // User-requested bindings: Ctrl+Alt+Numpad/ = next, Ctrl+Alt+Numpad* =
+        // previous. These are the keypad / and * keys.
+        let hotkey_previous = HotKey::new(modifiers, Code::NumpadMultiply);
+        let hotkey_next = HotKey::new(modifiers, Code::NumpadDivide);
 
         hkm.register(hotkey_previous).unwrap();
         hkm.register(hotkey_next).unwrap();
