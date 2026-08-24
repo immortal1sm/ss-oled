@@ -1,3 +1,31 @@
+# ss-oled — fork of [not-jan/apex-tux](https://github.com/not-jan/apex-tux)
+
+> **Note:** This is **ss-oled**, a fork of [not-jan/apex-tux](https://github.com/not-jan/apex-tux).
+> All credit for the upstream codebase goes to **not-jan** and contributors. This fork
+> diverges in design direction by adding event-driven provider switching, per-provider
+> dwell times, and a reworked MPRIS layout.
+>
+> Upstream `not-jan/apex-tux` remains the source of truth for the OLED protocol,
+> the renderer pipeline, and the provider framework. This fork layers new
+> scheduling behavior on top of that foundation.
+
+## What this fork adds (vs upstream)
+
+1. **Event-driven MPRIS jumps** — when a track changes or playback resumes, the OLED
+   immediately switches to the music screen instead of waiting for the rotation timer.
+   Pause/stop do not trigger the jump.
+2. **Per-provider dwell times** — the clock can sit for 5s while MPRIS and Sysinfo sit
+   for 30s, configured via `interval.<name>` keys in settings.toml.
+3. **Reworked MPRIS layout** — adds an elapsed/total timer row between the artist
+   and the progress bar (e.g. `1:23 / 3:45`).
+4. **Image provider enabled out of the box** — no need to pass `--features image`
+   manually; the bundled `settings.toml` enables it.
+
+Upstream-specific behavior (hardware protocol, providers framework, image renderer,
+DBus notification pipeline, simulator) is unchanged.
+
+---
+
 # apex-tux - Linux support for the Apex series OLED screens
 
 Make use of your OLED screen instead of letting the SteelSeries logo burn itself in :-)
