@@ -30,8 +30,21 @@ use tokio::{
 pub const TICK_LENGTH: usize = 50;
 pub const TICKS_PER_SECOND: usize = 1000 / TICK_LENGTH;
 
+/// Signal a provider can send to ask the scheduler to switch to it.
+///
+/// Used by the MPRIS provider to pull focus onto the OLED display whenever a
+/// track changes or playback resumes. Pause/stop do NOT fire this signal —
+/// the scheduler continues with whatever provider was active and rotates
+/// normally.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderWantsFocus;
+
+/// Broadcast channel between providers and the scheduler. Capacity 16 is
+/// plenty for our use case (at most a few events per second).
+pub type FocusChannel = broadcast::Sender<ProviderWantsFocus>;
+
 #[distributed_slice]
-pub static CONTENT_PROVIDERS: [fn(&Config) -> Result<Box<dyn ContentWrapper>>] = [..];
+pub static CONTENT_PROVIDERS: [fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper>>] = [..];
 
 #[distributed_slice]
 pub static NOTIFICATION_PROVIDERS: [fn() -> Result<Box<dyn NotificationWrapper>>] = [..];
@@ -87,10 +100,15 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         rx: broadcast::Receiver<Command>,
         mut config: Config,
     ) -> Result<()> {
+        // Channel providers use to request the scheduler focus on them.
+        // We subscribe below (focus_rx) and react by jumping the active
+        // provider index to the requester.
+        let (focus_tx, _) = broadcast::channel::<ProviderWantsFocus>(16);
+
         #[cfg(not(target_os = "macos"))]
         let mut providers = CONTENT_PROVIDERS
             .iter()
-            .map(|f| (f)(&mut config))
+            .map(|f| (f)(&mut config, focus_tx.clone()))
             .collect::<Result<Vec<_>>>()?;
 
         #[cfg(target_os = "macos")]
@@ -115,6 +133,11 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         }
 
         let mut notifications = stream::select_all(notifications.into_iter());
+
+        // Subscribe to provider focus requests. Held outside the loop so we
+        // don't create a new receiver on every iteration.
+        let focus_rx = focus_tx.subscribe();
+        pin_mut!(focus_rx);
 
         let current = Arc::new(AtomicUsize::new(0));
         info!("Found {} registered providers", providers.len());
@@ -217,6 +240,28 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                 content = y.next() => {
                     if let Some(Ok(content)) = &content {
                         self.device.draw(content).await?;
+                    }
+                }
+                focus_event = focus_rx.recv() => {
+                    // A provider asked for focus. Find it by name and jump to it.
+                    // The current provider index points into the sorted providers
+                    // list; we look up the mpris2 provider's position and set
+                    // `current` to it. If we're already showing mpris2, no-op.
+                    if focus_event.is_ok() {
+                        let active_idx = current.load(Ordering::SeqCst);
+                        if let Some(target_idx) = provider_names
+                            .iter()
+                            .position(|n| n == "mpris2")
+                        {
+                            if target_idx != active_idx {
+                                current.store(target_idx, Ordering::SeqCst);
+                                // Reset the dwell timer so we don't immediately
+                                // rotate away from the freshly-focused provider.
+                                *time_last_change.borrow_mut() = Instant::now();
+                                let _ = self.device.clear().await;
+                                info!("Provider focused: mpris2 (was idx {})", active_idx);
+                            }
+                        }
                     }
                 }
                 _ = change.tick() => {
