@@ -110,10 +110,24 @@ Carried over from upstream, plus this fork's own roadmap:
 
 **Upstream TODOs (status noted where applicable):**
 - [ ] Windows support *(upstream goal; ss-oled is Linux-first for now)*
-- [ ] Test on more than one Desktop Environment on X11 *(ss-oled targets Wayland/KDE; X11 untested here)*
+- [x] ~~Test on more than one Desktop Environment on X11~~ — **closed with reasoning:**
+  ss-oled is display-server independent *by design*. It talks only to DBus,
+  kernel HID, and the network — the codebase contains no X11/Wayland calls, and
+  the release binary doesn't even link libX11. Verified in practice on
+  **KDE Wayland** (primary development target; the one Wayland-specific issue —
+  DBus session env inheritance in systemd user units — was found and fixed).
+  Upstream was developed on X11-based systems. One known limitation on non-KDE
+  desktops: global hotkeys bind via KDE's kglobalaccel, so manual provider
+  switching requires KDE (auto-rotation and media-event focus are unaffected).
+
+| Environment | Status |
+|---|---|
+| KDE Wayland | ✅ fully verified — primary target |
+| X11-based systems | ⚠️ upstream's original environment; untested by us but architecturally identical |
+| non-KDE DEs | ⚠️ everything works except global hotkeys |
 - [x] More providers — GIFs ✅ (image provider + FS dithering), Weather/Forecast ✅
 - [ ] More providers — Games? (CS2/Dota Game State Integration would be the clean path)
-- [ ] Switch the USB crate to something async instead
+- [ ] Switch the USB crate to something async instead *(upstream tracks hidapi-rs#51; `nusb` is the likely successor)*
 - [ ] Add documentation on how to add custom providers
 - [ ] Switch from GATs to async traits once they're stable
 - [ ] Add support for more notifications
@@ -121,7 +135,5 @@ Carried over from upstream, plus this fork's own roadmap:
 **ss-oled roadmap:**
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
-- [ ] Wire up or remove the `units` config key (imperial conversion)
-- [ ] Restore city label somewhere non-overlapping on the weather screen
 - [ ] Package for Arch (AUR) / Flatpak
 - [ ] Demote diagnostic INFO logs in the focus path to DEBUG
