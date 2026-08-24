@@ -4,7 +4,7 @@ use apex_music::{AsyncPlayer, Metadata as MetadataTrait, PlaybackStatus, PlayerE
 use async_stream::stream;
 use dbus::{
     arg::PropMap,
-    message::MatchRule,
+    message::{MatchRule, MessageType},
     nonblock::{Proxy, SyncConnection},
     strings::BusName,
 };
@@ -72,6 +72,7 @@ impl MPRIS2 {
     #[allow(unreachable_code, unused_variables)]
     pub async fn stream(&self) -> Result<impl Stream<Item = PlayerEvent>> {
         let mr = MatchRule::new()
+            .with_type(MessageType::Signal)
             .with_path("/org/mpris/MediaPlayer2")
             .with_interface("org.freedesktop.DBus.Properties")
             .with_member("PropertiesChanged");
@@ -79,6 +80,7 @@ impl MPRIS2 {
         let (meta_match, mut meta_stream) = self.conn.add_match(mr).await?.msg_stream();
 
         let mr = MatchRule::new()
+            .with_type(MessageType::Signal)
             .with_interface("org.mpris.MediaPlayer2.Player")
             .with_path("/org/mpris/MediaPlayer2")
             .with_member("Seeked");
