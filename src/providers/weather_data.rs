@@ -98,12 +98,44 @@ pub struct WeatherData {
     pub days: Vec<DayForecast>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Units {
+    Metric,
+    Imperial,
+}
+
+impl Units {
+    pub fn from_config(config: &config::Config) -> Self {
+        match config.get_str("weather.units").as_deref() {
+            Ok("imperial") => Units::Imperial,
+            _ => Units::Metric,
+        }
+    }
+
+    /// Degree symbol for rendering.
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            Units::Metric => "\u{00B0}C",
+            Units::Imperial => "\u{00B0}F",
+        }
+    }
+
+    /// Open-Meteo's temperature_unit query parameter.
+    fn api_param(&self) -> &'static str {
+        match self {
+            Units::Metric => "celsius",
+            Units::Imperial => "fahrenheit",
+        }
+    }
+}
+
 pub struct WeatherCache {
     data: Arc<RwLock<Option<WeatherData>>>,
     last_fetch: Arc<RwLock<Option<Instant>>>,
     latitude: f64,
     longitude: f64,
     timezone: String,
+    units: Units,
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -115,12 +147,14 @@ impl WeatherCache {
         let timezone: String = config
             .get_str("weather.timezone")
             .unwrap_or_else(|_| "auto".to_string());
+        let units = Units::from_config(config);
         Ok(Self {
             data: Arc::new(RwLock::new(None)),
             last_fetch: Arc::new(RwLock::new(None)),
             latitude,
             longitude,
             timezone,
+            units,
         })
     }
 
@@ -142,10 +176,13 @@ impl WeatherCache {
             let lat = self.latitude;
             let lon = self.longitude;
             let tz = self.timezone.clone();
+            let unit_param = self.units.api_param();
             tokio::spawn(async move {
                 // Fetch on a blocking thread — ureq is synchronous.
-                let result =
-                    tokio::task::spawn_blocking(move || Self::fetch_coords(lat, lon, &tz)).await;
+                let result = tokio::task::spawn_blocking(move || {
+                    Self::fetch_coords(lat, lon, &tz, unit_param)
+                })
+                .await;
                 match result {
                     Ok(Ok(data)) => {
                         if let Ok(mut slot) = data_slot.write() {
@@ -160,14 +197,20 @@ impl WeatherCache {
         self.data.read().ok().and_then(|d| d.clone())
     }
 
-    fn fetch_coords(latitude: f64, longitude: f64, timezone: &str) -> Result<WeatherData> {
+    fn fetch_coords(
+        latitude: f64,
+        longitude: f64,
+        timezone: &str,
+        temp_unit: &str,
+    ) -> Result<WeatherData> {
         let url = format!(
             "https://api.open-meteo.com/v1/forecast?latitude={:.5}&longitude={:.5}\
              &current=temperature_2m,weather_code,precipitation_probability\
              &daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max\
-             &timezone={}&forecast_days=6",
+             &temperature_unit={}&timezone={}&forecast_days=6",
             latitude,
             longitude,
+            temp_unit,
             urlencode(timezone)
         );
 

@@ -2,7 +2,7 @@
 //! label. Refreshes from Open-Meteo every 15 min via WeatherCache.
 
 use crate::{
-    providers::weather_data::WeatherCache,
+    providers::weather_data::{Units, WeatherCache},
     render::{
         display::ContentProvider,
         scheduler::{ContentWrapper, FocusChannel, CONTENT_PROVIDERS},
@@ -31,6 +31,7 @@ static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper
 
 struct Weather {
     cache: std::sync::Arc<WeatherCache>,
+    units: Units,
     label: String,
 }
 
@@ -62,7 +63,7 @@ impl Weather {
             let style = MonoTextStyle::new(&iso_8859_15::FONT_10X20, BinaryColor::On);
             // Degree symbol: iso_8859_15 has ° at 0xB0. embedded-graphics
             // mono fonts render any char in their glyph range.
-            let text = format!("{:.0}\u{00B0}C", t);
+            let text = format!("{:.0}{}", t, self.units.symbol());
             Text::with_baseline(&text, Point::new(text_x, 1), style, Baseline::Top)
                 .draw(&mut buffer)?;
         }
@@ -135,5 +136,10 @@ fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn
     );
     let label: String = config.get_str("weather.label").unwrap_or_default();
 
-    Ok(Box::new(Weather { cache, label }))
+    let units = Units::from_config(config);
+    Ok(Box::new(Weather {
+        cache,
+        units,
+        label,
+    }))
 }
