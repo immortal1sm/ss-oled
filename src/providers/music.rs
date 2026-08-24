@@ -1,5 +1,8 @@
-use crate::render::display::ContentProvider;
-
+use crate::render::{
+    display::ContentProvider,
+    scheduler::{ContentWrapper, FocusChannel, CONTENT_PROVIDERS},
+    text::{ScrollableBuilder, StatefulScrollable},
+};
 use anyhow::Result;
 use async_stream::try_stream;
 #[cfg(not(target_os = "windows"))]
@@ -11,16 +14,11 @@ use embedded_graphics::{
 };
 use futures_core::stream::Stream;
 use linkme::distributed_slice;
-
 use log::info;
 use tinybmp::Bmp;
 use tokio::time;
 
-use crate::render::{
-    scheduler::{ContentWrapper, CONTENT_PROVIDERS},
-    text::{ScrollableBuilder, StatefulScrollable},
-};
-use apex_music::{AsyncPlayer, Metadata, Progress};
+use apex_music::{AsyncPlayer, Metadata, PlaybackStatus, Progress};
 use config::Config;
 use embedded_graphics::{
     mono_font::{iso_8859_15, MonoTextStyle},
@@ -34,7 +32,6 @@ use std::{
 use tokio::time::{Duration, MissedTickBehavior};
 
 use apex_hardware::FrameBuffer;
-use apex_music::PlaybackStatus;
 use futures::pin_mut;
 
 static NOTE_ICON: &[u8] = include_bytes!("./../../assets/note.bmp");
@@ -115,15 +112,18 @@ static UNKNOWN_ARTIST: &str = "Unknown artist";
 const RECONNECT_DELAY: u64 = 5;
 
 #[distributed_slice(CONTENT_PROVIDERS)]
-static PROVIDER_INIT: fn(&Config) -> Result<Box<dyn ContentWrapper>> = register_callback;
+static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper>> =
+    register_callback;
 
 #[allow(clippy::unnecessary_wraps)]
-fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
+fn register_callback(config: &Config, focus_tx: FocusChannel) -> Result<Box<dyn ContentWrapper>> {
     info!("Registering MPRIS2 display source.");
 
     let player = match config.get_str("mpris2.preferred_player") {
-        Ok(name) => MediaPlayerBuilder::new().with_player_name(name),
-        Err(_) => MediaPlayerBuilder::new(),
+        Ok(name) => MediaPlayerBuilder::new()
+            .with_player_name(name)
+            .with_focus_tx(focus_tx),
+        Err(_) => MediaPlayerBuilder::new().with_focus_tx(focus_tx),
     };
 
     Ok(Box::new(player))
@@ -133,6 +133,9 @@ fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
 pub struct MediaPlayerBuilder {
     /// If a preference for the player is wanted specify this field
     name: Option<Arc<String>>,
+    /// Channel used to request the scheduler switch focus to this provider
+    /// when a track changes or playback resumes.
+    focus_tx: Option<FocusChannel>,
 }
 
 // Ok so the plan for the MPRIS2 module is to wait for two DBUS events
@@ -220,6 +223,11 @@ impl MediaPlayerBuilder {
         self
     }
 
+    pub fn with_focus_tx(mut self, tx: FocusChannel) -> Self {
+        self.focus_tx = Some(tx);
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -235,6 +243,10 @@ impl ContentProvider for MediaPlayerBuilder {
         );
 
         let mut renderer = MediaPlayerRenderer::new()?;
+        let focus_tx = self
+            .focus_tx
+            .clone()
+            .expect("focus_tx must be set in register_callback");
 
         Ok(try_stream! {
             #[cfg(target_os = "windows")]
@@ -262,9 +274,23 @@ impl ContentProvider for MediaPlayerBuilder {
                 let tracker = mpris.stream().await?;
                 pin_mut!(tracker);
 
-                while (tracker.next().await).is_some() {
-                    // TODO: We could probably save *some* resources here by making use of the event
-                    // that's being called but I don't see enough of a reason to do so at the moment
+                while let Some(event) = tracker.next().await {
+                    // React to MPRIS events. Only fire focus on transitions INTO
+                    // Playing — pause and stop do NOT pull focus (the scheduler
+                    // keeps whatever provider was active and rotates normally).
+                    if matches!(event, apex_music::PlayerEvent::Properties) {
+                        // PropertiesChanged covers track-change AND playback-status
+                        // changes. Check the current status and only fire if we're
+                        // transitioning into Playing.
+                        if let Ok(PlaybackStatus::Playing) = player.playback_status().await {
+                            // Drop the result — the receiver may be lagging
+                            // but the next event will catch up.
+                            let _ = focus_tx.send(
+                                crate::render::scheduler::ProviderWantsFocus
+                            );
+                        }
+                    }
+
                     if let Ok(progress) = player.progress().await {
                         if let Ok(image) = renderer.update(&progress) {
                             yield image;
