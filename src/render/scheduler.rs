@@ -139,6 +139,27 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let focus_rx = focus_tx.subscribe();
         pin_mut!(focus_rx);
 
+        // KDE global media-key subscription as a robust fallback. KDE's
+        // kglobalaccel intercepts media keys at the system level BEFORE any
+        // application sees them, so we get a signal even when Firefox's MPRIS
+        // publisher is inconsistent (no-op keypresses, busy UI, etc.). When a
+        // media shortcut is pressed we fire focus on mpris2 via focus_tx.
+        //
+        // Errors are non-fatal: if the system doesn't have kglobalaccel (rare),
+        // we just don't get this bonus signal source.
+        match Self::subscribe_media_keys(focus_tx.clone()) {
+            Ok(_handle) => {
+                info!("Subscribed to KDE kglobalaccel media shortcuts");
+            }
+            Err(e) => {
+                log::warn!(
+                    "Could not subscribe to kglobalaccel media keys ({}). Falling back to \
+                     MPRIS-only focus. This usually means kde-globalaccel is not running.",
+                    e
+                );
+            }
+        }
+
         let current = Arc::new(AtomicUsize::new(0));
         info!("Found {} registered providers", providers.len());
 
@@ -372,5 +393,96 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     .map(|v| v as u64)
             })
             .unwrap_or(30)
+    }
+
+    /// Subscribe to KDE's kglobalaccel media shortcut signals and forward
+    /// them as focus requests on `focus_tx`. Returns a join handle that the
+    /// caller can keep alive for the daemon's lifetime; dropping the handle
+    /// cancels the subscription.
+    ///
+    /// The signal we listen to is:
+    /// `org.kde.kglobalaccel.Component.globalShortcutPressed(componentUnique,
+    ///   shortcutUnique, timestamp)`
+    ///
+    /// This fires every time the user presses a registered media key
+    /// (play/pause/next/prev/stop), independent of whether the focused app
+    /// actually responds. That's the key advantage over MPRIS: even when
+    /// Firefox's MPRIS publisher ignores a no-op keypress, kglobalaccel
+    /// still reports it.
+    ///
+    /// We filter to media-related shortcuts by inspecting the `componentUnique`
+    /// and `shortcutUnique` fields — only the "mediacontrol" component fires
+    /// focus. Other global shortcuts (volume, brightness, etc.) are ignored.
+    fn subscribe_media_keys(focus_tx: FocusChannel) -> Result<tokio::task::JoinHandle<()>> {
+        use dbus::message::MatchRule;
+        use dbus_tokio::connection;
+
+        // This blocks briefly. Run in a blocking task so we don't stall the
+        // scheduler's startup.
+        let focus_tx = focus_tx.clone();
+        let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+            let rt = tokio::runtime::Handle::current();
+            let (resource, conn) = connection::new_session_sync()?;
+            let _resource_handle = rt.block_on(async { resource });
+
+            let mr = MatchRule::new()
+                .with_interface("org.kde.kglobalaccel.Component")
+                .with_member("globalShortcutPressed");
+
+            // add_match returns a future that resolves to MsgMatch; await it
+            // synchronously inside this blocking task.
+            let add_match_fut = conn.add_match(mr);
+            let msg_match = rt.block_on(add_match_fut)?;
+            let (_msg_match, mut msg_stream) = msg_match.msg_stream();
+
+            // Spawn a task that processes incoming signals and forwards
+            // media-key events to focus_tx.
+            rt.spawn(async move {
+                use dbus::arg::messageitem::MessageItem;
+                use futures::stream::StreamExt;
+                while let Some(msg) = msg_stream.next().await {
+                    // globalShortcutPressed has 3 args: componentUnique,
+                    // shortcutUnique, timestamp. Get the items as a Vec.
+                    let items = msg.get_items();
+                    let mut strs = Vec::new();
+                    for item in items {
+                        if let MessageItem::Str(s) = item {
+                            strs.push(s);
+                            if strs.len() == 2 {
+                                break;
+                            }
+                        }
+                    }
+                    let (component, shortcut) = match strs.as_slice() {
+                        [c, s] => (c.as_str(), s.as_str()),
+                        _ => ("", ""),
+                    };
+                    if component == "mediacontrol" {
+                        log::info!("KDE media key pressed: {} (sending focus)", shortcut);
+                        let _ = focus_tx.send(ProviderWantsFocus);
+                    } else if !component.is_empty() {
+                        log::debug!(
+                            "KDE global shortcut from non-media component '{}': {}",
+                            component,
+                            shortcut
+                        );
+                    }
+                }
+            });
+
+            // Keep the connection alive for the daemon's lifetime
+            std::mem::forget(conn);
+            Ok(())
+        });
+
+        // Convert the JoinHandle<Result<Result<()>>> into JoinHandle<()>
+        // by spawning a wrapper that just logs errors.
+        Ok(tokio::spawn(async move {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!("media-key subscription task error: {}", e),
+                Err(e) => log::warn!("media-key subscription task panicked: {}", e),
+            }
+        }))
     }
 }
