@@ -31,7 +31,10 @@ use sysinfo::{
 
 #[doc(hidden)]
 #[distributed_slice(CONTENT_PROVIDERS)]
-pub static PROVIDER_INIT: fn(&Config) -> Result<Box<dyn ContentWrapper>> = register_callback;
+pub static PROVIDER_INIT: fn(
+    &Config,
+    crate::render::scheduler::FocusChannel,
+) -> Result<Box<dyn ContentWrapper>> = register_callback;
 
 fn tick() -> i64 {
     chrono::offset::Utc::now().timestamp_millis()
@@ -39,7 +42,10 @@ fn tick() -> i64 {
 
 #[doc(hidden)]
 #[allow(clippy::unnecessary_wraps)]
-fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
+fn register_callback(
+    config: &Config,
+    _focus_tx: crate::render::scheduler::FocusChannel,
+) -> Result<Box<dyn ContentWrapper>> {
     info!("Registering Sysinfo display source.");
 
     let refreshes = RefreshKind::new()

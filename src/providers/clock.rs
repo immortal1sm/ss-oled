@@ -24,7 +24,10 @@ use tokio::{
 
 #[doc(hidden)]
 #[distributed_slice(CONTENT_PROVIDERS)]
-pub static PROVIDER_INIT: fn(&Config) -> Result<Box<dyn ContentWrapper>> = register_callback;
+pub static PROVIDER_INIT: fn(
+    &Config,
+    crate::render::scheduler::FocusChannel,
+) -> Result<Box<dyn ContentWrapper>> = register_callback;
 
 #[derive(Debug, Copy, Clone)]
 /// Represents the options a user can choose for the clock format
@@ -39,7 +42,10 @@ enum ClockFormat {
 
 #[doc(hidden)]
 #[allow(clippy::unnecessary_wraps)]
-fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
+fn register_callback(
+    config: &Config,
+    _focus_tx: crate::render::scheduler::FocusChannel,
+) -> Result<Box<dyn ContentWrapper>> {
     info!("Registering Clock display source.");
 
     let clock_format = match config.get_bool("clock.twelve_hour") {

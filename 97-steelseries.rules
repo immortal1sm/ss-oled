@@ -1,0 +1,7 @@
+# SteelSeries Apex Pro (1038:1610) — grant access for apex-tux
+# Uses uaccess tag (systemd) so the active graphical session user gets access
+# without requiring a plugdev group to exist.
+SUBSYSTEM=="input", GROUP="input", MODE="0666", TAG+="uaccess"
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1610", MODE="0666", GROUP="king", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1610", MODE="0666", GROUP="king", TAG+="uaccess"

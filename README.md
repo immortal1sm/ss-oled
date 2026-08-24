@@ -1,3 +1,31 @@
+# ss-oled — fork of [not-jan/apex-tux](https://github.com/not-jan/apex-tux)
+
+> **Note:** This is **ss-oled**, a fork of [not-jan/apex-tux](https://github.com/not-jan/apex-tux).
+> All credit for the upstream codebase goes to **not-jan** and contributors. This fork
+> diverges in design direction by adding event-driven provider switching, per-provider
+> dwell times, and a reworked MPRIS layout.
+>
+> Upstream `not-jan/apex-tux` remains the source of truth for the OLED protocol,
+> the renderer pipeline, and the provider framework. This fork layers new
+> scheduling behavior on top of that foundation.
+
+## What this fork adds (vs upstream)
+
+1. **Event-driven MPRIS jumps** — when a track changes or playback resumes, the OLED
+   immediately switches to the music screen instead of waiting for the rotation timer.
+   Pause/stop do not trigger the jump.
+2. **Per-provider dwell times** — the clock can sit for 5s while MPRIS and Sysinfo sit
+   for 30s, configured via `interval.<name>` keys in settings.toml.
+3. **Reworked MPRIS layout** — adds an elapsed/total timer row between the artist
+   and the progress bar (e.g. `1:23 / 3:45`).
+4. **Image provider enabled out of the box** — no need to pass `--features image`
+   manually; the bundled `settings.toml` enables it.
+
+Upstream-specific behavior (hardware protocol, providers framework, image renderer,
+DBus notification pipeline, simulator) is unchanged.
+
+---
+
 # apex-tux - Linux support for the Apex series OLED screens
 
 Make use of your OLED screen instead of letting the SteelSeries logo burn itself in :-)
@@ -129,6 +157,39 @@ $ target/release/apex-tux
 In our case we need to set a right value for the sensor(`acpitz temp1`, critical temperatured one, i.e., cpu) and the network interface(`wlp3s0`, wifi) in the `[sysinfo]` section.
 
 You can set your default media player on the `[mpris2]` section.
+
+
+## Behavior (ss-oled fork)
+
+By default (matching upstream), the OLED cycles through enabled providers
+on a fixed timer — every 30 seconds, configurable via `[interval] refresh`.
+
+**ss-oled adds two pieces of behavior on top of that:**
+
+### 1. Per-provider dwell times
+
+You can override the dwell time for any provider individually. Set
+`[interval] clock = 5` to make the clock flash for just 5 seconds while
+the rest keep the global 30s default.
+
+```toml
+[interval]
+refresh = 30      # global fallback
+clock = 5         # clock shows for just 5s
+```
+
+A value of 0 means "do not auto-rotate this provider away".
+
+### 2. Event-driven MPRIS jumps
+
+When using the MPRIS2 provider, the OLED automatically switches to it
+whenever a new track starts or playback resumes from a paused state.
+Pause and stop do NOT trigger the jump — the screen continues showing
+whatever provider was active and rotates normally.
+
+This means: staring at the clock or sysinfo while music plays, then
+hitting "next track" or "play", immediately jumps the OLED to the music
+screen instead of waiting up to 30 seconds for the timer.
 
 
 ## Usage
