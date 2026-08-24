@@ -16,24 +16,34 @@ impl InputManager {
 
         let modifiers = Some(Modifiers::ALT | Modifiers::CONTROL);
 
-        // User-requested bindings: Ctrl+Alt+Numpad/ = next, Ctrl+Alt+Numpad* =
-        // previous. These are the keypad / and * keys.
+        // User-requested bindings (all with Ctrl+Alt):
+        //   Numpad/  next provider
+        //   Numpad*  previous provider
+        //   Numpad-  lock provider (no auto-rotate; / and * still move)
+        //   Numpad+  unlock provider (resume auto-rotate)
         let hotkey_previous = HotKey::new(modifiers, Code::NumpadMultiply);
         let hotkey_next = HotKey::new(modifiers, Code::NumpadDivide);
+        let hotkey_lock = HotKey::new(modifiers, Code::NumpadSubtract);
+        let hotkey_unlock = HotKey::new(modifiers, Code::NumpadAdd);
 
         hkm.register(hotkey_previous).unwrap();
         hkm.register(hotkey_next).unwrap();
+        hkm.register(hotkey_lock).unwrap();
+        hkm.register(hotkey_unlock).unwrap();
 
         let hotkey_handler = move |event: GlobalHotKeyEvent| {
-            if event.id == hotkey_previous.id() {
-                sender
-                    .send(Command::PreviousSource)
-                    .expect("Failed to send command!");
+            let cmd = if event.id == hotkey_previous.id() {
+                Command::PreviousSource
+            } else if event.id == hotkey_next.id() {
+                Command::NextSource
+            } else if event.id == hotkey_lock.id() {
+                Command::LockSource
+            } else if event.id == hotkey_unlock.id() {
+                Command::UnlockSource
             } else {
-                sender
-                    .send(Command::NextSource)
-                    .expect("Failed to send command!");
-            }
+                return;
+            };
+            sender.send(cmd).expect("Failed to send command!");
         };
 
         GlobalHotKeyEvent::set_event_handler(Some(hotkey_handler));

@@ -203,6 +203,11 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         // Flag to know if auto-change is enabled at all. With per-provider
         // intervals, "enabled" means any provider has a non-zero interval set.
         // If everything is 0, we skip the tick to save CPU.
+        // Provider lock state (Ctrl+Alt+Numpad- / Numpad+). When locked the
+        // rotation timer is suspended entirely; manual / and * movement still
+        // works and keeps the lock.
+        let mut provider_locked = false;
+
         let is_auto_change_enabled = config
             .get_int("interval.refresh")
             .map(|v| v != 0)
@@ -235,6 +240,27 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                             };
                             current.store(new, Ordering::SeqCst);
                             self.device.clear().await?;
+                        },
+                        Ok(Command::LockSource) => {
+                            if !provider_locked {
+                                provider_locked = true;
+                                log::info!(
+                                    "Provider LOCKED on '{}' — auto-rotation suspended",
+                                    provider_names
+                                        .get(current.load(Ordering::SeqCst))
+                                        .map(String::as_str)
+                                        .unwrap_or("?")
+                                );
+                            }
+                        },
+                        Ok(Command::UnlockSource) => {
+                            if provider_locked {
+                                provider_locked = false;
+                                // Restart the dwell from now so unlock doesn't
+                                // instantly rotate away.
+                                *time_last_change.borrow_mut() = Instant::now();
+                                log::info!("Provider UNLOCKED — auto-rotation resumed");
+                            }
                         },
                         _ => {}
                     }
@@ -306,7 +332,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     }
                 }
                 _ = change.tick() => {
-                    if is_auto_change_enabled {
+                    if is_auto_change_enabled && !provider_locked {
                         let current_time = Instant::now();
                         let elapsed_time = current_time - *time_last_change.borrow();
                         // Look up the dwell time for the CURRENT provider, not a
