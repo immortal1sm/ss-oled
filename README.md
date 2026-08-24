@@ -101,3 +101,27 @@ dwell times via `[interval]`; weather location via `[weather]`.
 - The original apex-tux authors — Linux support in the first place
 - [Open-Meteo](https://open-meteo.com/) — keyless weather API
 - [embedded-graphics](https://github.com/embedded-graphics/embedded-graphics) — rendering stack
+
+---
+
+# TODO
+
+Carried over from upstream, plus this fork's own roadmap:
+
+**Upstream TODOs (status noted where applicable):**
+- [ ] Windows support *(upstream goal; ss-oled is Linux-first for now)*
+- [ ] Test on more than one Desktop Environment on X11 *(ss-oled targets Wayland/KDE; X11 untested here)*
+- [x] More providers — GIFs ✅ (image provider + FS dithering), Weather/Forecast ✅
+- [ ] More providers — Games? (CS2/Dota Game State Integration would be the clean path)
+- [ ] Switch the USB crate to something async instead
+- [ ] Add documentation on how to add custom providers
+- [ ] Switch from GATs to async traits once they're stable
+- [ ] Add support for more notifications
+
+**ss-oled roadmap:**
+- [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
+- [ ] Idle blanking / dimming — real OLED burn-in mitigation
+- [ ] Wire up or remove the `units` config key (imperial conversion)
+- [ ] Restore city label somewhere non-overlapping on the weather screen
+- [ ] Package for Arch (AUR) / Flatpak
+- [ ] Demote diagnostic INFO logs in the focus path to DEBUG
