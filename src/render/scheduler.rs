@@ -246,27 +246,40 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     log::info!("Scheduler received focus event: {:?}", focus_event);
                     // A provider asked for focus. Find it by name and jump to it.
                     // If we're already showing mpris2, this is a no-op for the
-                    // active index — but we still reset the dwell timer so the
-                    // OLED stays on MPRIS while music events keep firing.
-                    // When the music stops (no more PropertiesChanged events
-                    // arrive), the 30s rotation timer naturally takes over.
+                    // active index AND we don't reset the dwell timer — the
+                    // rotation cycle continues normally. This is what makes
+                    // the OLED behave as a cycling display that ALSO responds
+                    // to media events: music activity briefly pulls focus,
+                    // then the cycle resumes from there.
+                    //
+                    // User intent: any music state change should jump to MPRIS
+                    // so the user can see what's playing. After that brief
+                    // view, rotation continues so other providers get screen
+                    // time too. Pause/stop will also fire PropertiesChanged
+                    // (Firefox does this on pause), which keeps the focus
+                    // behavior consistent.
                     if focus_event.is_ok() {
                         let active_idx = current.load(Ordering::SeqCst);
                         if let Some(target_idx) = provider_names
                             .iter()
                             .position(|n| n == "mpris2")
                         {
-                            let was_active = target_idx == active_idx;
-                            current.store(target_idx, Ordering::SeqCst);
-                            if !was_active {
+                            if target_idx != active_idx {
+                                current.store(target_idx, Ordering::SeqCst);
                                 let _ = self.device.clear().await;
+                                // Reset dwell on transition only — so the
+                                // OLED sits on MPRIS for its full 30s dwell
+                                // before rotating away.
+                                *time_last_change.borrow_mut() = Instant::now();
                                 log::info!("Provider focused: mpris2 (was idx {})", active_idx);
                             } else {
-                                log::info!("Refresh focus on mpris2 (events still firing)");
+                                log::debug!("Focus requested but already on mpris2 (no-op)");
                             }
-                            // Always reset the dwell timer so the OLED stays
-                            // on MPRIS while music events keep arriving.
-                            *time_last_change.borrow_mut() = Instant::now();
+                            // Note: we intentionally do NOT reset the dwell
+                            // timer when already on mpris2. This lets the
+                            // normal rotation cycle continue so other
+                            // providers get screen time even when music is
+                            // active.
                         } else {
                             log::warn!("Focus requested but mpris2 not in providers list");
                         }
@@ -293,6 +306,13 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                         if interval_secs > 0
                             && elapsed_time > Duration::from_secs(interval_secs)
                         {
+                            log::info!(
+                                "Rotation timer: rotating from {} (idx {}) after {}s (limit {}s)",
+                                active_name,
+                                active_idx,
+                                elapsed_time.as_secs(),
+                                interval_secs
+                            );
                             let _ = tx.send(Command::NextSource);
                         }
                     }
