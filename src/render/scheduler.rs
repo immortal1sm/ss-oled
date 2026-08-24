@@ -243,7 +243,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     }
                 }
                 focus_event = focus_rx.recv() => {
-                    log::debug!("Scheduler received focus event: {:?}", focus_event);
+                    log::info!("Scheduler received focus event: {:?}", focus_event);
                     // A provider asked for focus. Find it by name and jump to it.
                     // If we're already showing mpris2, this is a no-op for the
                     // active index — but we still reset the dwell timer so the
@@ -257,20 +257,15 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                             .position(|n| n == "mpris2")
                         {
                             let was_active = target_idx == active_idx;
+                            current.store(target_idx, Ordering::SeqCst);
                             if !was_active {
-                                current.store(target_idx, Ordering::SeqCst);
                                 let _ = self.device.clear().await;
                                 log::info!("Provider focused: mpris2 (was idx {})", active_idx);
                             } else {
-                                log::debug!("Refresh focus on mpris2 (events still firing)");
+                                log::info!("Refresh focus on mpris2 (events still firing)");
                             }
                             // Always reset the dwell timer so the OLED stays
-                            // on MPRIS while music events keep arriving. This
-                            // is what makes the OLED behave like a music HUD —
-                            // it shows the music screen as long as music is
-                            // active, and only rotates away after 30s of
-                            // silence (i.e., music stopped or paused without
-                            // further state changes).
+                            // on MPRIS while music events keep arriving.
                             *time_last_change.borrow_mut() = Instant::now();
                         } else {
                             log::warn!("Focus requested but mpris2 not in providers list");
