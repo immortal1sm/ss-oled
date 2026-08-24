@@ -243,27 +243,35 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     }
                 }
                 focus_event = focus_rx.recv() => {
-                    log::info!("Scheduler received focus event: {:?}", focus_event);
+                    log::debug!("Scheduler received focus event: {:?}", focus_event);
                     // A provider asked for focus. Find it by name and jump to it.
-                    // The current provider index points into the sorted providers
-                    // list; we look up the mpris2 provider's position and set
-                    // `current` to it. If we're already showing mpris2, no-op.
+                    // If we're already showing mpris2, this is a no-op for the
+                    // active index — but we still reset the dwell timer so the
+                    // OLED stays on MPRIS while music events keep firing.
+                    // When the music stops (no more PropertiesChanged events
+                    // arrive), the 30s rotation timer naturally takes over.
                     if focus_event.is_ok() {
                         let active_idx = current.load(Ordering::SeqCst);
                         if let Some(target_idx) = provider_names
                             .iter()
                             .position(|n| n == "mpris2")
                         {
-                            if target_idx != active_idx {
+                            let was_active = target_idx == active_idx;
+                            if !was_active {
                                 current.store(target_idx, Ordering::SeqCst);
-                                // Reset the dwell timer so we don't immediately
-                                // rotate away from the freshly-focused provider.
-                                *time_last_change.borrow_mut() = Instant::now();
                                 let _ = self.device.clear().await;
-                                info!("Provider focused: mpris2 (was idx {})", active_idx);
+                                log::info!("Provider focused: mpris2 (was idx {})", active_idx);
                             } else {
-                                log::info!("Focus requested but already on mpris2");
+                                log::debug!("Refresh focus on mpris2 (events still firing)");
                             }
+                            // Always reset the dwell timer so the OLED stays
+                            // on MPRIS while music events keep arriving. This
+                            // is what makes the OLED behave like a music HUD —
+                            // it shows the music screen as long as music is
+                            // active, and only rotates away after 30s of
+                            // silence (i.e., music stopped or paused without
+                            // further state changes).
+                            *time_last_change.borrow_mut() = Instant::now();
                         } else {
                             log::warn!("Focus requested but mpris2 not in providers list");
                         }
