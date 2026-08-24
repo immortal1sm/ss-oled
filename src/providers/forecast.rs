@@ -92,8 +92,9 @@ fn render_day(
             .draw(buffer)?;
     }
 
-    // Day header bottom-left under the icon area, y=30..39 (last safe row)
-    let header = if idx == 1 { "TOMORROW" } else { "FORECAST" };
+    // Day header bottom-left under the icon area, y=30..39 (last safe row).
+    // Shows the short weekday label (M|T|W|TH|F|ST|S) for this day.
+    let header = day.day_label();
     let m = mid.measure_string(header, Point::zero(), Baseline::Top);
     let hx = (128 - m.bounding_box.size.width as i32) / 2 + offset_x;
     Text::with_baseline(header, Point::new(hx, 30), mid, Baseline::Top).draw(buffer)?;
