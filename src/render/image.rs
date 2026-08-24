@@ -30,130 +30,117 @@ pub struct ImageRenderer {
 }
 
 impl ImageRenderer {
-    pub fn calculate_median_color_value(
-        image: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
-        image_height: i32,
-        image_width: i32,
-    ) -> u8 {
-        //NOTE we're using the median to determine wether the pixel should be black or
-        // white
-
-        let mut colors = (0..=255).into_iter().map(|_| 0).collect::<Vec<u32>>();
-        let mut num_pixels_alpha = 0;
-
-        let height = image.height();
-        let width = image.width();
-
-        for y in 0..image_height {
-            //if y is outside of the gif width
-            if y >= height as i32 {
-                continue;
-            }
-
-            //if y is outside of the screen
-            if y >= DISPLAY_HEIGHT {
-                continue;
-            }
-            for x in 0..image_width {
-                //if x is outside of the gif width
-                if x >= width as i32 {
-                    continue;
-                }
-
-                //if x is outside of the screen
-                if x >= DISPLAY_WIDTH {
-                    continue;
-                }
-
-                let pixel = image.get_pixel(x as u32, y as u32);
-
-                let avg_pixel_value =
-                    ((u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2])) / 3)
-                        as usize;
-
-                //the value is multiplied by the alpha (a) of said pixel
-                //the more the pixel is transparent, the less the pixel has an importance
-                colors[avg_pixel_value] += u32::from(pixel[3]);
-
-                //We need the number of non-transparent pixels
-                num_pixels_alpha += u32::from(pixel[3]);
-            }
-        }
-        //the alpha are in the 0-255 range
-        num_pixels_alpha /= 255;
-
-        let mut sum = 0;
-        for (color_value, count) in colors.iter().enumerate() {
-            sum += *count / 255;
-
-            if sum >= num_pixels_alpha / 2 {
-                if color_value == 0 {
-                    return 1;
-                }
-                return color_value as u8;
-            }
-        }
-
-        1
-    }
-
     pub fn read_image(
         image: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
         image_height: i32,
         image_width: i32,
     ) -> Vec<u8> {
-        // We first get the median "color" of the frame
-        let median_color = Self::calculate_median_color_value(image, image_height, image_width);
-
-        let mut frame_data = Vec::new();
-        let mut buf: u8 = 0;
+        // Floyd–Steinberg error-diffusion dithering.
+        //
+        // The OLED panel is strictly 1-bit (one bit per pixel, MSB-first per
+        // row — see gamesense-sdk json-handlers-screen.md). There is no
+        // grayscale on the wire, so multi-tone images can only fake shades
+        // through pixel density. A single global median threshold (the old
+        // approach) flattens mid-tones: every pixel of a grey area lands on
+        // one side of the cut and the shade is lost entirely.
+        //
+        // Error diffusion instead quantizes each pixel against a local,
+        // evolving threshold: after snapping a pixel to black or white, the
+        // quantization error is distributed to its not-yet-visited neighbors
+        // (right 7/16, bottom-left 3/16, bottom 5/16, bottom-right 1/16).
+        // Bright regions end up with ~their brightness fraction of lit
+        // pixels scattered in a fine pattern that the eye averages back
+        // into a perceived shade — the same trick SteelSeries GG uses when
+        // importing GIFs on Windows.
 
         let height = image.height();
         let width = image.width();
 
+        // Step 1: build a float luminance plane, compositing alpha over
+        // black (the panel's background is black, so transparent pixels
+        // contribute zero light rather than their raw RGB).
+        let mut luma = vec![0f32; (image_width * image_height) as usize];
         for y in 0..image_height {
-            //if y is outside of the gif width
-            if y >= height as i32 {
-                continue;
-            }
-
-            //if y is outside of the screen
-            if y >= DISPLAY_HEIGHT {
+            if y >= height as i32 || y >= DISPLAY_HEIGHT {
                 continue;
             }
             for x in 0..image_width {
-                //since we're using an array of u8, every 8 bit we need to start with a new int
-                if x % 8 == 0 && x != 0 {
-                    frame_data.push(buf);
-                    buf = 0;
-                }
-                //if x is outside of the gif width
-                if x >= width as i32 {
+                if x >= width as i32 || x >= DISPLAY_WIDTH {
                     continue;
                 }
+                let p = image.get_pixel(x as u32, y as u32);
+                let r = u32::from(p[0]);
+                let g = u32::from(p[1]);
+                let b = u32::from(p[2]);
+                // Rec.601-ish luma approximation (same weighting family as
+                // the old mean, but properly scaled to 0..255).
+                let lum = (r * 299 + g * 587 + b * 114) / 1000;
+                let alpha = u32::from(p[3]);
+                // Composite over black.
+                let composited = lum * alpha / 255;
+                luma[(y * image_width + x) as usize] = composited as f32;
+            }
+        }
 
-                //if x is outside of the screen
-                if x >= DISPLAY_WIDTH {
-                    continue;
-                }
+        // Step 2: serpentine-free (raster order) Floyd–Steinberg. Threshold
+        // is 128 (half of full brightness); everything below pushes its
+        // residual rightward/downward so local density tracks local tone.
+        const THRESHOLD: f32 = 128.0;
 
-                //getting the value of the pixel
-                let pixel = image.get_pixel(x as u32, y as u32);
+        let mut frame_data = Vec::new();
+        let mut buf: u8 = 0;
 
-                let mean = (u32::from(pixel[0]) / 3)
-                    + (u32::from(pixel[1]) / 3)
-                    + (u32::from(pixel[2]) / 3);
-                //I'm not sure if we should do something with the alpha channel of the gif
-                //I decided not to, but maybe we should
+        for y in 0..image_height {
+            let row_in_bounds = y < height as i32 && y < DISPLAY_HEIGHT;
+            for x in 0..image_width {
+                let col_in_bounds = x < width as i32 && x < DISPLAY_WIDTH;
 
-                if mean >= u32::from(median_color) {
-                    //which bit to turn on
+                let old = if row_in_bounds && col_in_bounds {
+                    luma[(y * image_width + x) as usize]
+                } else {
+                    0.0
+                };
+
+                let new = if old >= THRESHOLD { 255.0 } else { 0.0 };
+                let err = old - new;
+
+                if new > 0.0 {
                     let shift = x % 8;
                     buf += 128 >> shift;
                 }
+
+                if col_in_bounds && row_in_bounds {
+                    // Distribute error to neighbors. Out-of-screen neighbors
+                    // are simply dropped (their slots in `luma` still exist
+                    // but are never read into frame_data).
+                    let mut push = |dx: i32, dy: i32, factor: f32| {
+                        let nx = x + dx;
+                        let ny = y + dy;
+                        if nx < 0 || ny < 0 || nx >= image_width || ny >= image_height {
+                            return;
+                        }
+                        let idx = (ny * image_width + nx) as usize;
+                        luma[idx] += err * factor;
+                    };
+                    push(1, 0, 7.0 / 16.0); // right
+                    push(-1, 1, 3.0 / 16.0); // bottom-left
+                    push(0, 1, 5.0 / 16.0); // bottom
+                    push(1, 1, 1.0 / 16.0); // bottom-right
+                }
+
+                //since we're using an array of u8, every 8 bit we need to start with a new int
+                if x % 8 == 7 {
+                    frame_data.push(buf);
+                    buf = 0;
+                }
             }
-            //we forcibly push the frame to the buffer after each line
-            frame_data.push(buf);
+            // Row-end flush: only needed when the screen width isn't a
+            // multiple of 8 (the inner loop already flushed complete bytes
+            // at every x%8==7). For our 128px panel this never fires; it
+            // exists so a future odd-width display still packs correctly.
+            if image_width % 8 != 0 {
+                frame_data.push(buf);
+            }
             buf = 0;
         }
         frame_data
