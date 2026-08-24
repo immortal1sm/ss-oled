@@ -135,5 +135,8 @@ Carried over from upstream, plus this fork's own roadmap:
 **ss-oled roadmap:**
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
+- [ ] GUI config editor + system tray — edit settings.toml visually; tray icon
+      to start/stop/restart the service, toggle rotation lock, and switch
+      providers without opening a terminal
 - [ ] Package for Arch (AUR) / Flatpak
 - [ ] Demote diagnostic INFO logs in the focus path to DEBUG
