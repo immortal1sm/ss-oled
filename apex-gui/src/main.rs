@@ -499,8 +499,8 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                     *SEARCH.lock().unwrap() = Some(rx);
             }
 
-            text_field(ui, app, "weather.latitude", "Latitude");
-            text_field(ui, app, "weather.longitude", "Longitude");
+            float_field(ui, app, "weather.latitude", "Latitude");
+            float_field(ui, app, "weather.longitude", "Longitude");
             text_field(ui, app, "weather.timezone", "Timezone");
             ui.horizontal(|ui| {
                 ui.label("Units:");
@@ -537,6 +537,25 @@ fn text_field(ui: &mut egui::Ui, app: &mut App, key: &str, label: &str) {
         let mut s = app.get_str(key);
         if ui.text_edit_singleline(&mut s).lost_focus() && !s.is_empty() {
             app.set_str(key, &s);
+        }
+    });
+}
+
+fn float_field(ui: &mut egui::Ui, app: &mut App, key: &str, label: &str) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        // Display works for both Float and legacy String values; edits write
+        // back as proper floats.
+        let mut display = match app.get_value(key) {
+            Some(toml::Value::Float(f)) => f.to_string(),
+            Some(toml::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let response = ui.text_edit_singleline(&mut display);
+        if response.changed() || response.lost_focus() {
+            if let Ok(v) = display.trim().parse::<f64>() {
+                app.set_value(key, toml::Value::Float(v));
+            }
         }
     });
 }
