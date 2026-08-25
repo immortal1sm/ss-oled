@@ -12,6 +12,7 @@ members = [
     "apex-music",
     "apex-simulator",
     "apex-input",
+    "apex-tray",
     "apex-engine",
     "apex-windows"
 ]
