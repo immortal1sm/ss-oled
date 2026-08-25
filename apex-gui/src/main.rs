@@ -411,28 +411,41 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                     let q = query.trim().to_string();
                     let (tx, rx) = mpsc::channel();
                     std::thread::spawn(move || {
-                        let url = format!(
-                            "https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language=en&format=json"
-                        );
-                        let result = (|| {
-                            let body = ureq::get(&url)
-                                .timeout(std::time::Duration::from_secs(8))
-                                .call()?
-                                .into_string()?;
-                            let v: serde_json::Value = serde_json::from_str(&body)?;
-                            let hit = v["results"]
-                                .get(0)
-                                .ok_or_else(|| anyhow::anyhow!("no results found"))?;
-                            Ok(format!(
-                                "{}|{}|{}|{}",
-                                hit["latitude"].as_f64().unwrap_or(0.0),
-                                hit["longitude"].as_f64().unwrap_or(0.0),
-                                hit["timezone"].as_str().unwrap_or("auto"),
-                                hit["name"].as_str().unwrap_or("")
-                            ))
-                        })()
-                        .map_err(|e: anyhow::Error| e.to_string());
-                        let _ = tx.send(result);
+                        // Try the full query first; on zero results, progressively
+                        // drop trailing words ("Science City of Munoz" -> "Science
+                        // City of" -> "Science City"...). The geocoder's DB uses
+                        // short canonical names ("Munoz"), so formal multi-word
+                        // names often miss.
+                        let result = (|| -> anyhow::Result<String> {
+                            let mut attempt: Vec<&str> = q.split_whitespace().collect();
+                            loop {
+                                let name = attempt.join(" ");
+                                if name.is_empty() {
+                                    anyhow::bail!("no results - try a shorter city name");
+                                }
+                                let url = format!(
+                                    "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
+                                    urlencode(&name)
+                                );
+                                let body = ureq::get(&url)
+                                    .timeout(std::time::Duration::from_secs(8))
+                                    .call()?
+                                    .into_string()?;
+                                let v: serde_json::Value =
+                                    serde_json::from_str(&body)?;
+                                if let Some(hit) = v["results"].get(0) {
+                                    return Ok(format!(
+                                        "{}|{}|{}|{}",
+                                        hit["latitude"].as_f64().unwrap_or(0.0),
+                                        hit["longitude"].as_f64().unwrap_or(0.0),
+                                        hit["timezone"].as_str().unwrap_or("auto"),
+                                        hit["name"].as_str().unwrap_or(""),
+                                    ));
+                                }
+                                attempt.pop();
+                            }
+                        })();
+                        result
                     });
                     *SEARCH.lock().unwrap() = Some(rx);
                 }
@@ -539,6 +552,20 @@ fn ensure_interval_table(app: &mut App) -> &mut toml::value::Table {
     root.get_mut("interval")
         .and_then(|v| v.as_table_mut())
         .expect("interval is a table")
+}
+
+/// Percent-encode a string for use as a URL query value.
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 fn main() -> Result<()> {
