@@ -47,6 +47,9 @@ pub struct IpcHandle {
     /// Names of registered providers in rotation order.
     pub provider_names: Arc<Vec<String>>,
     pub current: Arc<std::sync::atomic::AtomicUsize>,
+    /// Shared dwell clock — IPC switches restart it so an already-elapsed
+    /// dwell can't instantly rotate away the provider we just switched to.
+    pub last_change: Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 impl IpcHandle {
@@ -57,6 +60,7 @@ impl IpcHandle {
             locked: Arc::new(AtomicBool::new(false)),
             provider_names: Arc::new(provider_names),
             current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_change: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         }
     }
 
@@ -123,8 +127,27 @@ async fn serve(stream: UnixStream, handle: IpcHandle) -> Result<()> {
             None => (cmd, ""),
         };
 
+        // Switching commands restart the dwell clock so an already-elapsed
+        // dwell can't instantly rotate away what we just switched to.
+        if matches!(cmd, "next" | "prev") || cmd.starts_with("goto") {
+            *handle.last_change.lock().unwrap() = std::time::Instant::now();
+        }
+
         let response = match cmd {
-            "next" | "prev" => {
+            "next" | "prev" | "goto" => {
+                // Any switch restarts the dwell clock.
+                *handle.last_change.lock().unwrap() = std::time::Instant::now();
+            }
+            _ => {}
+
+        let cmd = cmd;
+        // Switching commands restart the dwell clock so an already-elapsed
+        // dwell can't instantly rotate away what we just switched to.
+        if matches!(cmd, "next" | "prev") || cmd.starts_with("goto") {
+            *handle.last_change.lock().unwrap() = std::time::Instant::now();
+        }
+
+        let response = match cmd {
                 // Rotation is allowed even when locked — manual movement
                 // carries the lock, matching hotkey semantics.
                 let c = if cmd == "next" {

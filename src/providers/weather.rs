@@ -33,6 +33,11 @@ struct Weather {
     cache: std::sync::Arc<WeatherCache>,
     units: Units,
     label: String,
+    /// Seconds the today view stays on screen (weather.duration).
+    today_secs: u64,
+    /// Seconds for the whole 5-day forecast cycle; each page gets 1/5
+    /// (weather.forecast_duration).
+    forecast_secs: u64,
 }
 
 impl Weather {
@@ -110,9 +115,10 @@ impl ContentProvider for Weather {
             let mut tick = interval(Duration::from_millis(300));
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-            const TODAY_MS: u64 = 10_000;   // today's view
-            const PAGE_MS: u64 = 3_000;     // per forecast day
-            const SLIDE_STEPS: i32 = 5;     // frames per push transition
+            // Configurable via [weather] duration / forecast_duration.
+            let today_ms = self.today_secs.saturating_mul(1000).max(1_000);
+            let page_ms = (self.forecast_secs.saturating_mul(1000) / 5).max(500);
+            let slide_steps: i32 = 5;
 
             let mut anim = 0usize;
             let mut phase_ms = 0u64;
@@ -133,7 +139,7 @@ impl ContentProvider for Weather {
                     // Push transition between forecast pages.
                     let mut buffer = FrameBuffer::new();
                     if let Some(d) = &data {
-                        let step_w = 128 / SLIDE_STEPS;
+                        let step_w = 128 / slide_steps;
                         let progress = trans_step + 1;
                         let out_off = -progress * step_w;
                         let in_off = 128 - progress * step_w;
@@ -171,16 +177,16 @@ impl ContentProvider for Weather {
 
                 if transitioning {
                     trans_step += 1;
-                    if trans_step >= SLIDE_STEPS {
+                    if trans_step >= slide_steps {
                         transitioning = false;
                         phase_ms = 0;
                     }
-                } else if !in_forecast && phase_ms >= TODAY_MS {
+                } else if !in_forecast && phase_ms >= today_ms {
                     // Enter forecast cycle at tomorrow (day index 1).
                     in_forecast = true;
                     page = 1;
                     phase_ms = 0;
-                } else if in_forecast && phase_ms >= PAGE_MS {
+                } else if in_forecast && phase_ms >= page_ms {
                     // Slide to the next day; after day 5, back to today.
                     let next = if page >= 5 { 0 } else { page + 1 };
                     prev_page = page;
@@ -205,6 +211,9 @@ fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn
     info!("Registering Weather display source.");
 
     let enabled = config.get_bool("weather.enabled").unwrap_or(false);
+    let today_secs = config.get_int("weather.duration").unwrap_or(10).max(1) as u64;
+    let forecast_secs =
+        config.get_int("weather.forecast_duration").unwrap_or(30).max(5) as u64;
     if !enabled {
         anyhow::bail!("weather provider disabled");
     }
@@ -220,5 +229,7 @@ fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn
         cache,
         units,
         label,
+        today_secs,
+        forecast_secs,
     }))
 }
