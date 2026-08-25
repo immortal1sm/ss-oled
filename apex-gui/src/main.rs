@@ -32,6 +32,8 @@ struct App {
     doc: toml::Value,
     /// Provider names in current display order (from priority ints).
     providers: Vec<String>,
+    /// Currently selected provider (drives the right-hand settings panel).
+    selected: Option<String>,
     /// Status line for the UI.
     status: String,
 }
@@ -44,6 +46,7 @@ impl App {
             config_path: path,
             doc,
             providers: Vec::new(),
+            selected: None,
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -174,66 +177,111 @@ impl eframe::App for App {
             ui.heading("ss-oled configuration");
             ui.add_space(8.0);
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // ---- Rotation order ----
-                ui.group(|ui| {
-                    ui.label("Rotation order (top = first shown)");
-                    ui.add_space(4.0);
+            // Two-column layout: providers list | selected provider settings.
+            let available = ui.available_size();
+            let panel_w = (available.x * 0.38).max(220.0);
 
-                    let mut move_up: Option<usize> = None;
-                    let mut move_down: Option<usize> = None;
+            ui.horizontal(|ui| {
+                // ================= LEFT: provider list =================
+                egui::ScrollArea::vertical()
+                    .id_source("provider_list")
+                    .show(ui, |ui| {
+                        ui.set_width(panel_w);
+                        ui.set_min_height(available.y - 90.0);
+                        ui.group(|ui| {
+                            ui.label("Rotation order (drag to rearrange)");
+                            ui.add_space(4.0);
 
-                    for (idx, name) in self.providers.clone().iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            let enabled_key = format!("{name}.enabled");
-                            let mut enabled = self.get_bool(&enabled_key);
-                            if ui.checkbox(&mut enabled, "").changed() {
-                                self.set_bool(&enabled_key, enabled);
+                            // Drag state for this frame.
+                            let mut drag_from: Option<usize> = None;
+                            let mut drop_at: Option<usize> = None;
+
+                            for (idx, name) in self.providers.clone().iter().enumerate() {
+                                let is_selected = self.selected.as_deref() == Some(name);
+                                let response = ui.horizontal(|ui| {
+                                    // Enable checkbox on the LEFT of the label.
+                                    let enabled_key = format!("{name}.enabled");
+                                    let mut enabled = self.get_bool(&enabled_key);
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        self.set_bool(&enabled_key, enabled);
+                                    }
+
+                                    // Provider title acts as the drag handle + selector.
+                                    let label = ui.selectable_label(is_selected, name.as_str());
+                                    if label.clicked() {
+                                        self.selected = Some(name.clone());
+                                    }
+                                    label
+                                });
+
+                                // Drag detection: sense drag on the row.
+                                let row_resp = ui.allocate_rect(
+                                    response.response.rect,
+                                    egui::Sense::click_and_drag(),
+                                );
+                                if row_resp.drag_started() {
+                                    drag_from = Some(idx);
+                                }
+                                let pointer_pos = if row_resp.dragged() {
+                                    ui.input(|i| i.pointer.hover_pos())
+                                } else {
+                                    None
+                                };
+                                if row_resp.dragged() && pointer_pos.is_some() {
+                                    let pointer_pos = pointer_pos.unwrap();
+                                    // Which row is the pointer over now?
+                                    for (other_idx, other_name) in
+                                        self.providers.clone().iter().enumerate()
+                                    {
+                                        if other_name == name {
+                                            continue;
+                                        }
+                                        // We can't easily get each row's rect here,
+                                        // so approximate: pointer above/below this
+                                        // row's rect by more than a row height swaps.
+                                        let dy = pointer_pos.y - row_resp.rect.center().y;
+                                        let row_h = row_resp.rect.height();
+                                        if dy < -row_h && other_idx == idx.saturating_sub(1) {
+                                            drop_at = Some(idx - 1);
+                                        } else if dy > row_h
+                                            && other_idx == idx + 1
+                                            && idx + 1 < self.providers.len()
+                                        {
+                                            drop_at = Some(idx + 1);
+                                        }
+                                    }
+                                }
                             }
 
-                            ui.label(name.as_str());
-
-                            if ui.button("▲").clicked() && idx > 0 {
-                                move_up = Some(idx);
-                            }
-                            if ui.button("▼").clicked() && idx < self.providers.len() - 1 {
-                                move_down = Some(idx);
+                            if let (Some(from), Some(to)) = (drag_from, drop_at) {
+                                let item = self.providers.remove(from);
+                                self.providers.insert(to, item);
+                                self.sync_priorities();
                             }
                         });
-                    }
-
-                    if let Some(i) = move_up {
-                        self.providers.swap(i, i - 1);
-                        self.sync_priorities();
-                    }
-                    if let Some(i) = move_down {
-                        self.providers.swap(i, i + 1);
-                        self.sync_priorities();
-                    }
-                });
-
-                ui.add_space(8.0);
-
-                // ---- Global dwell ----
-                ui.horizontal(|ui| {
-                    ui.label("Default dwell (s):");
-                    let mut refresh = self.get_int("interval.refresh");
-                    if ui.add(egui::DragValue::new(&mut refresh).clamp_range(1..=600)).changed() {
-                        self.set_int("interval.refresh", refresh);
-                    }
-                });
-
-                ui.add_space(12.0);
-
-                // ---- Per-provider tabs ----
-                ui.heading("Providers");
-                let tab_names: Vec<String> = self.providers.clone();
-                for name in &tab_names {
-                    let title = name.clone();
-                    ui.collapsing(title, |ui| {
-                        provider_section(ui, self, name);
                     });
-                }
+
+                ui.separator();
+
+                // ================= RIGHT: settings panel =================
+                egui::ScrollArea::vertical()
+                    .id_source("settings_panel")
+                    .show(ui, |ui| {
+                        ui.set_min_height(available.y - 90.0);
+                        let selected = self.selected.clone();
+                        match selected.as_deref() {
+                            Some(name) => {
+                                ui.heading(name.to_string());
+                                ui.add_space(4.0);
+                                provider_section(ui, self, name);
+                            }
+                            None => {
+                                ui.label(
+                                    "Select a provider on the left to edit its settings.",
+                                );
+                            }
+                        }
+                    });
             });
 
             ui.separator();
@@ -253,8 +301,7 @@ impl eframe::App for App {
     }
 }
 
-/// Generic per-provider field rendering. Each built-in provider gets its
-/// known keys; unknown providers show whatever standard keys exist.
+
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
     let dwell_key = format!("interval.{name}");
     ui.horizontal(|ui| {
