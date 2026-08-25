@@ -119,11 +119,6 @@ Carried over from upstream, plus this fork's own roadmap:
   ss-oled is display-server independent *by design*. It talks only to DBus,
   kernel HID, and the network — the codebase contains no X11/Wayland calls, and
   the release binary doesn't even link libX11. 
-| Environment | Status |
-|---|---|
-| KDE Wayland | ✅ fully verified — primary target |
-| X11-based systems | ⚠️ upstream's original environment; untested by us but architecturally identical |
-| non-KDE DEs | ⚠️ everything works except global hotkeys |
 - [x] More providers — GIFs ✅ (image provider + FS dithering), Weather/Forecast ✅
 - [ ] More providers — Games? 
 - [ ] Switch the USB crate to something async instead *(upstream tracks hidapi-rs#51; `nusb` is the likely successor)*
