@@ -128,12 +128,27 @@ static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper
 fn register_callback(config: &Config, focus_tx: FocusChannel) -> Result<Box<dyn ContentWrapper>> {
     info!("Registering MPRIS2 display source.");
 
+    let event_focus = config.get_bool("mpris2.event_focus").unwrap_or(true);
+    let show_timer = config.get_bool("mpris2.show_timer").unwrap_or(true);
+    let show_source_label =
+        config.get_bool("mpris2.show_source_label").unwrap_or(true);
+
     let player = match config.get_str("mpris2.preferred_player") {
         Ok(name) => MediaPlayerBuilder::new()
             .with_player_name(name)
+            .with_event_focus(event_focus)
+            .with_display_options(show_timer, show_source_label)
             .with_focus_tx(focus_tx),
-        Err(_) => MediaPlayerBuilder::new().with_focus_tx(focus_tx),
+        Err(_) => MediaPlayerBuilder::new()
+            .with_event_focus(event_focus)
+            .with_display_options(show_timer, show_source_label)
+            .with_focus_tx(focus_tx),
     };
+
+    info!(
+        "MPRIS2 options: event_focus={} show_timer={} show_source_label={}",
+        event_focus, show_timer, show_source_label
+    );
 
     Ok(Box::new(player))
 }
