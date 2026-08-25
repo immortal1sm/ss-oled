@@ -44,8 +44,8 @@ Configure your location in `settings.toml`:
 ```toml
 [weather]
 enabled = true
-latitude = 15.71611        # your coordinates
-longitude = 120.90306
+latitude =        # your coordinates
+longitude = 
 timezone = "Asia/Manila"
 units = "metric"
 label = "Manila"
