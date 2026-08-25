@@ -305,7 +305,6 @@ impl eframe::App for App {
                 }
             }
 
-
             // ---------- Geocoding search result delivery ----------
             // Polled globally so a search completes even if the user switches
             // provider tabs or collapses the weather section mid-request.
@@ -337,9 +336,11 @@ impl eframe::App for App {
                             *SEARCH.lock().unwrap() = None;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            // Still running: put the receiver back.
+                            // Still running: put the receiver back; surface
+                            // which query variant is being tried right now.
                             *SEARCH.lock().unwrap() = pending.take();
-                            self.status = "Searching…".into();
+                            let progress = SEARCH_PROGRESS.lock().unwrap().clone();
+                            self.status = format!("Searching: '{progress}'…");
                         }
                         Err(_) => {
                             *SEARCH.lock().unwrap() = None;
@@ -456,47 +457,53 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             if do_search {
                 let q = query.trim().to_string();
                 app.status = format!("Searching for '{q}'…");
-                    let (tx, rx) = mpsc::channel();
-                    std::thread::spawn(move || {
-                        // Try the full query first; on zero results, progressively
-                        // drop trailing words ("Science City of Munoz" -> "Science
-                        // City of" -> "Science City"...). The geocoder's DB uses
-                        // short canonical names ("Munoz"), so formal multi-word
-                        // names often miss.
-                        // Try the full query first; on zero results retry with
-                        // right-truncated variants ("Science City of Munoz" ->
-                        // "City of Munoz" -> "of Munoz" -> "Munoz"). The geocoder
-                        // indexes short canonical names, and the LAST word of a
-                        // formal name is usually the actual city.
-                        let result = (|| -> anyhow::Result<String> {
-                            let words: Vec<&str> = q.split_whitespace().collect();
-                            for start in 0..words.len() {
-                                let name = words[start..].join(" ");
-                                let url = format!(
+                *SEARCH_PROGRESS.lock().unwrap() = q.clone();
+                let (tx, rx) = mpsc::channel();
+                // Overall budget for ALL fallback attempts combined.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                std::thread::spawn(move || {
+                    // Try the full query first; on zero results, progressively
+                    // drop trailing words ("Science City of Munoz" -> "Science
+                    // City of" -> "Science City"...). The geocoder's DB uses
+                    // short canonical names ("Munoz"), so formal multi-word
+                    // names often miss.
+                    // Try the full query first; on zero results retry with
+                    // right-truncated variants ("Science City of Munoz" ->
+                    // "City of Munoz" -> "of Munoz" -> "Munoz"). The geocoder
+                    // indexes short canonical names, and the LAST word of a
+                    // formal name is usually the actual city.
+                    let result = (|| -> anyhow::Result<String> {
+                        let words: Vec<&str> = q.split_whitespace().collect();
+                        for start in 0..words.len() {
+                            if std::time::Instant::now() >= deadline {
+                                anyhow::bail!("timed out - try a shorter city name");
+                            }
+                            let name = words[start..].join(" ");
+                            *SEARCH_PROGRESS.lock().unwrap() = name.clone();
+                            let url = format!(
                                     "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
                                     urlencode(&name)
                                 );
-                                let body = ureq::get(&url)
-                                    .timeout(std::time::Duration::from_secs(5))
-                                    .call()?
-                                    .into_string()?;
-                                let v: serde_json::Value =
-                                    serde_json::from_str(&body)?;
-                                if let Some(hit) = v["results"].get(0) {
-                                    return Ok(format!(
-                                        "{}|{}|{}|{}",
-                                        hit["latitude"].as_f64().unwrap_or(0.0),
-                                        hit["longitude"].as_f64().unwrap_or(0.0),
-                                        hit["timezone"].as_str().unwrap_or("auto"),
-                                        hit["name"].as_str().unwrap_or(""),
-                                    ));
-                                }
+                            let body = ureq::get(&url)
+                                .timeout(std::time::Duration::from_secs(5))
+                                .call()?
+                                .into_string()?;
+                            let v: serde_json::Value = serde_json::from_str(&body)?;
+                            if let Some(hit) = v["results"].get(0) {
+                                return Ok(format!(
+                                    "{}|{}|{}|{}",
+                                    hit["latitude"].as_f64().unwrap_or(0.0),
+                                    hit["longitude"].as_f64().unwrap_or(0.0),
+                                    hit["timezone"].as_str().unwrap_or("auto"),
+                                    hit["name"].as_str().unwrap_or(""),
+                                ));
                             }
-                            anyhow::bail!("no results - try a shorter city name")
-                        })();
-                        result
-                    });
-                    *SEARCH.lock().unwrap() = Some(rx);
+                        }
+                        anyhow::bail!("no results - try a shorter city name")
+                    })();
+                    result
+                });
+                *SEARCH.lock().unwrap() = Some(rx);
             }
 
             float_field(ui, app, "weather.latitude", "Latitude");
@@ -597,9 +604,11 @@ fn urlencode(s: &str) -> String {
 }
 
 /// Geocoding search state: weather tab spawns, global poll delivers.
-static SEARCH: std::sync::Mutex<
-    Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-> = std::sync::Mutex::new(None);
+static SEARCH: std::sync::Mutex<Option<std::sync::mpsc::Receiver<Result<String, String>>>> =
+    std::sync::Mutex::new(None);
+
+/// Live progress text from the running search thread (current query variant).
+static SEARCH_PROGRESS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 fn main() -> Result<()> {
     let path = std::env::args()
