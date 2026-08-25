@@ -13,6 +13,7 @@ members = [
     "apex-simulator",
     "apex-input",
     "apex-tray",
+    "apex-gui",
     "apex-engine",
     "apex-windows"
 ]
