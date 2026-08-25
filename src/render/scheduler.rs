@@ -147,7 +147,15 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         //
         // Errors are non-fatal: if the system doesn't have kglobalaccel (rare),
         // we just don't get this bonus signal source.
-        tokio::spawn(subscribe_media_keys(focus_tx.clone()));
+        // Media-key jumps honor mpris2.event_focus: when the user disables
+        // event focus, physical media keys no longer yank the screen either.
+        let media_key_focus_enabled = Arc::new(AtomicBool::new(
+            config.get_bool("mpris2.event_focus").unwrap_or(true),
+        ));
+        tokio::spawn(subscribe_media_keys(
+            focus_tx.clone(),
+            Arc::clone(&media_key_focus_enabled),
+        ));
 
         let current = Arc::new(AtomicUsize::new(0));
         info!("Found {} registered providers", providers.len());
@@ -197,7 +205,6 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             .collect::<Vec<_>>();
         let size = providers.len();
         let z = current.clone();
-
 
         let mut y = multiplex(providers, move || z.load(Ordering::SeqCst));
 
@@ -326,6 +333,12 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                             log::debug!("Focus event ignored (provider locked)");
                         } else {
                             let active_idx = current.load(Ordering::SeqCst);
+                            log::info!(
+                                "FOCUS DEBUG: active_idx={} target={:?} order={:?}",
+                                active_idx,
+                                provider_names.iter().position(|n| n == "mpris2"),
+                                provider_names
+                            );
                             if let Some(target_idx) = provider_names
                                 .iter()
                                 .position(|n| n == "mpris2")
@@ -463,7 +476,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
 /// We filter to `componentUnique == "mediacontrol"` so we don't react to
 /// volume/brightness/etc. shortcuts.
 
-async fn subscribe_media_keys(focus_tx: FocusChannel) {
+async fn subscribe_media_keys(focus_tx: FocusChannel, event_focus_enabled: Arc<AtomicBool>) {
     use dbus::message::{MatchRule, MessageType};
     use dbus_tokio::connection;
 
@@ -521,6 +534,13 @@ async fn subscribe_media_keys(focus_tx: FocusChannel) {
             _ => ("", ""),
         };
         if component == "mediacontrol" {
+            if !event_focus_enabled.load(Ordering::SeqCst) {
+                log::debug!(
+                    "KDE media key pressed: {} (event_focus off, no jump)",
+                    shortcut
+                );
+                continue;
+            }
             log::info!("KDE media key pressed: {} (sending focus)", shortcut);
             let _ = focus_tx.send(ProviderWantsFocus);
         } else if !component.is_empty() {
