@@ -34,6 +34,7 @@ impl ImageRenderer {
         image: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
         image_height: i32,
         image_width: i32,
+        dither: bool,
     ) -> Vec<u8> {
         // Floyd–Steinberg error-diffusion dithering.
         //
@@ -109,10 +110,11 @@ impl ImageRenderer {
                     buf += 128 >> shift;
                 }
 
-                if col_in_bounds && row_in_bounds {
-                    // Distribute error to neighbors. Out-of-screen neighbors
-                    // are simply dropped (their slots in `luma` still exist
-                    // but are never read into frame_data).
+                if dither && col_in_bounds && row_in_bounds {
+                    // Distribute error to neighbors (Floyd-Steinberg). When
+                    // `dither` is off, this is skipped: pixels snap against
+                    // a flat 128 threshold — hard-edged logos and pixel art
+                    // often look crisper that way.
                     let mut push = |dx: i32, dy: i32, factor: f32| {
                         let nx = x + dx;
                         let ny = y + dy;
@@ -167,6 +169,7 @@ impl ImageRenderer {
         stop: Point,
         image: DynamicImage,
         buffer: &[u8],
+        dither: bool,
     ) -> Self {
         //we first get the dimension of the image
         let image_height = stop.y - origin.y;
@@ -199,6 +202,7 @@ impl ImageRenderer {
                         &resized.into_rgba8(),
                         image_height,
                         image_width,
+                        dither,
                     ));
                 }
             }
@@ -209,6 +213,7 @@ impl ImageRenderer {
                 &resized.into_rgba8(),
                 image_height,
                 image_width,
+                dither,
             ));
             delays.push(500); // Add a default delay of 500ms for single image
                               // rendering
@@ -224,31 +229,31 @@ impl ImageRenderer {
         }
     }
 
-    pub fn new(origin: Point, stop: Point, mut file: File) -> Self {
+    pub fn new(origin: Point, stop: Point, mut file: File, dither: bool) -> Self {
         let mut buffer = Vec::new();
         if let Ok(_) = file.read_to_end(&mut buffer) {
             if let Ok(image) = image::load_from_memory(&buffer) {
-                Self::read_dynamic_image(origin, stop, image, &buffer)
+                Self::read_dynamic_image(origin, stop, image, &buffer, dither)
             } else {
                 log::error!("Failed to decode the image.");
-                Self::new_error(origin, stop)
+                Self::new_error(origin, stop, dither)
             }
         } else {
             log::error!("Failed to read the image file.");
-            Self::new_error(origin, stop)
+            Self::new_error(origin, stop, dither)
         }
     }
 
-    pub fn new_error(origin: Point, stop: Point) -> Self {
-        Self::new_u8(origin, stop, GIF_MISSING)
+    pub fn new_error(origin: Point, stop: Point, dither: bool) -> Self {
+        Self::new_u8(origin, stop, GIF_MISSING, dither)
     }
 
-    pub fn new_u8(origin: Point, stop: Point, u8_array: &[u8]) -> Self {
+    pub fn new_u8(origin: Point, stop: Point, u8_array: &[u8], dither: bool) -> Self {
         if let Ok(image) = image::load_from_memory(u8_array) {
-            Self::read_dynamic_image(origin, stop, image, u8_array)
+            Self::read_dynamic_image(origin, stop, image, u8_array, dither)
         } else {
             log::error!("Failed to decode the image.");
-            Self::new_error(origin, stop)
+            Self::new_error(origin, stop, dither)
         }
     }
 
