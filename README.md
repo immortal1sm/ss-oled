@@ -131,7 +131,7 @@ Carried over from upstream, plus this fork's own roadmap:
 | X11-based systems | ⚠️ upstream's original environment; untested by us but architecturally identical |
 | non-KDE DEs | ⚠️ everything works except global hotkeys |
 - [x] More providers — GIFs ✅ (image provider + FS dithering), Weather/Forecast ✅
-- [ ] More providers — Games? (CS2/Dota Game State Integration would be the clean path)
+- [ ] More providers — Games? 
 - [ ] Switch the USB crate to something async instead *(upstream tracks hidapi-rs#51; `nusb` is the likely successor)*
 - [x] ~~Add documentation on how to add custom providers~~ — [docs/PROVIDERS.md](docs/PROVIDERS.md)
 - [ ] Switch from GATs to async traits once they're stable
