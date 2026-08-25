@@ -148,6 +148,10 @@ pub struct MediaPlayerBuilder {
     /// Whether MPRIS events pull the screen to this provider. Set from
     /// `mpris2.event_focus` in settings.toml.
     event_focus: bool,
+    /// Show elapsed/total timer row (mpris2.show_timer).
+    show_timer: bool,
+    /// Show media source label (mpris2.show_source_label).
+    show_source_label: bool,
 }
 
 // Ok so the plan for the MPRIS2 module is to wait for two DBUS events
@@ -166,6 +170,10 @@ pub struct MediaPlayerRenderer {
     /// Human-readable media source label (e.g. "Firefox", "Spotify"),
     /// drawn bottom-right of the timer row.
     source: Option<String>,
+    /// Show elapsed/total timer row (mpris2.show_timer).
+    show_timer: bool,
+    /// Show media source label (mpris2.show_source_label).
+    show_source_label: bool,
 }
 
 /// Map a raw MPRIS bus name (e.g.
@@ -225,7 +233,15 @@ impl MediaPlayerRenderer {
             artist: artist.try_into()?,
             title: title.try_into()?,
             source: None,
+            show_timer: true,
+            show_source_label: true,
         })
+    }
+
+    /// Toggle visibility options from config.
+    pub fn set_display_options(&mut self, show_timer: bool, show_source_label: bool) {
+        self.show_timer = show_timer;
+        self.show_source_label = show_source_label;
     }
 
     /// Set the media source label shown bottom-right of the timer row.
@@ -287,17 +303,19 @@ impl MediaPlayerRenderer {
                 // a track length. Show just the elapsed time.
                 format_mmss(elapsed_us)
             };
-            let timer_style = MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On);
-            let metrics = timer_style.measure_string(&timer_text, Point::zero(), Baseline::Top);
-            let text_width = metrics.bounding_box.size.width as i32;
-            let timer_x = (128 - text_width) / 2;
-            Text::with_baseline(
-                &timer_text,
-                Point::new(timer_x, 27),
-                timer_style,
-                Baseline::Top,
-            )
-            .draw(&mut display)?;
+            if self.show_timer {
+                let timer_style = MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On);
+                let metrics = timer_style.measure_string(&timer_text, Point::zero(), Baseline::Top);
+                let text_width = metrics.bounding_box.size.width as i32;
+                let timer_x = (128 - text_width) / 2;
+                Text::with_baseline(
+                    &timer_text,
+                    Point::new(timer_x, 27),
+                    timer_style,
+                    Baseline::Top,
+                )
+                .draw(&mut display)?;
+            }
         }
 
         // ----- media source label (bottom-right of timer row) -----
@@ -305,19 +323,21 @@ impl MediaPlayerRenderer {
         // centered timer leaves enough room for labels up to ~8 chars
         // ("Firefox", "Spotify"); longer names are simply truncated by the
         // 128px screen edge.
-        if let Some(src) = &self.source {
-            if !src.is_empty() {
-                let src_style = MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On);
-                let metrics = src_style.measure_string(src, Point::zero(), Baseline::Top);
-                let src_width = metrics.bounding_box.size.width as i32;
-                // Right edge at x=127, on the timer's baseline (y=27).
-                Text::with_baseline(
-                    src,
-                    Point::new(127 - src_width, 27),
-                    src_style,
-                    Baseline::Top,
-                )
-                .draw(&mut display)?;
+        if self.show_source_label {
+            if let Some(src) = &self.source {
+                if !src.is_empty() {
+                    let src_style = MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On);
+                    let metrics = src_style.measure_string(src, Point::zero(), Baseline::Top);
+                    let src_width = metrics.bounding_box.size.width as i32;
+                    // Right edge at x=127, on the timer's baseline (y=27).
+                    Text::with_baseline(
+                        src,
+                        Point::new(127 - src_width, 27),
+                        src_style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display)?;
+                }
             }
         }
 
@@ -418,6 +438,12 @@ impl MediaPlayerBuilder {
         self
     }
 
+    pub fn with_display_options(mut self, show_timer: bool, show_source_label: bool) -> Self {
+        self.show_timer = show_timer;
+        self.show_source_label = show_source_label;
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -433,6 +459,7 @@ impl ContentProvider for MediaPlayerBuilder {
         );
 
         let mut renderer = MediaPlayerRenderer::new()?;
+        renderer.set_display_options(self.show_timer, self.show_source_label);
         let event_focus = self.event_focus;
         let focus_tx = self
             .focus_tx
