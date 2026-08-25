@@ -401,6 +401,9 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             ui.horizontal(|ui| {
                 ui.label("City:");
                 let field = ui.text_edit_singleline(&mut query);
+                // Keep the working text in App state every frame so keystrokes
+                // survive repaints (the field re-inits from this each frame).
+                app.city_query = query.clone();
                 // Enter inside the field triggers search (standard UX).
                 if field.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -409,9 +412,6 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                     do_search = true;
                 }
                 do_search |= ui.button("Search").clicked();
-                if do_search {
-                    app.city_query = query.clone();
-                }
             });
             if do_search {
                 let q = query.trim().to_string();
