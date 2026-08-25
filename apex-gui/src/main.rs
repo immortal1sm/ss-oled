@@ -85,10 +85,19 @@ impl App {
             })
             .unwrap_or_default();
         list.sort_by_key(|(_, prio)| *prio);
-        self.providers = list.into_iter().map(|(name, _)| name).collect();
+        // 'forecast' merged into 'weather' - hide obsolete section from GUI.
+        self.providers = list
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|n| n != "forecast")
+            .collect();
     }
 
     fn save(&mut self) -> Result<()> {
+        // Purge the obsolete forecast section if present (merged into weather).
+        if let Some(table) = self.doc.as_table_mut() {
+            table.remove("forecast");
+        }
         let serialized = toml::to_string_pretty(&self.doc)?;
         std::fs::write(&self.config_path, serialized)?;
         self.status = "Saved to disk".into();
@@ -425,12 +434,19 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                 match rx.try_recv() {
                     Ok(Ok(payload)) => {
                         let mut it = payload.split('|');
+                        // Lat/lon MUST be numeric (daemon reads with get_float).
                         let lat = it.next().unwrap_or("");
                         let lon = it.next().unwrap_or("");
                         let tz = it.next().unwrap_or("");
                         let name = it.next().unwrap_or("");
-                        app.set_str("weather.latitude", lat);
-                        app.set_str("weather.longitude", lon);
+                        app.set_value(
+                            "weather.latitude",
+                            toml::Value::Float(lat.parse().unwrap_or(0.0)),
+                        );
+                        app.set_value(
+                            "weather.longitude",
+                            toml::Value::Float(lon.parse().unwrap_or(0.0)),
+                        );
                         app.set_str("weather.timezone", tz);
                         app.set_str("weather.label", name);
                         app.status = format!("Found: {name}");
