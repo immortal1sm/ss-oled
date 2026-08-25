@@ -36,6 +36,8 @@ struct App {
     selected: Option<String>,
     /// Row being dragged (index), persists across frames while held.
     drag_from: Option<usize>,
+    /// Row currently hovered as drop target during drag.
+    drag_over: Option<usize>,
     /// Status line for the UI.
     status: String,
 }
@@ -50,6 +52,7 @@ impl App {
             providers: Vec::new(),
             selected: None,
             drag_from: None,
+            drag_over: None,
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -201,56 +204,81 @@ impl eframe::App for App {
                         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
                         for (idx, name) in self.providers.clone().iter().enumerate() {
-                            let is_selected = self.selected.as_deref() == Some(name.as_str());
-                            ui.horizontal(|ui| {
+                            let is_selected =
+                                self.selected.as_deref() == Some(name.as_str())
+                                    || self.drag_from == Some(idx);
+
+                            let row = ui.horizontal(|ui| {
                                 let enabled_key = format!("{name}.enabled");
                                 let mut enabled = self.get_bool(&enabled_key);
                                 if ui.checkbox(&mut enabled, "").changed() {
                                     self.set_bool(&enabled_key, enabled);
                                 }
-                                let label = ui.selectable_label(is_selected, name.as_str());
-                                if label.clicked() {
+
+                                let label =
+                                    ui.selectable_label(is_selected, name.as_str());
+
+                                // Transparent interaction layer over the whole
+                                // row (checkbox excluded) handling select+drag.
+                                let row_id = egui::Id::new(("provider_row", name));
+                                let hitbox = ui.interact(
+                                    label.rect.expand2(egui::vec2(60.0, 6.0)),
+                                    row_id,
+                                    egui::Sense::click_and_drag(),
+                                );
+                                if hitbox.clicked() {
                                     self.selected = Some(name.clone());
+                                }
+                                if hitbox.drag_started() {
+                                    self.drag_from = Some(idx);
                                 }
                             });
 
-                            // Record row rect AFTER drawing for drag hit-testing
-                            // next frame (store last-known rects).
-                            let rect = ui.min_rect();
+                            // Row rect for hover-swap hit testing.
+                            let rect = row.response.rect;
                             row_rects.push((idx, rect));
-
-                            // Start drag when pointer presses inside a row.
-                            let interaction = ui.interact(
-                                rect,
-                                egui::Id::new(("row", idx)),
-                                egui::Sense::click_and_drag(),
-                            );
-                            if interaction.drag_started() {
-                                self.drag_from = Some(idx);
-                            }
                         }
 
-                        // While dragging, entering another row swaps live.
+                        // While dragging: highlight hovered row (no mutation).
+                        // On release: move dragged item to hovered position.
                         if let Some(from) = self.drag_from {
                             let hover = ui.input(|i| i.pointer.hover_pos());
                             let released = ui.input(|i| i.pointer.any_released());
+
                             if released {
-                                self.drag_from = None;
-                            } else if let Some(pos) = hover {
-                                for (other, rect) in &row_rects {
-                                    if *other != from && rect.contains(pos) {
-                                        swap = Some((from, *other));
-                                        break;
+                                // Commit the move.
+                                if let Some(to) = self.drag_over.take() {
+                                    if to != from {
+                                        let item =
+                                            self.providers.remove(from);
+                                        let to_adj = if to > from { to - 1 } else { to };
+                                        self.providers.insert(to_adj, item);
+                                        self.sync_priorities();
                                     }
                                 }
+                                self.drag_from = None;
+                                self.drag_over = None;
+                            } else if let Some(pos) = hover {
+                                self.drag_over = row_rects
+                                    .iter()
+                                    .find(|(_, rect)| rect.contains(pos))
+                                    .map(|(idx, _)| *idx);
                             }
                         }
 
-                        if let Some((from, to)) = swap {
-                            let item = self.providers.remove(from);
-                            self.providers.insert(to, item);
-                            self.drag_from = Some(to); // follow the dragged item
-                            self.sync_priorities();
+                        // Paint insertion indicator on the hovered row.
+                        if let (Some(_from), Some(over)) =
+                            (self.drag_from, self.drag_over)
+                        {
+                            if let Some((_, rect)) =
+                                row_rects.iter().find(|(i, _)| *i == over)
+                            {
+                                ui.painter().rect_stroke(
+                                    *rect,
+                                    2.0,
+                                    egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE),
+                                );
+                            }
                         }
                     });
             });
