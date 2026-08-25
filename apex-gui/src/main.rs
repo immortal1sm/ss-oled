@@ -423,19 +423,21 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                         // City of" -> "Science City"...). The geocoder's DB uses
                         // short canonical names ("Munoz"), so formal multi-word
                         // names often miss.
+                        // Try the full query first; on zero results retry with
+                        // right-truncated variants ("Science City of Munoz" ->
+                        // "City of Munoz" -> "of Munoz" -> "Munoz"). The geocoder
+                        // indexes short canonical names, and the LAST word of a
+                        // formal name is usually the actual city.
                         let result = (|| -> anyhow::Result<String> {
-                            let mut attempt: Vec<&str> = q.split_whitespace().collect();
-                            loop {
-                                let name = attempt.join(" ");
-                                if name.is_empty() {
-                                    anyhow::bail!("no results - try a shorter city name");
-                                }
+                            let words: Vec<&str> = q.split_whitespace().collect();
+                            for start in 0..words.len() {
+                                let name = words[start..].join(" ");
                                 let url = format!(
                                     "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
                                     urlencode(&name)
                                 );
                                 let body = ureq::get(&url)
-                                    .timeout(std::time::Duration::from_secs(8))
+                                    .timeout(std::time::Duration::from_secs(5))
                                     .call()?
                                     .into_string()?;
                                 let v: serde_json::Value =
@@ -449,8 +451,8 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                                         hit["name"].as_str().unwrap_or(""),
                                     ));
                                 }
-                                attempt.pop();
                             }
+                            anyhow::bail!("no results - try a shorter city name")
                         })();
                         result
                     });
