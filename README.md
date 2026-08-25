@@ -48,7 +48,7 @@ latitude = 15.71611        # your coordinates
 longitude = 120.90306
 timezone = "Asia/Manila"
 units = "metric"
-label = "Munoz"
+label = "Manila"
 
 [forecast]
 enabled = true
