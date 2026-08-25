@@ -100,19 +100,98 @@ impl ContentProvider for Weather {
     type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a;
 
     fn stream(&mut self) -> Result<<Self as ContentProvider>::ContentStream<'_>> {
-        info!("Registering Weather display source.");
-
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        info!(
+            "Registering Weather display source (today + 5-day forecast combined)."
+        );
 
         Ok(try_stream! {
-            let mut frame = 0usize;
+            use tokio::time::{interval, Duration, MissedTickBehavior};
+            // ~300ms tick drives both icon animation and page timing.
+            let mut tick = interval(Duration::from_millis(300));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            const TODAY_MS: u64 = 10_000;   // today's view
+            const PAGE_MS: u64 = 3_000;     // per forecast day
+            const SLIDE_STEPS: i32 = 5;     // frames per push transition
+
+            let mut anim = 0usize;
+            let mut phase_ms = 0u64;
+            // Phase::Today | Phase::Day(page) | mid-transition state:
+            let mut in_forecast = false;
+            let mut page = 0usize;          // 1..=5 (day index into days[])
+            let mut trans_step = 0i32;
+            let mut transitioning = false;
+            let mut prev_page = 0usize;
+
             loop {
-                if let Ok(image) = self.render(frame) {
-                    yield image;
+                let data = self.cache.get();
+
+                let frame = if !in_forecast {
+                    // Today view with animated icon.
+                    self.render(anim)?
+                } else if transitioning {
+                    // Push transition between forecast pages.
+                    let mut buffer = FrameBuffer::new();
+                    if let Some(d) = &data {
+                        let step_w = 128 / SLIDE_STEPS;
+                        let progress = trans_step + 1;
+                        let out_off = -progress * step_w;
+                        let in_off = 128 - progress * step_w;
+                        let out_day = if prev_page == 0 { 0 } else { prev_page };
+                        if out_off > -128 {
+                            let _ = crate::providers::forecast::render_day(
+                                &mut buffer, &d.days, out_day, out_off,
+                                self.units.symbol(),
+                            );
+                        }
+                        if in_off < 128 {
+                            let _ = crate::providers::forecast::render_day(
+                                &mut buffer, &d.days, page.max(1), in_off,
+                                self.units.symbol(),
+                            );
+                        }
+                    }
+                    buffer
+                } else {
+                    // Static forecast page for this day.
+                    let mut buffer = FrameBuffer::new();
+                    if let Some(d) = &data {
+                        let _ = crate::providers::forecast::render_day(
+                            &mut buffer, &d.days, page.max(1), 0,
+                            self.units.symbol(),
+                        );
+                    }
+                    buffer
+                };
+
+                yield frame;
+                anim = anim.wrapping_add(1);
+                tick.tick().await;
+                phase_ms += 300;
+
+                if transitioning {
+                    trans_step += 1;
+                    if trans_step >= SLIDE_STEPS {
+                        transitioning = false;
+                        phase_ms = 0;
+                    }
+                } else if !in_forecast && phase_ms >= TODAY_MS {
+                    // Enter forecast cycle at tomorrow (day index 1).
+                    in_forecast = true;
+                    page = 1;
+                    phase_ms = 0;
+                } else if in_forecast && phase_ms >= PAGE_MS {
+                    // Slide to the next day; after day 5, back to today.
+                    let next = if page >= 5 { 0 } else { page + 1 };
+                    prev_page = page;
+                    page = next;
+                    transitioning = true;
+                    trans_step = 0;
+                    if next == 0 {
+                        // Finished the cycle: return to today view after slide.
+                        in_forecast = false;
+                    }
                 }
-                frame = frame.wrapping_add(1);
-                interval.tick().await;
             }
         })
     }
