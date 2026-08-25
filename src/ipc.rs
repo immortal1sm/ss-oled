@@ -118,6 +118,11 @@ async fn serve(stream: UnixStream, handle: IpcHandle) -> Result<()> {
             continue;
         }
 
+        let (cmd, rest) = match cmd.split_once(' ') {
+            Some((c, r)) => (c, r),
+            None => (cmd, ""),
+        };
+
         let response = match cmd {
             "next" | "prev" => {
                 // Rotation is allowed even when locked — manual movement
@@ -156,6 +161,17 @@ async fn serve(stream: UnixStream, handle: IpcHandle) -> Result<()> {
                 handle.locked.store(false, Ordering::SeqCst);
                 info!("IPC: provider UNLOCKED");
                 "ok unlocked".to_string()
+            }
+            "goto" if !rest.is_empty() => {
+                // goto <provider_name>: jump directly to a named provider.
+                match handle.provider_names.iter().position(|n| n == rest) {
+                    Some(idx) => {
+                        handle.current.store(idx, Ordering::SeqCst);
+                        let _ = handle.tx.send(IpcCommand::Next); // any switch cmd works
+                        format!("ok {rest}")
+                    }
+                    None => format!("err no provider named '{rest}'"),
+                }
             }
             "status" => handle.status_line(),
             "providers" => handle.provider_names.join(" "),
