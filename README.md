@@ -142,6 +142,6 @@ Carried over from upstream, plus this fork's own roadmap:
       window (drag-order rotation, live image preview, city-search weather),
       rebindable hotkeys with single lock toggle, and the custom provider
       engine (JSON API -> field mapping -> row layout) that lets users build
-      screens without writing Rust. Original to this fork.
+      screens without writing Rust. 
 - [ ] Package for Arch (AUR) / Flatpak
 - [ ] Demote diagnostic INFO logs in the focus path to DEBUG
