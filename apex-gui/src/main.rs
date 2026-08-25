@@ -38,6 +38,8 @@ struct App {
     drag_from: Option<usize>,
     /// Row currently hovered as drop target during drag.
     drag_over: Option<usize>,
+    /// Working text for the weather city-search field.
+    city_query: String,
     /// Status line for the UI.
     status: String,
 }
@@ -53,6 +55,7 @@ impl App {
             selected: None,
             drag_from: None,
             drag_over: None,
+            city_query: String::new(),
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -73,15 +76,10 @@ impl App {
                 t.iter()
                     .filter_map(|(k, v)| {
                         // A provider section has an `enabled` key.
-                        v.get("enabled")
-                            .and_then(|e| e.as_bool())
-                            .map(|_| {
-                                let prio = v
-                                    .get("priority")
-                                    .and_then(|p| p.as_integer())
-                                    .unwrap_or(99);
-                                (k.clone(), prio)
-                            })
+                        v.get("enabled").and_then(|e| e.as_bool()).map(|_| {
+                            let prio = v.get("priority").and_then(|p| p.as_integer()).unwrap_or(99);
+                            (k.clone(), prio)
+                        })
                     })
                     .collect()
             })
@@ -124,12 +122,8 @@ impl App {
     fn sync_priorities(&mut self) {
         if let Some(table) = self.doc.as_table_mut() {
             for (idx, name) in self.providers.iter().enumerate() {
-                if let Some(section) = table.get_mut(name.as_str()).and_then(|v| v.as_table_mut())
-                {
-                    section.insert(
-                        "priority".into(),
-                        toml::Value::Integer((idx + 1) as i64),
-                    );
+                if let Some(section) = table.get_mut(name.as_str()).and_then(|v| v.as_table_mut()) {
+                    section.insert("priority".into(), toml::Value::Integer((idx + 1) as i64));
                 }
             }
         }
@@ -137,7 +131,9 @@ impl App {
 
     /// Get/set helpers for nested "section.key" paths.
     fn get_bool(&self, path: &str) -> bool {
-        self.get_value(path).and_then(|v| v.as_bool()).unwrap_or(false)
+        self.get_value(path)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     fn set_bool(&mut self, path: &str, val: bool) {
@@ -145,7 +141,9 @@ impl App {
     }
 
     fn get_int(&self, path: &str) -> i64 {
-        self.get_value(path).and_then(|v| v.as_integer()).unwrap_or(0)
+        self.get_value(path)
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0)
     }
 
     fn set_int(&mut self, path: &str, val: i64) {
@@ -189,7 +187,7 @@ impl eframe::App for App {
         // ---------- LEFT SIDEBAR: provider list ----------
         egui::SidePanel::left("providers_panel")
             .resizable(false)
-            .default_width(230.0)
+            .default_width(240.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.heading("Providers");
@@ -204,9 +202,8 @@ impl eframe::App for App {
                         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
                         for (idx, name) in self.providers.clone().iter().enumerate() {
-                            let is_selected =
-                                self.selected.as_deref() == Some(name.as_str())
-                                    || self.drag_from == Some(idx);
+                            let is_selected = self.selected.as_deref() == Some(name.as_str())
+                                || self.drag_from == Some(idx);
 
                             let row = ui.horizontal(|ui| {
                                 let enabled_key = format!("{name}.enabled");
@@ -215,8 +212,7 @@ impl eframe::App for App {
                                     self.set_bool(&enabled_key, enabled);
                                 }
 
-                                let label =
-                                    ui.selectable_label(is_selected, name.as_str());
+                                let label = ui.selectable_label(is_selected, name.as_str());
 
                                 // Transparent interaction layer over the whole
                                 // row (checkbox excluded) handling select+drag.
@@ -249,8 +245,7 @@ impl eframe::App for App {
                                 // Commit the move.
                                 if let Some(to) = self.drag_over.take() {
                                     if to != from {
-                                        let item =
-                                            self.providers.remove(from);
+                                        let item = self.providers.remove(from);
                                         let to_adj = if to > from { to - 1 } else { to };
                                         self.providers.insert(to_adj, item);
                                         self.sync_priorities();
@@ -267,12 +262,8 @@ impl eframe::App for App {
                         }
 
                         // Paint insertion indicator on the hovered row.
-                        if let (Some(_from), Some(over)) =
-                            (self.drag_from, self.drag_over)
-                        {
-                            if let Some((_, rect)) =
-                                row_rects.iter().find(|(i, _)| *i == over)
-                            {
+                        if let (Some(_from), Some(over)) = (self.drag_from, self.drag_over) {
+                            if let Some((_, rect)) = row_rects.iter().find(|(i, _)| *i == over) {
                                 ui.painter().rect_stroke(
                                     *rect,
                                     2.0,
@@ -324,7 +315,6 @@ impl eframe::App for App {
     }
 }
 
-
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
     let dwell_key = format!("interval.{name}");
     ui.horizontal(|ui| {
@@ -333,7 +323,10 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
         if d == 0 {
             d = app.get_int("interval.refresh");
         }
-        if ui.add(egui::DragValue::new(&mut d).clamp_range(1..=600)).changed() {
+        if ui
+            .add(egui::DragValue::new(&mut d).clamp_range(1..=600))
+            .changed()
+        {
             // Write into interval.<name> creating the table if needed.
             ensure_interval_table(app).insert(name.to_string(), toml::Value::Integer(d));
         }
@@ -341,8 +334,18 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
 
     match name {
         "mpris2" => {
-            toggle(ui, app, "mpris2.event_focus", "Jump to screen on play/pause/track change");
-            toggle(ui, app, "mpris2.show_source_label", "Show source label (Firefox, Spotify…)");
+            toggle(
+                ui,
+                app,
+                "mpris2.event_focus",
+                "Jump to screen on play/pause/track change",
+            );
+            toggle(
+                ui,
+                app,
+                "mpris2.show_source_label",
+                "Show source label (Firefox, Spotify…)",
+            );
             toggle(ui, app, "mpris2.show_timer", "Show elapsed/total timer row");
         }
         "sysinfo" => {
@@ -374,12 +377,16 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             use std::sync::mpsc;
             static SEARCH: std::sync::Mutex<Option<mpsc::Receiver<Result<String, String>>>> =
                 std::sync::Mutex::new(None);
-            let mut query = app.get_str("weather.search_query");
+            let mut query = app.city_query.clone();
             ui.horizontal(|ui| {
                 ui.label("City:");
-                let changed = ui.text_edit_singleline(&mut query).lost_focus();
-                let do_search = ui.button("Search").clicked()
-                    || (changed && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                let changed = ui.text_edit_singleline(&mut query).changed();
+                if changed {
+                    app.city_query = query.clone();
+                }
+                let pressed_enter =
+                    changed && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let do_search = ui.button("Search").clicked() || pressed_enter;
                 if do_search && !query.trim().is_empty() {
                     app.set_str("weather.search_query", query.trim());
                     let q = query.trim().to_string();
@@ -517,7 +524,8 @@ fn main() -> Result<()> {
     let app = App::load(path)?;
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 480.0])
+            .with_inner_size([760.0, 560.0])
+            .with_min_inner_size([700.0, 480.0])
             .with_title("ss-oled settings"),
         ..Default::default()
     };
