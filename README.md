@@ -135,15 +135,11 @@ Carried over from upstream, plus this fork's own roadmap:
 **ss-oled roadmap:**
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
-- [ ] System tray controller (separate opt-in binary, keeps daemon pure) —
-      ksni icon with: lock toggle, provider switch submenu, service
-      restart, "Edit settings" action. Talks to the daemon over IPC
-      (unix socket); daemon gains a ~50-line IPC listener.
-      Memory discipline: mimalloc global allocator (returns freed pages
-      promptly vs glibc arenas), trimmed tokio (rt-only), LTO+strip —
-      target <10 MB resident for the tray. Config editing via $EDITOR +
-      inotify auto-restart rather than a retained GUI window; a full egui
-      settings dialog can be added later as a third binary if wanted.
-      Budget: daemon ~4MB + tray ~10MB = well under the 20MB idle target.
+- [ ] **GUI + Tray suite** — full design spec in [docs/DESIGN.md](docs/DESIGN.md):
+      system tray controller (separate opt-in binary), schema-driven config
+      window (drag-order rotation, live image preview, city-search weather),
+      rebindable hotkeys with single lock toggle, and the custom provider
+      engine (JSON API -> field mapping -> row layout) that lets users build
+      screens without writing Rust. Original to this fork.
 - [ ] Package for Arch (AUR) / Flatpak
 - [ ] Demote diagnostic INFO logs in the focus path to DEBUG
