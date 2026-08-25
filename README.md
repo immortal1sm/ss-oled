@@ -64,7 +64,9 @@ stays on screen).
 
 ## Why this architecture
 
-The old approach for DIY OLED dashboards was: PC → Python loop → serial UART →
+The old approach for DIY OLED dashboards — the one used by my own
+[arduino-pc-monitor](https://github.com/immortal1sm/arduino-pc-monitor), an
+Arduino Nano + SH1106 dashboard — was: PC → Python loop → serial UART →
 Arduino → SPI → panel. Five pipeline hops, ~55ms of wire time per frame,
 continuous polling CPU, and a second device to power and maintain.
 
@@ -77,6 +79,12 @@ ss-oled talks to the keyboard's panel **directly over native USB HID**:
 
 Smaller pipeline, faster frames, fewer devices. That speed is what makes the
 animated weather icons, slide transitions, and instant focus jumps possible.
+
+> ss-oled was born from arduino-pc-monitor: same dashboard philosophy (sysinfo,
+> media, weather), rebuilt for hardware that already sits on your desk. The
+> Arduino project remains the reference for cross-vendor sensor work and
+> standalone displays; ss-oled is where that experience lands when a SteelSeries
+> Apex keyboard is available.
 
 ## Building
 
