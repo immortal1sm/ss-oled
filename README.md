@@ -90,6 +90,11 @@ Install the udev rule (`97-steelseries.rules`, vendor `1038` product `1610`
 with `uaccess` tag), then run as a user systemd unit with
 `DBUS_SESSION_BUS_ADDRESS` inherited so MPRIS works under Wayland.
 
+### Writing your own screens
+
+See [docs/PROVIDERS.md](docs/PROVIDERS.md) —
+a guide to writing custom providers with a minimal working example.
+
 ### Configuration
 
 See `settings.toml` — every provider has `enabled` and `priority` keys;
@@ -128,7 +133,7 @@ Carried over from upstream, plus this fork's own roadmap:
 - [x] More providers — GIFs ✅ (image provider + FS dithering), Weather/Forecast ✅
 - [ ] More providers — Games? (CS2/Dota Game State Integration would be the clean path)
 - [ ] Switch the USB crate to something async instead *(upstream tracks hidapi-rs#51; `nusb` is the likely successor)*
-- [ ] Add documentation on how to add custom providers
+- [x] ~~Add documentation on how to add custom providers~~ — [docs/PROVIDERS.md](docs/PROVIDERS.md)
 - [ ] Switch from GATs to async traits once they're stable
 - [ ] Add support for more notifications
 
