@@ -137,11 +137,6 @@ Carried over from upstream, plus this fork's own roadmap:
 **ss-oled roadmap:**
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
-- [ ] **GUI + Tray suite** — full design spec in [docs/DESIGN.md](docs/DESIGN.md):
-      system tray controller (separate opt-in binary), schema-driven config
-      window (drag-order rotation, live image preview, city-search weather),
-      rebindable hotkeys with single lock toggle, and the custom provider
-      engine (JSON API -> field mapping -> row layout) that lets users build
-      screens without writing Rust. 
+- [ ] **GUI + Tray suite** — full design spec in [docs/DESIGN.md](docs/DESIGN.md)
 - [ ] Package for Arch (AUR) / Flatpak
 - [ ] Demote diagnostic INFO logs in the focus path to DEBUG
