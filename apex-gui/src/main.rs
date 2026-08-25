@@ -352,11 +352,98 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             int_field(ui, app, "sysinfo.temperature_max", "Temp max scale");
         }
         "image" => {
-            text_field(ui, app, "image.path", "GIF/logo file");
+            ui.horizontal(|ui| {
+                ui.label("GIF/logo file:");
+                let mut s = app.get_str("image.path");
+                if ui.text_edit_singleline(&mut s).lost_focus() && !s.is_empty() {
+                    app.set_str("image.path", &s);
+                }
+                if ui.button("Browse…").clicked() {
+                    if let Some(file) = rfd::FileDialog::new()
+                        .add_filter("Images", &["gif", "png", "jpg", "jpeg", "webp", "bmp"])
+                        .pick_file()
+                    {
+                        app.set_str("image.path", &file.to_string_lossy());
+                    }
+                }
+            });
             toggle(ui, app, "image.dither", "Floyd–Steinberg dithering");
-            ui.label("(preview coming in a future release)");
         }
         "weather" => {
+            // City search via Open-Meteo geocoding API. Fills lat/lon/tz.
+            use std::sync::mpsc;
+            static SEARCH: std::sync::Mutex<Option<mpsc::Receiver<Result<String, String>>>> =
+                std::sync::Mutex::new(None);
+            let mut query = app.get_str("weather.search_query");
+            ui.horizontal(|ui| {
+                ui.label("City:");
+                let changed = ui.text_edit_singleline(&mut query).lost_focus();
+                let do_search = ui.button("Search").clicked()
+                    || (changed && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if do_search && !query.trim().is_empty() {
+                    app.set_str("weather.search_query", query.trim());
+                    let q = query.trim().to_string();
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let url = format!(
+                            "https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language=en&format=json"
+                        );
+                        let result = (|| {
+                            let body = ureq::get(&url)
+                                .timeout(std::time::Duration::from_secs(8))
+                                .call()?
+                                .into_string()?;
+                            let v: serde_json::Value = serde_json::from_str(&body)?;
+                            let hit = v["results"]
+                                .get(0)
+                                .ok_or_else(|| anyhow::anyhow!("no results found"))?;
+                            Ok(format!(
+                                "{}|{}|{}|{}",
+                                hit["latitude"].as_f64().unwrap_or(0.0),
+                                hit["longitude"].as_f64().unwrap_or(0.0),
+                                hit["timezone"].as_str().unwrap_or("auto"),
+                                hit["name"].as_str().unwrap_or("")
+                            ))
+                        })()
+                        .map_err(|e: anyhow::Error| e.to_string());
+                        let _ = tx.send(result);
+                    });
+                    *SEARCH.lock().unwrap() = Some(rx);
+                }
+            });
+
+            // Poll for geocoding results without blocking the UI thread.
+            let mut pending = SEARCH.lock().unwrap().take();
+            if let Some(rx) = &mut pending {
+                match rx.try_recv() {
+                    Ok(Ok(payload)) => {
+                        let mut it = payload.split('|');
+                        let lat = it.next().unwrap_or("");
+                        let lon = it.next().unwrap_or("");
+                        let tz = it.next().unwrap_or("");
+                        let name = it.next().unwrap_or("");
+                        app.set_str("weather.latitude", lat);
+                        app.set_str("weather.longitude", lon);
+                        app.set_str("weather.timezone", tz);
+                        app.set_str("weather.label", name);
+                        app.status = format!("Found: {name}");
+                        *SEARCH.lock().unwrap() = None;
+                    }
+                    Ok(Err(e)) => {
+                        app.status = format!("Search failed: {e}");
+                        *SEARCH.lock().unwrap() = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // Still running: put the receiver back.
+                        *SEARCH.lock().unwrap() = pending.take();
+                        ui.label("Searching…");
+                    }
+                    Err(_) => {
+                        *SEARCH.lock().unwrap() = None;
+                    }
+                }
+            }
+
             text_field(ui, app, "weather.latitude", "Latitude");
             text_field(ui, app, "weather.longitude", "Longitude");
             text_field(ui, app, "weather.timezone", "Timezone");

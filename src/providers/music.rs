@@ -145,6 +145,9 @@ pub struct MediaPlayerBuilder {
     /// Channel used to request the scheduler switch focus to this provider
     /// when a track changes or playback resumes.
     focus_tx: Option<FocusChannel>,
+    /// Whether MPRIS events pull the screen to this provider. Set from
+    /// `mpris2.event_focus` in settings.toml.
+    event_focus: bool,
 }
 
 // Ok so the plan for the MPRIS2 module is to wait for two DBUS events
@@ -410,6 +413,11 @@ impl MediaPlayerBuilder {
         self
     }
 
+    pub fn with_event_focus(mut self, enabled: bool) -> Self {
+        self.event_focus = enabled;
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -425,6 +433,7 @@ impl ContentProvider for MediaPlayerBuilder {
         );
 
         let mut renderer = MediaPlayerRenderer::new()?;
+        let event_focus = self.event_focus;
         let focus_tx = self
             .focus_tx
             .clone()
@@ -470,11 +479,18 @@ impl ContentProvider for MediaPlayerBuilder {
                         apex_music::PlayerEvent::Properties
                             | apex_music::PlayerEvent::Seeked
                     ) {
-                        log::info!("MPRIS event fired: {:?}", event);
-                        let send_result = focus_tx.send(
-                            crate::render::scheduler::ProviderWantsFocus
-                        );
-                        log::info!("focus_tx.send result: {:?}", send_result);
+                        // Honor mpris2.event_focus: when disabled, media state
+                        // changes still re-render this screen if it's shown,
+                        // but do NOT steal focus from another provider.
+                        if event_focus {
+                            log::info!("MPRIS event fired: {:?}", event);
+                            let send_result = focus_tx.send(
+                                crate::render::scheduler::ProviderWantsFocus,
+                            );
+                            log::info!("focus_tx.send result: {:?}", send_result);
+                        } else {
+                            log::debug!("MPRIS event (event_focus off): {:?}", event);
+                        }
                     }
 
                     if let Ok(progress) = player.progress().await {
