@@ -198,23 +198,6 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let size = providers.len();
         let z = current.clone();
 
-        // IPC control interface (tray/CLI clients). Shares `current` and a
-        // lock flag with the scheduler so external commands and hotkeys stay
-        // in sync. Errors here are non-fatal: the daemon runs headless.
-        let ipc_locked = Arc::new(AtomicBool::new(false));
-        {
-            let handle = crate::ipc::IpcHandle {
-                tx: broadcast::Sender::new(16),
-                locked: Arc::clone(&ipc_locked),
-                provider_names: Arc::new(provider_names.clone()),
-                current: Arc::clone(&current),
-            };
-            let socket_dir =
-                std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-            if let Err(e) = crate::ipc::spawn(std::path::Path::new(&socket_dir), handle) {
-                log::warn!("IPC server unavailable: {e}");
-            }
-        }
 
         let mut y = multiplex(providers, move || z.load(Ordering::SeqCst));
 
@@ -237,12 +220,35 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         }));
         change.set_missed_tick_behavior(MissedTickBehavior::Skip);
         //the last time the screen was changed
-        let time_last_change = Rc::new(RefCell::new(Instant::now()));
+        let time_last_change = Arc::new(std::sync::Mutex::new(Instant::now()));
+
+        // IPC control interface (tray/CLI clients). Shares `current` and a
+        // lock flag with the scheduler so external commands and hotkeys stay
+        // in sync. Errors here are non-fatal: the daemon runs headless.
+        let ipc_locked = Arc::new(AtomicBool::new(false));
+        {
+            let handle = crate::ipc::IpcHandle {
+                tx: broadcast::Sender::new(16),
+                locked: Arc::clone(&ipc_locked),
+                provider_names: Arc::new(provider_names.clone()),
+                current: Arc::clone(&current),
+                last_change: Arc::clone(&time_last_change),
+            };
+            let socket_dir =
+                std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+            if let Err(e) = crate::ipc::spawn(std::path::Path::new(&socket_dir), handle) {
+                log::warn!("IPC server unavailable: {e}");
+            }
+        }
+
+        // Set when a focus jump just happened: skip the immediately following
+        // rotation tick so the jump isn't undone by an already-elapsed dwell.
+        let mut suppress_next_rotation = false;
         loop {
             tokio::select! {
                 cmd = rx.recv() => {
                     //update the last time the screen was updated to now
-                    *time_last_change.borrow_mut() = Instant::now();
+                    *time_last_change.lock().unwrap() = Instant::now();
                     match cmd {
                         Ok(Command::Shutdown) => break,
                         Ok(Command::NextSource) => {
@@ -275,7 +281,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                 provider_locked = false;
                                 // Restart the dwell from now so unlock doesn't
                                 // instantly rotate away.
-                                *time_last_change.borrow_mut() = Instant::now();
+                                *time_last_change.lock().unwrap() = Instant::now();
                                 log::info!("Provider UNLOCKED — auto-rotation resumed");
                             }
                         },
@@ -329,8 +335,11 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                     let _ = self.device.clear().await;
                                     // Reset dwell on transition only — so the
                                     // OLED sits on MPRIS for its full 30s dwell
-                                    // before rotating away.
-                                    *time_last_change.borrow_mut() = Instant::now();
+                                    // before rotating away. Also skip the next
+                                    // rotation tick to win the focus-vs-rotate
+                                    // race when the previous dwell had expired.
+                                    *time_last_change.lock().unwrap() = Instant::now();
+                                    suppress_next_rotation = true;
                                     log::info!(
                                         "Provider focused: mpris2 (was idx {}, name={})",
                                         active_idx,
@@ -357,9 +366,11 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     }
                 }
                 _ = change.tick() => {
-                    if is_auto_change_enabled && !provider_locked {
+                    if suppress_next_rotation {
+                        suppress_next_rotation = false;
+                    } else if is_auto_change_enabled && !provider_locked {
                         let current_time = Instant::now();
-                        let elapsed_time = current_time - *time_last_change.borrow();
+                        let elapsed_time = current_time - *time_last_change.lock().unwrap();
                         // Look up the dwell time for the CURRENT provider, not a
                         // global value. Priority of lookup:
                         //   1. `interval.<provider_name>` (e.g. `interval.clock`)

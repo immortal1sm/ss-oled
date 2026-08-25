@@ -382,6 +382,13 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             toggle(ui, app, "image.dither", "Floyd–Steinberg dithering");
         }
         "weather" => {
+            int_field(ui, app, "weather.duration", "Today duration (s)");
+            int_field(
+                ui,
+                app,
+                "weather.forecast_duration",
+                "Forecast cycle total (s)",
+            );
             // City search via Open-Meteo geocoding API. Fills lat/lon/tz.
             use std::sync::mpsc;
             static SEARCH: std::sync::Mutex<Option<mpsc::Receiver<Result<String, String>>>> =
