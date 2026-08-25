@@ -40,6 +40,8 @@ struct App {
     drag_over: Option<usize>,
     /// Working text for the weather city-search field.
     city_query: String,
+    /// Working text for the optional province/state disambiguation.
+    province_filter: String,
     /// Status line for the UI.
     status: String,
 }
@@ -48,6 +50,13 @@ impl App {
     fn load(path: PathBuf) -> Result<Self> {
         let text = std::fs::read_to_string(&path)?;
         let doc: toml::Value = toml::from_str(&text)?;
+        let province_filter = doc
+            .get("weather")
+            .and_then(|w| w.get("province"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string();
+
         let mut app = Self {
             config_path: path,
             doc,
@@ -56,6 +65,7 @@ impl App {
             drag_from: None,
             drag_over: None,
             city_query: String::new(),
+            province_filter,
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -435,6 +445,17 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                 "weather.forecast_duration",
                 "Forecast cycle total (s)",
             );
+            // Optional province/state disambiguates same-named cities
+            // (client-side filter on the geocoder's admin1/admin2 fields).
+            ui.horizontal(|ui| {
+                ui.label("Province/State (optional):");
+                let mut p = app.province_filter.clone();
+                if ui.text_edit_singleline(&mut p).changed() {
+                    app.province_filter = p.clone();
+                    app.set_str("weather.province", &p);
+                }
+            });
+
             // City search via Open-Meteo geocoding API. Fills lat/lon/tz.
             use std::sync::mpsc;
             let mut query = app.city_query.clone();
@@ -458,6 +479,10 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                 let q = query.trim().to_string();
                 app.status = format!("Searching for '{q}'…");
                 *SEARCH_PROGRESS.lock().unwrap() = q.clone();
+                let province = app.province_filter.trim().to_lowercase();
+                if !province.is_empty() {
+                    app.set_str("weather.province", &province);
+                }
                 let (tx, rx) = mpsc::channel();
                 // Overall budget for ALL fallback attempts combined.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -472,6 +497,11 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                     // "City of Munoz" -> "of Munoz" -> "Munoz"). The geocoder
                     // indexes short canonical names, and the LAST word of a
                     // formal name is usually the actual city.
+                    // With a province filter we can afford a wide net:
+                    // request 25 candidates and filter client-side on the
+                    // geocoder's admin1 (region) / admin2 (province) / name.
+                    let count = if province.is_empty() { 1 } else { 25 };
+
                     let result = (|| -> anyhow::Result<String> {
                         let words: Vec<&str> = q.split_whitespace().collect();
                         for start in 0..words.len() {
@@ -481,7 +511,7 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                             let name = words[start..].join(" ");
                             *SEARCH_PROGRESS.lock().unwrap() = name.clone();
                             let url = format!(
-                                    "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
+                                    "https://geocoding-api.open-meteo.com/v1/search?name={}&count={count}&language=en&format=json",
                                     urlencode(&name)
                                 );
                             let body = ureq::get(&url)
@@ -489,7 +519,47 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                                 .call()?
                                 .into_string()?;
                             let v: serde_json::Value = serde_json::from_str(&body)?;
-                            if let Some(hit) = v["results"].get(0) {
+
+                            let candidates = v["results"].as_array().cloned().unwrap_or_default();
+
+                            // Province-filtered pick first (case-insensitive
+                            // substring against admin1/admin2/name).
+                            if !province.is_empty() {
+                                for hit in &candidates {
+                                    let matches_prov =
+                                        |s: &str| s.to_lowercase().contains(&province);
+                                    let hit_match = hit
+                                        .get("admin1")
+                                        .and_then(|a| a.as_str())
+                                        .map(matches_prov)
+                                        .unwrap_or(false)
+                                        || hit
+                                            .get("admin2")
+                                            .and_then(|a| a.as_str())
+                                            .map(matches_prov)
+                                            .unwrap_or(false);
+                                    let name_match = hit
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .map(matches_prov)
+                                        .unwrap_or(false);
+                                    if hit_match || name_match {
+                                        return Ok(format!(
+                                            "{}|{}|{}|{}",
+                                            hit["latitude"].as_f64().unwrap_or(0.0),
+                                            hit["longitude"].as_f64().unwrap_or(0.0),
+                                            hit["timezone"].as_str().unwrap_or("auto"),
+                                            hit["name"].as_str().unwrap_or(""),
+                                        ));
+                                    }
+                                }
+                                // No province match for this variant; try the
+                                // next suffix before giving up.
+                                continue;
+                            }
+
+                            // Unfiltered: first hit wins.
+                            if let Some(hit) = candidates.first() {
                                 return Ok(format!(
                                     "{}|{}|{}|{}",
                                     hit["latitude"].as_f64().unwrap_or(0.0),
