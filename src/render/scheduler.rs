@@ -19,7 +19,7 @@ use itertools::Itertools;
 use linkme::distributed_slice;
 use log::{error, info};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::{
@@ -198,15 +198,32 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let size = providers.len();
         let z = current.clone();
 
+        // IPC control interface (tray/CLI clients). Shares `current` and a
+        // lock flag with the scheduler so external commands and hotkeys stay
+        // in sync. Errors here are non-fatal: the daemon runs headless.
+        let ipc_locked = Arc::new(AtomicBool::new(false));
+        {
+            let handle = crate::ipc::IpcHandle {
+                tx: broadcast::Sender::new(16),
+                locked: Arc::clone(&ipc_locked),
+                provider_names: Arc::new(provider_names.clone()),
+                current: Arc::clone(&current),
+            };
+            let socket_dir =
+                std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+            if let Err(e) = crate::ipc::spawn(std::path::Path::new(&socket_dir), handle) {
+                log::warn!("IPC server unavailable: {e}");
+            }
+        }
+
         let mut y = multiplex(providers, move || z.load(Ordering::SeqCst));
 
         // Flag to know if auto-change is enabled at all. With per-provider
         // intervals, "enabled" means any provider has a non-zero interval set.
         // If everything is 0, we skip the tick to save CPU.
-        // Provider lock state (Ctrl+Alt+Numpad- / Numpad+). When locked the
-        // rotation timer is suspended entirely; manual / and * movement still
-        // works and keeps the lock.
-        let mut provider_locked = false;
+        // Provider lock state (Ctrl+Shift+Numpad- / Numpad+, or IPC lock).
+        // Shared with the IPC server so tray/CLI toggles reflect instantly.
+        let mut provider_locked = false; // scheduler-local mirror for select! arm reads
 
         let is_auto_change_enabled = config
             .get_int("interval.refresh")

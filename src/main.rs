@@ -32,6 +32,7 @@ use log::warn;
 // This is kind of pointless on non-Linux platforms
 #[cfg(all(feature = "dbus-support", target_os = "linux"))]
 mod dbus;
+mod ipc;
 
 mod providers;
 mod render;
