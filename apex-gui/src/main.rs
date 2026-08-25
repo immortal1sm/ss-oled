@@ -415,6 +415,7 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             });
             if do_search {
                 let q = query.trim().to_string();
+                app.status = format!("Searching for '{q}'…");
                     let (tx, rx) = mpsc::channel();
                     std::thread::spawn(move || {
                         // Try the full query first; on zero results, progressively
@@ -485,9 +486,11 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                         *SEARCH.lock().unwrap() = None;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        // Still running: put the receiver back.
+                        // Still running: put the receiver back; show state
+                        // in the bottom status bar (visible even if this
+                        // section is scrolled away).
                         *SEARCH.lock().unwrap() = pending.take();
-                        ui.label("Searching…");
+                        app.status = "Searching…".into();
                     }
                     Err(_) => {
                         *SEARCH.lock().unwrap() = None;
