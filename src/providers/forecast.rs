@@ -1,19 +1,11 @@
-//! 5-day forecast: pages through the next days with a horizontal slide
-//! transition. Day 0 (today) is shown by the weather provider; this one
-//! covers days 1..=5.
+//! Forecast page rendering shared with the weather provider's combined
+//! cycle (today view -> day 2..6 push slides).
 
-use crate::{
-    providers::weather_data::{Units, WeatherCache},
-    render::{
-        display::ContentProvider,
-        scheduler::{ContentWrapper, FocusChannel, CONTENT_PROVIDERS},
-    },
-};
 use anyhow::Result;
+use crate::providers::weather_icons::draw_condition_icon;
 use apex_hardware::FrameBuffer;
-use async_stream::try_stream;
-use config::Config;
 use embedded_graphics::{
+    geometry::Size,
     mono_font::{iso_8859_15, MonoTextStyle},
     pixelcolor::BinaryColor,
     prelude::{Point, Primitive},
@@ -21,37 +13,8 @@ use embedded_graphics::{
     text::{renderer::TextRenderer, Baseline, Text},
     Drawable,
 };
-use futures::Stream;
-use linkme::distributed_slice;
-use log::info;
 
-use super::weather_icons::draw_condition_icon;
-
-#[distributed_slice(CONTENT_PROVIDERS)]
-static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper>> =
-    register_callback;
-
-const PAGE_MS: u64 = 3000; // per-day dwell
-const SLIDE_STEPS: i32 = 6; // intermediate frames for slide transition
-const SLIDE_STEP_W: i32 = 128 / SLIDE_STEPS as i32; // px per slide frame
-
-struct Forecast {
-    cache: std::sync::Arc<WeatherCache>,
-    units: Units,
-}
-
-fn day_name(days_ahead: usize) -> &'static str {
-    // Stable & short — fits FONT_6X10 at a glance.
-    match days_ahead {
-        1 => "TOMORROW",
-        _ => "",
-    }
-}
-
-/// Render day `idx` of the cached data onto `buffer`. If `slide_from` is
-/// Some(offset_px), the whole frame is drawn shifted right by that amount
-/// (the incoming-slide animation).
-fn render_day(
+pub(crate) fn render_day(
     buffer: &mut FrameBuffer,
     days: &[crate::providers::weather_data::DayForecast],
     idx: usize,
@@ -120,135 +83,3 @@ fn render_day(
     Ok(())
 }
 
-impl Forecast {
-    fn render_page(
-        &self,
-        prev: Option<(usize, i32)>,
-        page: usize,
-        slide_offset: Option<i32>,
-    ) -> Result<FrameBuffer> {
-        let _ = prev;
-        let mut buffer = FrameBuffer::new();
-        if let Some(data) = self.cache.get() {
-            if data.days.len() > 1 {
-                render_day(
-                    &mut buffer,
-                    &data.days,
-                    page + 1,
-                    slide_offset.unwrap_or(0),
-                    self.units.symbol(),
-                )?;
-            }
-        }
-        Ok(buffer)
-    }
-
-    /// Full push-transition frame: outgoing day at `out_offset` (negative =
-    /// moving left), incoming at `in_offset` (positive = entering from
-    /// right). Both pages' icons AND text shift together.
-    fn render_transition(
-        &self,
-        out_page: usize,
-        in_page: usize,
-        progress: i32,
-    ) -> Result<FrameBuffer> {
-        let mut buffer = FrameBuffer::new();
-        if let Some(data) = self.cache.get() {
-            if data.days.len() <= 1 {
-                return Ok(buffer);
-            }
-            let step_w = 128 / SLIDE_STEPS;
-            // Outgoing shifts left off-screen; incoming enters from right.
-            let out_off = -progress * step_w;
-            let in_off = 128 - progress * step_w;
-            if out_off > -128 {
-                render_day(
-                    &mut buffer,
-                    &data.days,
-                    out_page + 1,
-                    out_off,
-                    self.units.symbol(),
-                )?;
-            }
-            if in_off < 128 {
-                render_day(
-                    &mut buffer,
-                    &data.days,
-                    in_page + 1,
-                    in_off,
-                    self.units.symbol(),
-                )?;
-            }
-        }
-        Ok(buffer)
-    }
-}
-
-impl ContentProvider for Forecast {
-    type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a;
-
-    fn stream(&mut self) -> Result<<Self as ContentProvider>::ContentStream<'_>> {
-        info!("Registering Forecast display source.");
-
-        Ok(try_stream! {
-            use tokio::time::{interval, Duration, MissedTickBehavior};
-            let mut tick = interval(Duration::from_millis(50));
-            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            let mut page = 0usize;
-            let mut page_ms = 0u64;
-            let mut transitioning = false;
-            let mut trans_step = 0i32;
-            let mut next_page = 0usize;
-
-            loop {
-                // Emit frames.
-                let frame = if transitioning {
-                    // Push transition: old page slides left, new page enters
-                    // from the right — icons, drops, bolts and all.
-                    self.render_transition(page, next_page, trans_step + 1)?
-                } else {
-                    self.render_page(None, page, None)?
-                };
-                yield frame.clone();
-
-                // Advance state machine every tick (50ms).
-                tick.tick().await;
-                page_ms += 50;
-
-                if transitioning {
-                    trans_step += 1;
-                    if trans_step >= SLIDE_STEPS {
-                        transitioning = false;
-                        page = next_page;
-                        page_ms = 0;
-                    }
-                } else if page_ms >= PAGE_MS {
-                    next_page = (page + 1) % 5;
-                    transitioning = true;
-                    trans_step = 0;
-                }
-            }
-        })
-    }
-
-    fn name(&self) -> &'static str {
-        "forecast"
-    }
-}
-
-fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn ContentWrapper>> {
-    info!("Registering Forecast display source.");
-
-    let enabled = config.get_bool("forecast.enabled").unwrap_or(false);
-    if !enabled {
-        anyhow::bail!("forecast provider disabled");
-    }
-    let cache = std::sync::Arc::new(
-        WeatherCache::from_config(config)
-            .map_err(|e| anyhow::anyhow!("forecast config error: {}", e))?,
-    );
-
-    let units = Units::from_config(config);
-    Ok(Box::new(Forecast { cache, units }))
-}
