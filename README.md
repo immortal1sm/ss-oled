@@ -118,13 +118,7 @@ Carried over from upstream, plus this fork's own roadmap:
 - [x] ~~Test on more than one Desktop Environment on X11~~ — **closed with reasoning:**
   ss-oled is display-server independent *by design*. It talks only to DBus,
   kernel HID, and the network — the codebase contains no X11/Wayland calls, and
-  the release binary doesn't even link libX11. Verified in practice on
-  **KDE Wayland** (primary development target; the one Wayland-specific issue —
-  DBus session env inheritance in systemd user units — was found and fixed).
-  Upstream was developed on X11-based systems. One known limitation on non-KDE
-  desktops: global hotkeys bind via KDE's kglobalaccel, so manual provider
-  switching requires KDE (auto-rotation and media-event focus are unaffected).
-
+  the release binary doesn't even link libX11. 
 | Environment | Status |
 |---|---|
 | KDE Wayland | ✅ fully verified — primary target |
