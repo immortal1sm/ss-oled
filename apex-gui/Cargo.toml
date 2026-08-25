@@ -11,4 +11,7 @@ eframe = { version = "0.27", default-features = false, features = [
     "wayland",
 ] }
 egui = "0.27"
+rfd = "0.13"
 toml = "0.8"
+ureq = "2"
+serde_json = "1"
