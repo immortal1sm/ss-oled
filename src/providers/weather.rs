@@ -109,16 +109,18 @@ impl ContentProvider for Weather {
 
         Ok(try_stream! {
             use tokio::time::{interval, Duration, MissedTickBehavior};
-            // ~300ms tick drives both icon animation and page timing.
-            let mut tick = interval(Duration::from_millis(300));
+            // 50ms master tick: smooth push-slides (~10fps during transitions);
+            // icon animation advances every 6th tick (~300ms).
+            let mut tick = interval(Duration::from_millis(50));
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             // Configurable via [weather] duration / forecast_duration.
             let today_ms = self.today_secs.saturating_mul(1000).max(1_000);
             let page_ms = (self.forecast_secs.saturating_mul(1000) / 5).max(500);
-            let slide_steps: i32 = 5;
+            let slide_steps: i32 = 12;
 
             let mut anim = 0usize;
+            let mut subframe = 0u32;
             let mut phase_ms = 0u64;
             // Phase::Today | Phase::Day(page) | mid-transition state:
             let mut in_forecast = false;
@@ -169,9 +171,13 @@ impl ContentProvider for Weather {
                 };
 
                 yield frame;
-                anim = anim.wrapping_add(1);
+                // Icon animation ticks at ~300ms; slides run every tick.
+                if subframe % 6 == 0 && !transitioning {
+                    anim = anim.wrapping_add(1);
+                }
+                subframe = subframe.wrapping_add(1);
                 tick.tick().await;
-                phase_ms += 300;
+                phase_ms += 50;
 
                 if transitioning {
                     trans_step += 1;
