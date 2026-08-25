@@ -105,9 +105,7 @@ impl ContentProvider for Weather {
     type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a;
 
     fn stream(&mut self) -> Result<<Self as ContentProvider>::ContentStream<'_>> {
-        info!(
-            "Registering Weather display source (today + 5-day forecast combined)."
-        );
+        info!("Registering Weather display source (today + 5-day forecast combined).");
 
         Ok(try_stream! {
             use tokio::time::{interval, Duration, MissedTickBehavior};
@@ -212,8 +210,10 @@ fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn
 
     let enabled = config.get_bool("weather.enabled").unwrap_or(false);
     let today_secs = config.get_int("weather.duration").unwrap_or(10).max(1) as u64;
-    let forecast_secs =
-        config.get_int("weather.forecast_duration").unwrap_or(30).max(5) as u64;
+    let forecast_secs = config
+        .get_int("weather.forecast_duration")
+        .unwrap_or(30)
+        .max(5) as u64;
     if !enabled {
         anyhow::bail!("weather provider disabled");
     }

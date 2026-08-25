@@ -325,21 +325,24 @@ impl eframe::App for App {
 }
 
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
-    let dwell_key = format!("interval.{name}");
-    ui.horizontal(|ui| {
-        ui.label("Duration (s):");
-        let mut d = app.get_int(&dwell_key);
-        if d == 0 {
-            d = app.get_int("interval.refresh");
-        }
-        if ui
-            .add(egui::DragValue::new(&mut d).clamp_range(1..=600))
-            .changed()
-        {
-            // Write into interval.<name> creating the table if needed.
-            ensure_interval_table(app).insert(name.to_string(), toml::Value::Integer(d));
-        }
-    });
+    // Weather has its own two durations (today + forecast cycle); showing the
+    // generic rotation dwell too would be three confusing numbers.
+    if name != "weather" {
+        let dwell_key = format!("interval.{name}");
+        ui.horizontal(|ui| {
+            ui.label("Duration (s):");
+            let mut d = app.get_int(&dwell_key);
+            if d == 0 {
+                d = app.get_int("interval.refresh");
+            }
+            if ui
+                .add(egui::DragValue::new(&mut d).clamp_range(1..=600))
+                .changed()
+            {
+                ensure_interval_table(app).insert(name.to_string(), toml::Value::Integer(d));
+            }
+        });
+    }
 
     match name {
         "mpris2" => {
