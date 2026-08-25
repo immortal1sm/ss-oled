@@ -50,6 +50,11 @@ impl App {
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
+        eprintln!(
+            "apex-gui: loaded {} (providers: {:?})",
+            app.config_path.display(),
+            app.providers
+        );
         Ok(app)
     }
 
@@ -179,15 +184,19 @@ impl eframe::App for App {
 
             // Two-column layout: providers list | selected provider settings.
             let available = ui.available_size();
+            let panel_h = (available.y - 60.0).max(200.0);
             let panel_w = (available.x * 0.38).max(220.0);
 
             ui.horizontal(|ui| {
                 // ================= LEFT: provider list =================
+                // NOTE: ScrollArea inside a horizontal layout collapses to
+                // zero height unless given an explicit max_height HERE.
                 egui::ScrollArea::vertical()
                     .id_source("provider_list")
+                    .max_height(panel_h)
                     .show(ui, |ui| {
                         ui.set_width(panel_w);
-                        ui.set_min_height(available.y - 90.0);
+                        ui.set_min_height(panel_h);
                         ui.group(|ui| {
                             ui.label("Rotation order (drag to rearrange)");
                             ui.add_space(4.0);
@@ -266,8 +275,9 @@ impl eframe::App for App {
                 // ================= RIGHT: settings panel =================
                 egui::ScrollArea::vertical()
                     .id_source("settings_panel")
+                    .max_height(panel_h)
                     .show(ui, |ui| {
-                        ui.set_min_height(available.y - 90.0);
+                        ui.set_min_height(panel_h);
                         let selected = self.selected.clone();
                         match selected.as_deref() {
                             Some(name) => {
