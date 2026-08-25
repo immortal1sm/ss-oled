@@ -30,15 +30,18 @@ fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn
     let image_path = config
         .get_str("image.path")
         .unwrap_or_else(|_| String::from("images/sample_1.gif"));
+    // Floyd-Steinberg dithering on by default; pixel art / hard-edged logos
+    // sometimes look crisper with it off.
+    let dither = config.get_bool("image.dither").unwrap_or(true);
     let image_file = File::open(&image_path);
 
     let image = match image_file {
-        Ok(file) => image::ImageRenderer::new(Point::new(0, 0), Point::new(128, 40), file),
+        Ok(file) => image::ImageRenderer::new(Point::new(0, 0), Point::new(128, 40), file, dither),
         Err(err) => {
             log::error!("Failed to open the image '{}': {}", image_path, err);
 
             // Use the `new_error` function to create an error GIF
-            image::ImageRenderer::new_error(Point::new(0, 0), Point::new(128, 40))
+            image::ImageRenderer::new_error(Point::new(0, 0), Point::new(128, 40), dither)
         }
     };
 
