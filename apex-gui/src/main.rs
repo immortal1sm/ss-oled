@@ -305,6 +305,48 @@ impl eframe::App for App {
                 }
             }
 
+
+            // ---------- Geocoding search result delivery ----------
+            // Polled globally so a search completes even if the user switches
+            // provider tabs or collapses the weather section mid-request.
+            {
+                let mut pending = SEARCH.lock().unwrap().take();
+                if let Some(rx) = &mut pending {
+                    match rx.try_recv() {
+                        Ok(Ok(payload)) => {
+                            let mut it = payload.split('|');
+                            let lat = it.next().unwrap_or("");
+                            let lon = it.next().unwrap_or("");
+                            let tz = it.next().unwrap_or("");
+                            let name = it.next().unwrap_or("");
+                            self.set_value(
+                                "weather.latitude",
+                                toml::Value::Float(lat.parse().unwrap_or(0.0)),
+                            );
+                            self.set_value(
+                                "weather.longitude",
+                                toml::Value::Float(lon.parse().unwrap_or(0.0)),
+                            );
+                            self.set_str("weather.timezone", tz);
+                            self.set_str("weather.label", name);
+                            self.status = format!("Found: {name}");
+                            *SEARCH.lock().unwrap() = None;
+                        }
+                        Ok(Err(e)) => {
+                            self.status = format!("Search failed: {e}");
+                            *SEARCH.lock().unwrap() = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // Still running: put the receiver back.
+                            *SEARCH.lock().unwrap() = pending.take();
+                            self.status = "Searching…".into();
+                        }
+                        Err(_) => {
+                            *SEARCH.lock().unwrap() = None;
+                        }
+                    }
+                }
+            }
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -394,8 +436,6 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             );
             // City search via Open-Meteo geocoding API. Fills lat/lon/tz.
             use std::sync::mpsc;
-            static SEARCH: std::sync::Mutex<Option<mpsc::Receiver<Result<String, String>>>> =
-                std::sync::Mutex::new(None);
             let mut query = app.city_query.clone();
             let mut do_search = false;
             ui.horizontal(|ui| {
@@ -457,47 +497,6 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                         result
                     });
                     *SEARCH.lock().unwrap() = Some(rx);
-            }
-
-            // Poll for geocoding results without blocking the UI thread.
-            let mut pending = SEARCH.lock().unwrap().take();
-            if let Some(rx) = &mut pending {
-                match rx.try_recv() {
-                    Ok(Ok(payload)) => {
-                        let mut it = payload.split('|');
-                        // Lat/lon MUST be numeric (daemon reads with get_float).
-                        let lat = it.next().unwrap_or("");
-                        let lon = it.next().unwrap_or("");
-                        let tz = it.next().unwrap_or("");
-                        let name = it.next().unwrap_or("");
-                        app.set_value(
-                            "weather.latitude",
-                            toml::Value::Float(lat.parse().unwrap_or(0.0)),
-                        );
-                        app.set_value(
-                            "weather.longitude",
-                            toml::Value::Float(lon.parse().unwrap_or(0.0)),
-                        );
-                        app.set_str("weather.timezone", tz);
-                        app.set_str("weather.label", name);
-                        app.status = format!("Found: {name}");
-                        *SEARCH.lock().unwrap() = None;
-                    }
-                    Ok(Err(e)) => {
-                        app.status = format!("Search failed: {e}");
-                        *SEARCH.lock().unwrap() = None;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        // Still running: put the receiver back; show state
-                        // in the bottom status bar (visible even if this
-                        // section is scrolled away).
-                        *SEARCH.lock().unwrap() = pending.take();
-                        app.status = "Searching…".into();
-                    }
-                    Err(_) => {
-                        *SEARCH.lock().unwrap() = None;
-                    }
-                }
             }
 
             text_field(ui, app, "weather.latitude", "Latitude");
@@ -577,6 +576,11 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
+
+/// Geocoding search state: weather tab spawns, global poll delivers.
+static SEARCH: std::sync::Mutex<
+    Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+> = std::sync::Mutex::new(None);
 
 fn main() -> Result<()> {
     let path = std::env::args()
