@@ -397,18 +397,24 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             static SEARCH: std::sync::Mutex<Option<mpsc::Receiver<Result<String, String>>>> =
                 std::sync::Mutex::new(None);
             let mut query = app.city_query.clone();
+            let mut do_search = false;
             ui.horizontal(|ui| {
                 ui.label("City:");
-                let changed = ui.text_edit_singleline(&mut query).changed();
-                if changed {
+                let field = ui.text_edit_singleline(&mut query);
+                // Enter inside the field triggers search (standard UX).
+                if field.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && !query.trim().is_empty()
+                {
+                    do_search = true;
+                }
+                do_search |= ui.button("Search").clicked();
+                if do_search {
                     app.city_query = query.clone();
                 }
-                let pressed_enter =
-                    changed && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let do_search = ui.button("Search").clicked() || pressed_enter;
-                if do_search && !query.trim().is_empty() {
-                    app.set_str("weather.search_query", query.trim());
-                    let q = query.trim().to_string();
+            });
+            if do_search {
+                let q = query.trim().to_string();
                     let (tx, rx) = mpsc::channel();
                     std::thread::spawn(move || {
                         // Try the full query first; on zero results, progressively
@@ -448,8 +454,7 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                         result
                     });
                     *SEARCH.lock().unwrap() = Some(rx);
-                }
-            });
+            }
 
             // Poll for geocoding results without blocking the UI thread.
             let mut pending = SEARCH.lock().unwrap().take();
