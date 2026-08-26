@@ -138,13 +138,20 @@ impl Tray for SsOledTray {
                     if already {
                         return;
                     }
-                    let _ = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(
-                            "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui \
-                             >/dev/null 2>&1 &",
-                        )
-                        .spawn();
+                    // The GUI needs a display connection; if this tray was
+                    // started without one in its environment, supply the usual
+                    // Plasma session defaults.
+                    let mut cmd = std::process::Command::new("sh");
+                    cmd.arg("-c").arg(
+                        "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui >/dev/null 2>&1 &",
+                    );
+                    let have_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
+                        || std::env::var_os("DISPLAY").is_some();
+                    if !have_display {
+                        cmd.env("WAYLAND_DISPLAY", "wayland-0");
+                        cmd.env("XDG_SESSION_TYPE", "wayland");
+                    }
+                    let _ = cmd.spawn();
                 }),
                 ..Default::default()
             }
