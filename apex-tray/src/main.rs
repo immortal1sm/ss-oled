@@ -151,7 +151,7 @@ impl Tray for SsOledTray {
 
         items.push(
             StandardItem {
-                label: "Quit — stop OLED & close settings".into(),
+                label: "Quit".into(),
                 activate: Box::new(|_tray: &mut Self| {
                     // Full-suite shutdown: config editor, then daemon, then us.
                     let _ = std::process::Command::new("pkill")
