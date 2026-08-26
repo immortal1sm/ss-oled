@@ -827,7 +827,10 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     ui.label("API endpoint:");
     ui.horizontal(|ui| {
         let mut s = app.get_str(&format!("{base}.source"));
-        let response = ui.add(egui::TextEdit::singleline(&mut s).desired_width(f32::INFINITY));
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut s)
+                .desired_width(ui.available_width() - 70.0),
+        );
         if response.changed() || response.lost_focus() {
             app.set_str(&format!("{base}.source"), &s);
         }
