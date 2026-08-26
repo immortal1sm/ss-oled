@@ -1013,43 +1013,41 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
     let mut drag_over = app.field_drag_over;
     let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
-    ui.label("Fields — JSON path : label");
-    ui.add_space(2.0);
-
-    egui::Grid::new(("fields_grid", base)).show(ui, |ui| {
-        for (i, row) in rows.iter_mut().enumerate() {
-            // First checkbox: label visibility ONLY. Never touches path/key.
+    for (i, row) in rows.iter_mut().enumerate() {
+        // Capture row rect BEFORE drawing widgets so drag-hover detection
+        // sees the actual rendered area.
+        let row_resp = ui.horizontal(|ui| {
+            // Column 1: label visibility checkbox.
             if ui.checkbox(&mut row.label_visible, "").changed() {
                 changed = true;
             }
 
-            // Label/key text — editable regardless of visibility
-            // (visibility controls RENDERING, not configurability).
+            // Column 2: label text input (always editable).
             let key_resp = ui.add(
                 egui::TextEdit::singleline(&mut row.label)
                     .hint_text("label")
-                    .desired_width(110.0),
+                    .desired_width(90.0),
             );
             if key_resp.changed() {
                 changed = true;
             }
 
-            // JSON path.
+            // Column 3: JSON path / value.
             let p_resp = ui.add(
                 egui::TextEdit::singleline(&mut row.path)
                     .hint_text("json.path[0].key")
-                    .desired_width(170.0),
+                    .desired_width(150.0),
             );
             if p_resp.changed() || p_resp.lost_focus() {
                 changed = true;
             }
 
-            // Second checkbox: value visibility ONLY.
+            // Column 4: value visibility checkbox.
             if ui.checkbox(&mut row.value_visible, "").changed() {
                 changed = true;
             }
 
-            // Dedicated drag handle — the only drag initiator.
+            // Column 5: drag handle — sole drag initiator.
             let handle = ui.add(egui::Button::new("⠿").small().sense(egui::Sense::drag()));
             let handle_rect = handle.rect;
             if handle.drag_started() {
@@ -1062,24 +1060,27 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             handle.on_hover_text("Drag to reorder field");
-            row_rects.push((i, handle_rect));
 
-            if ui.button("✕ remove").clicked() {
+            // Column 6: remove.
+            if ui.button("✕").clicked() {
                 remove_idx = Some(i);
             }
-            ui.end_row();
-        }
+        });
+        row_rects.push((i, row_resp.response.rect));
+    }
 
-        // Drag-over detection (pointer based) across rows.
-        if drag_from.is_some() {
-            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                app.field_drag_over = row_rects
-                    .iter()
-                    .find(|(_, r)| r.contains(pos))
-                    .map(|(i, _)| *i);
-            }
+    // Drag-over detection: pointer position vs each row's full rect.
+    if drag_from.is_some() {
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            app.field_drag_over = row_rects
+                .iter()
+                .find(|(_, r)| r.contains(pos))
+                .map(|(i, _)| *i);
         }
+    }
 
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
         if ui.button("+ Add field").clicked() {
             rows.push(FieldRow {
                 path: String::new(),
@@ -1101,7 +1102,6 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 changed = true;
             }
         }
-        ui.end_row();
     });
 
     // Commit drag reorder after the grid closure finishes. The whole
