@@ -128,59 +128,57 @@ async fn serve(stream: UnixStream, handle: IpcHandle) -> Result<()> {
             *handle.last_change.lock().unwrap() = std::time::Instant::now();
         }
 
-        let response = match cmd {
-            "next" | "prev" => {
-                // Rotation is allowed even when locked - manual movement
-                // carries the lock, matching hotkey semantics.
-                let c = if cmd == "next" {
-                    IpcCommand::Next
-                } else {
-                    IpcCommand::Prev
-                };
-                let idx_before = handle.current.load(Ordering::SeqCst);
-                let size = handle.provider_names.len();
-                let idx_after = if cmd == "next" {
-                    (idx_before + 1) % size
-                } else if idx_before == 0 {
-                    size - 1
-                } else {
-                    idx_before - 1
-                };
-                handle.current.store(idx_after, Ordering::SeqCst);
-                let _ = handle.tx.send(c);
-                format!(
-                    "ok {}",
-                    handle
-                        .provider_names
-                        .get(idx_after)
-                        .map(String::as_str)
-                        .unwrap_or("?")
-                )
-            }
-            "goto" if !cmd[5..].is_empty() => {
-                let target = &cmd[5..];
-                match handle.provider_names.iter().position(|n| n == target) {
-                    Some(idx) => {
-                        handle.current.store(idx, Ordering::SeqCst);
-                        let _ = handle.tx.send(IpcCommand::Next);
-                        format!("ok {target}")
-                    }
-                    None => format!("err no provider named '{target}'"),
+        let response = if cmd == "next" || cmd == "prev" {
+            // Rotation is allowed even when locked - manual movement
+            // carries the lock, matching hotkey semantics.
+            let c = if cmd == "next" {
+                IpcCommand::Next
+            } else {
+                IpcCommand::Prev
+            };
+            let idx_before = handle.current.load(Ordering::SeqCst);
+            let size = handle.provider_names.len();
+            let idx_after = if cmd == "next" {
+                (idx_before + 1) % size
+            } else if idx_before == 0 {
+                size - 1
+            } else {
+                idx_before - 1
+            };
+            handle.current.store(idx_after, Ordering::SeqCst);
+            let _ = handle.tx.send(c);
+            format!(
+                "ok {}",
+                handle
+                    .provider_names
+                    .get(idx_after)
+                    .map(String::as_str)
+                    .unwrap_or("?")
+            )
+        } else if cmd.starts_with("goto ") && cmd.len() > 5 {
+            let target = &cmd[5..];
+            match handle.provider_names.iter().position(|n| n == target) {
+                Some(idx) => {
+                    handle.current.store(idx, Ordering::SeqCst);
+                    let _ = handle.tx.send(IpcCommand::Next);
+                    format!("ok {target}")
                 }
+                None => format!("err no provider named '{target}'"),
             }
-            "lock" => {
-                handle.locked.store(true, Ordering::SeqCst);
-                info!("IPC: provider LOCKED");
-                "ok locked".to_string()
-            }
-            "unlock" => {
-                handle.locked.store(false, Ordering::SeqCst);
-                info!("IPC: provider UNLOCKED");
-                "ok unlocked".to_string()
-            }
-            "status" => handle.status_line(),
-            "providers" => handle.provider_names.join(" "),
-            other => format!("err unknown command '{other}'"),
+        } else if cmd == "lock" {
+            handle.locked.store(true, Ordering::SeqCst);
+            info!("IPC: provider LOCKED");
+            "ok locked".to_string()
+        } else if cmd == "unlock" {
+            handle.locked.store(false, Ordering::SeqCst);
+            info!("IPC: provider UNLOCKED");
+            "ok unlocked".to_string()
+        } else if cmd == "status" {
+            handle.status_line()
+        } else if cmd == "providers" {
+            handle.provider_names.join(" ")
+        } else {
+            format!("err unknown command '{cmd}'")
         };
 
         writer.write_all(response.as_bytes()).await?;
