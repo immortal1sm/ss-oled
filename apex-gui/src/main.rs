@@ -326,7 +326,18 @@ impl eframe::App for App {
                                 || self.drag_from == Some(idx);
 
                             let row = ui.horizontal(|ui| {
-                                let enabled_key = format!("{name}.enabled");
+                                // Custom providers nest under providers.custom.<name>.
+                                let is_custom = self
+                                    .doc
+                                    .get("providers")
+                                    .and_then(|p| p.get("custom"))
+                                    .and_then(|c| c.get(&name))
+                                    .is_some();
+                                let enabled_key = if is_custom {
+                                    format!("providers.custom.{name}.enabled")
+                                } else {
+                                    format!("{name}.enabled")
+                                };
                                 let mut enabled = self.get_bool(&enabled_key);
                                 if ui.checkbox(&mut enabled, "").changed() {
                                     self.set_bool(&enabled_key, enabled);
