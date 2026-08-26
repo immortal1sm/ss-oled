@@ -50,6 +50,9 @@ struct App {
     api_suggested: Option<Vec<(String, String)>>,
     /// Receiver for the in-flight API test.
     api_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// Field-editor drag state (persists across frames while dragging).
+    field_drag_from: Option<usize>,
+    field_drag_over: Option<usize>,
     /// Status line for the UI.
     status: String,
 }
@@ -78,6 +81,8 @@ impl App {
             api_preview: None,
             api_suggested: None,
             api_test: None,
+            field_drag_from: None,
+            field_drag_over: None,
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -1004,8 +1009,8 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
 
     let mut changed = false;
     let mut remove_idx: Option<usize> = None;
-    let mut drag_from: Option<usize> = None;
-    let mut drag_over: Option<usize> = None;
+    let drag_from = app.field_drag_from;
+    let mut drag_over = app.field_drag_over;
     let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
     ui.label("Fields — JSON path : label");
@@ -1018,14 +1023,14 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 changed = true;
             }
 
-            // Key/label text — editable only while the label is visible.
-            let key_resp = ui.add_enabled(
-                row.label_visible,
+            // Label/key text — editable regardless of visibility
+            // (visibility controls RENDERING, not configurability).
+            let key_resp = ui.add(
                 egui::TextEdit::singleline(&mut row.label)
                     .hint_text("label")
                     .desired_width(110.0),
             );
-            if row.label_visible && key_resp.changed() {
+            if key_resp.changed() {
                 changed = true;
             }
 
@@ -1048,7 +1053,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             let handle = ui.add(egui::Button::new("⠿").small().sense(egui::Sense::drag()));
             let handle_rect = handle.rect;
             if handle.drag_started() {
-                drag_from = Some(i);
+                app.field_drag_from = Some(i);
             }
             if handle.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -1068,7 +1073,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
         // Drag-over detection (pointer based) across rows.
         if drag_from.is_some() {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                drag_over = row_rects
+                app.field_drag_over = row_rects
                     .iter()
                     .find(|(_, r)| r.contains(pos))
                     .map(|(i, _)| *i);
@@ -1101,13 +1106,15 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
 
     // Commit drag reorder after the grid closure finishes. The whole
     // FieldRow (path, label, both visibilities) moves together.
-    if let (Some(from), Some(to)) = (drag_from, drag_over) {
+    if let (Some(from), Some(to)) = (app.field_drag_from, app.field_drag_over) {
         if from != to {
             let item = rows.remove(from);
             let to_adj = if to > from { to - 1 } else { to };
             rows.insert(to_adj, item);
             changed = true;
         }
+        app.field_drag_from = None;
+        app.field_drag_over = None;
     }
 
     if let Some(idx) = remove_idx {
