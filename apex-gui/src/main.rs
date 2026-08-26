@@ -42,6 +42,8 @@ struct App {
     city_query: String,
     /// Working text for the optional province/state disambiguation.
     province_filter: String,
+    /// Whether the secret header field shows plain text.
+    show_secret: bool,
     /// Status line for the UI.
     status: String,
 }
@@ -66,6 +68,7 @@ impl App {
             drag_over: None,
             city_query: String::new(),
             province_filter,
+            show_secret: false,
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -94,6 +97,22 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        // Custom providers live under [providers.custom.<name>].
+        if let Some(custom) = self
+            .doc
+            .get("providers")
+            .and_then(|p| p.get("custom"))
+            .and_then(|c| c.as_table())
+        {
+            for (name, v) in custom {
+                if v.get("enabled").and_then(|e| e.as_bool()).is_some() {
+                    let prio =
+                        v.get("priority").and_then(|p| p.as_integer()).unwrap_or(99);
+                    list.push((name.clone(), prio));
+                }
+            }
+        }
+
         list.sort_by_key(|(_, prio)| *prio);
         // 'forecast' merged into 'weather' - hide obsolete section from GUI.
         self.providers = list
@@ -181,21 +200,38 @@ impl App {
     }
 
     fn get_value(&self, path: &str) -> Option<&toml::Value> {
-        let mut parts = path.split('.');
-        let section = parts.next()?;
-        let key = parts.next()?;
-        self.doc.get(section).and_then(|sec| sec.get(key))
+        let mut cur = &self.doc;
+        for part in path.split('.') {
+            cur = cur.get(part)?;
+        }
+        Some(cur)
     }
 
+    fn get_value_owned(&self, path: &str) -> Option<toml::Value> {
+        self.get_value(path).cloned()
+    }
+
+    /// Walk/create nested tables along `path` minus the last segment, then
+    /// insert `val` under the final key. Works for any depth.
     fn set_value(&mut self, path: &str, val: toml::Value) {
-        let Some((section, key)) = path.split_once('.') else {
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.len() < 2 {
             return;
-        };
-        if let Some(table) = self.doc.as_table_mut() {
-            if let Some(sec) = table.get_mut(section).and_then(|v| v.as_table_mut()) {
-                sec.insert(key.to_string(), val);
-            }
         }
+        let mut table = match self.doc.as_table_mut() {
+            Some(t) => t,
+            None => return,
+        };
+        for part in &parts[..parts.len() - 1] {
+            if !table.contains_key(*part) {
+                table.insert(part.to_string(), toml::Value::Table(Default::default()));
+            }
+            table = match table.get_mut(*part).and_then(|v| v.as_table_mut()) {
+                Some(t) => t,
+                None => return,
+            };
+        }
+        table.insert(parts[parts.len() - 1].to_string(), val);
     }
 }
 
@@ -378,6 +414,18 @@ impl eframe::App for App {
 }
 
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
+    // Custom providers get their own editor.
+    let is_custom = app
+        .doc
+        .get("providers")
+        .and_then(|p| p.get("custom"))
+        .and_then(|c| c.get(name))
+        .is_some();
+    if is_custom {
+        custom_provider_editor(ui, app, name);
+        return;
+    }
+
     // Weather has its own two durations (today + forecast cycle); showing the
     // generic rotation dwell too would be three confusing numbers.
     if name != "weather" {
@@ -658,6 +706,155 @@ fn ensure_interval_table(app: &mut App) -> &mut toml::value::Table {
         .and_then(|v| v.as_table_mut())
         .expect("interval is a table")
 }
+
+
+/// Editor for [providers.custom.<name>] sections.
+fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
+    let base = format!("providers.custom.{name}");
+
+    ui.horizontal(|ui| {
+        ui.label(format!("{name} —"));
+        ui.colored_label(egui::Color32::LIGHT_BLUE, "custom JSON-API screen");
+    });
+    ui.add_space(4.0);
+
+    toggle(ui, app, &format!("{base}.enabled"), "Enabled");
+
+    ui.horizontal(|ui| {
+        ui.label("Duration (s):");
+        let mut d = app.get_int(&format!("interval.{name}"));
+        if d == 0 {
+            d = app.get_int("interval.refresh");
+        }
+        if ui
+            .add(egui::DragValue::new(&mut d).clamp_range(1..=600))
+            .changed()
+        {
+            ensure_interval_table(app).insert(name.to_string(), toml::Value::Integer(d));
+        }
+
+        ui.label("Poll (s):");
+        let mut p = app.get_int(&format!("{base}.poll"));
+        if p == 0 {
+            p = 300;
+        }
+        if ui
+            .add(egui::DragValue::new(&mut p).clamp_range(10..=86400))
+            .changed()
+        {
+            app.set_int(&format!("{base}.poll"), p);
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.label("API endpoint:");
+    text_field_multiline_ok(app, ui, &format!("{base}.source"));
+
+    ui.add_space(6.0);
+    ui.label("Header (optional, ${ENV_VAR} expanded):");
+    // Masked input for secrets.
+    ui.horizontal(|ui| {
+        let path = format!("{base}.header");
+        let mut s = app.get_str(&path);
+        let masked = !s.is_empty() && !app.show_secret;
+        let response = ui.add(egui::TextEdit::singleline(&mut s).password(masked));
+        if response.changed() {
+            app.set_str(&path, &s);
+        }
+        if ui
+            .toggle_value(&mut app.show_secret, "👁")
+            .changed()
+        {
+            // toggling just re-renders
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.label("Fields — JSON path : label");
+    edit_fields_table(ui, app, &base);
+}
+
+fn text_field_multiline_ok(app: &mut App, ui: &mut egui::Ui, path: &str) {
+    ui.horizontal(|ui| {
+        let mut s = app.get_str(path);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut s)
+                .desired_width(f32::INFINITY),
+        );
+        if response.changed() || response.lost_focus() {
+            app.set_str(path, &s);
+        }
+    });
+}
+
+fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
+    let fields_path = format!("{base}.fields");
+    // Read current entries as strings.
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if let Some(toml::Value::Array(arr)) = app.get_value_owned(&fields_path) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                let (path_part, label_part) = match s.split_once(':') {
+                    Some((p, l)) => (p.trim().to_string(), l.trim().to_string()),
+                    None => (s.trim().to_string(), String::new()),
+                };
+                rows.push((path_part, label_part));
+            }
+        }
+    }
+
+    let mut changed = false;
+    let mut remove_idx: Option<usize> = None;
+
+    egui::Grid::new(("fields_grid", base)).show(ui, |ui| {
+        for (i, (path_part, label_part)) in rows.iter_mut().enumerate() {
+            let p_resp = ui.add(
+                egui::TextEdit::singleline(path_part)
+                    .hint_text("json.path[0].key")
+                    .desired_width(220.0),
+            );
+            let l_resp = ui.add(
+                egui::TextEdit::singleline(label_part)
+                    .hint_text("Label")
+                    .desired_width(120.0),
+            );
+            if p_resp.changed() || l_resp.changed() {
+                changed = true;
+            }
+            if ui.button("✕").clicked() {
+                remove_idx = Some(i);
+            }
+            ui.end_row();
+        }
+        if ui.button("+ Add field").clicked() {
+            rows.push((String::new(), String::new()));
+            changed = true;
+        }
+        ui.end_row();
+    });
+
+    if let Some(idx) = remove_idx {
+        rows.remove(idx);
+        changed = true;
+    }
+
+    if changed {
+        let serialized: Vec<toml::Value> = rows
+            .iter()
+            .filter(|(p, _)| !p.trim().is_empty())
+            .map(|(p, l)| {
+                if l.trim().is_empty() {
+                    toml::Value::String(p.clone())
+                } else {
+                    toml::Value::String(format!("{}: {}", p.trim(), l.trim()))
+                }
+            })
+            .collect();
+        app.set_value(&fields_path, toml::Value::Array(serialized));
+    }
+}
+
 
 /// Percent-encode a string for use as a URL query value.
 fn urlencode(s: &str) -> String {
