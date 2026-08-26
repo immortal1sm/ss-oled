@@ -44,6 +44,10 @@ struct App {
     province_filter: String,
     /// Whether the secret header field shows plain text.
     show_secret: bool,
+    /// Live preview of the last API test response (pretty JSON).
+    api_preview: Option<String>,
+    /// Receiver for the in-flight API test.
+    api_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Status line for the UI.
     status: String,
 }
@@ -69,6 +73,8 @@ impl App {
             city_query: String::new(),
             province_filter,
             show_secret: false,
+            api_preview: None,
+            api_test: None,
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -106,8 +112,7 @@ impl App {
         {
             for (name, v) in custom {
                 if v.get("enabled").and_then(|e| e.as_bool()).is_some() {
-                    let prio =
-                        v.get("priority").and_then(|p| p.as_integer()).unwrap_or(99);
+                    let prio = v.get("priority").and_then(|p| p.as_integer()).unwrap_or(99);
                     list.push((name.clone(), prio));
                 }
             }
@@ -209,6 +214,66 @@ impl App {
 
     fn get_value_owned(&self, path: &str) -> Option<toml::Value> {
         self.get_value(path).cloned()
+    }
+
+    /// Fire a background GET against `source` with the optional header;
+    /// result lands in self.api_test for the poll loop to collect.
+    fn test_api(&mut self, source: &str, header: &str) {
+        use std::sync::mpsc;
+        if source.is_empty() {
+            self.status = "API test: endpoint is empty".into();
+            return;
+        }
+        let header = header.to_string();
+        let source = source.to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let mut req = ureq::get(&source).timeout(std::time::Duration::from_secs(8));
+                if !header.trim().is_empty() {
+                    // Expand ${ENV} and split "Key: value".
+                    let expanded = expand_env_str(&header);
+                    let mut parts = expanded.splitn(2, ':');
+                    let key = parts.next().unwrap_or("").trim();
+                    let val = parts.next().unwrap_or("").trim();
+                    if !key.is_empty() {
+                        req = req.set(key, val);
+                    }
+                }
+                let body = req
+                    .call()
+                    .map_err(|e| format!("{e}"))?
+                    .into_string()
+                    .map_err(|e| format!("read failed: {e}"))?;
+                // Pretty-print JSON when possible for the preview.
+                match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => serde_json::to_string_pretty(&v).map_err(|e| e.to_string()),
+                    Err(_) => Ok(body.chars().take(2000).collect()),
+                }
+            })();
+            let _ = tx.send(result);
+        });
+        self.api_test = Some(rx);
+        self.status = "Testing API…".into();
+    }
+
+    /// Collect finished API test results (non-blocking).
+    fn take_api_result(&mut self) -> Option<Result<String, String>> {
+        let rx = self.api_test.as_mut()?;
+        match rx.try_recv() {
+            Ok(r) => {
+                self.api_test = None;
+                Some(r)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.status = "Testing API…".into();
+                None
+            }
+            Err(_) => {
+                self.api_test = None;
+                Some(Err("connection dropped".into()))
+            }
+        }
     }
 
     /// Walk/create nested tables along `path` minus the last segment, then
@@ -707,7 +772,6 @@ fn ensure_interval_table(app: &mut App) -> &mut toml::value::Table {
         .expect("interval is a table")
 }
 
-
 /// Editor for [providers.custom.<name>] sections.
 fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     let base = format!("providers.custom.{name}");
@@ -748,7 +812,31 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
 
     ui.add_space(6.0);
     ui.label("API endpoint:");
-    text_field_multiline_ok(app, ui, &format!("{base}.source"));
+    ui.horizontal(|ui| {
+        let mut s = app.get_str(&format!("{base}.source"));
+        let response = ui.add(egui::TextEdit::singleline(&mut s).desired_width(f32::INFINITY));
+        if response.changed() || response.lost_focus() {
+            app.set_str(&format!("{base}.source"), &s);
+        }
+        if ui.button("Test").clicked() {
+            app.test_api(
+                &s.trim().to_string(),
+                &app.get_str(&format!("{base}.header")),
+            );
+        }
+    });
+    // Live API test result (raw JSON preview) polled from background thread.
+    if let Some(result) = app.take_api_result() {
+        match result {
+            Ok(body) => {
+                app.api_preview = Some(body.clone());
+                app.status = format!("API OK ({} bytes)", body.len());
+            }
+            Err(e) => {
+                app.status = format!("API test failed: {e}");
+            }
+        }
+    }
 
     ui.add_space(6.0);
     ui.label("Header (optional, ${ENV_VAR} expanded):");
@@ -761,10 +849,7 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
         if response.changed() {
             app.set_str(&path, &s);
         }
-        if ui
-            .toggle_value(&mut app.show_secret, "👁")
-            .changed()
-        {
+        if ui.toggle_value(&mut app.show_secret, "👁").changed() {
             // toggling just re-renders
         }
     });
@@ -778,10 +863,7 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
 fn text_field_multiline_ok(app: &mut App, ui: &mut egui::Ui, path: &str) {
     ui.horizontal(|ui| {
         let mut s = app.get_str(path);
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut s)
-                .desired_width(f32::INFINITY),
-        );
+        let response = ui.add(egui::TextEdit::singleline(&mut s).desired_width(f32::INFINITY));
         if response.changed() || response.lost_focus() {
             app.set_str(path, &s);
         }
@@ -840,9 +922,9 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
     }
 
     if changed {
+        // Keep empty-path rows too: they're work-in-progress entries.
         let serialized: Vec<toml::Value> = rows
             .iter()
-            .filter(|(p, _)| !p.trim().is_empty())
             .map(|(p, l)| {
                 if l.trim().is_empty() {
                     toml::Value::String(p.clone())
@@ -853,8 +935,46 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             .collect();
         app.set_value(&fields_path, toml::Value::Array(serialized));
     }
+
+    ui.add_space(6.0);
+    if let Some(preview) = &app.api_preview {
+        egui::CollapsingHeader::new("Last API response")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut preview.as_str())
+                                .desired_width(f32::INFINITY)
+                                .code_editor(),
+                        );
+                    });
+            });
+    }
 }
 
+/// Expand `${VAR}` references from the process environment (GUI side).
+fn expand_env_str(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                out.push_str(std::env::var(&after[..end]).unwrap_or_default().as_str());
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str("${");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// Percent-encode a string for use as a URL query value.
 fn urlencode(s: &str) -> String {
