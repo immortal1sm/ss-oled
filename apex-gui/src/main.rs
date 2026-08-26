@@ -347,12 +347,15 @@ impl eframe::App for App {
 
                                 // Transparent interaction layer over the whole
                                 // row (checkbox excluded) handling select+drag.
+                                // Grow the hitbox only RIGHTWARD so it never
+                                // overlaps the checkbox to its left.
+                                let mut hb = label.rect;
+                                hb.max.x += 60.0;
+                                hb.min.y -= 4.0;
+                                hb.max.y += 4.0;
                                 let row_id = egui::Id::new(("provider_row", name));
-                                let hitbox = ui.interact(
-                                    label.rect.expand2(egui::vec2(60.0, 6.0)),
-                                    row_id,
-                                    egui::Sense::click_and_drag(),
-                                );
+                                let hitbox =
+                                    ui.interact(hb, row_id, egui::Sense::click_and_drag());
                                 if hitbox.clicked() {
                                     self.selected = Some(name.clone());
                                 }
@@ -793,8 +796,7 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     });
     ui.add_space(4.0);
 
-    toggle(ui, app, &format!("{base}.enabled"), "Enabled");
-
+    // Enabled state lives in the sidebar checkbox; no duplicate here.
     ui.horizontal(|ui| {
         ui.label("Duration (s):");
         let mut d = app.get_int(&format!("interval.{name}"));
