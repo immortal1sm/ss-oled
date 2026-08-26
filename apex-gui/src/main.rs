@@ -46,6 +46,8 @@ struct App {
     show_secret: bool,
     /// Live preview of the last API test response (pretty JSON).
     api_preview: Option<String>,
+    /// Suggested (path, label) pairs generated from the last API response.
+    api_suggested: Option<Vec<(String, String)>>,
     /// Receiver for the in-flight API test.
     api_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Status line for the UI.
@@ -74,6 +76,7 @@ impl App {
             province_filter,
             show_secret: false,
             api_preview: None,
+            api_suggested: None,
             api_test: None,
             status: "Loaded".into(),
         };
@@ -846,6 +849,10 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
         match result {
             Ok(body) => {
                 app.api_preview = Some(body.clone());
+                // Auto-suggest field rows from the response structure.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    app.api_suggested = Some(suggest_fields(&v));
+                }
                 app.status = format!("API OK ({} bytes)", body.len());
             }
             Err(e) => {
@@ -929,6 +936,13 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             rows.push((String::new(), String::new()));
             changed = true;
         }
+        if app.api_preview.is_some() && ui.button("Auto-fill from response").clicked() {
+            if let Some(sugg) = &app.api_suggested {
+                rows.clear();
+                rows.extend(sugg.iter().cloned());
+                changed = true;
+            }
+        }
         ui.end_row();
     });
 
@@ -968,6 +982,52 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     });
             });
     }
+}
+
+/// Walk a JSON value and produce (path, label) suggestions for leaf scalars.
+fn suggest_fields(
+    v: &serde_json::Value,
+) -> Vec<(String, String)> {
+    fn walk(v: &serde_json::Value, prefix: &str, depth: usize, out: &mut Vec<(String, String)>) {
+        if out.len() >= 12 {
+            return;
+        }
+        match v {
+            serde_json::Value::Object(map) => {
+                if prefix.is_empty() && map.is_empty() {
+                    return;
+                }
+                for (k, child) in map {
+                    let p = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    walk(child, &p, depth + 1, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                if let Some(first) = arr.first() {
+                    walk(first, &format!("{prefix}[0]"), depth + 1, out);
+                }
+            }
+            // Leaf scalar.
+            _ => {
+                if !prefix.is_empty() {
+                    let label = prefix
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(prefix)
+                        .trim_end_matches("[0]")
+                        .to_string();
+                    out.push((prefix.to_string(), label));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, "", 0, &mut out);
+    out
 }
 
 /// Expand `${VAR}` references from the process environment (GUI side).
