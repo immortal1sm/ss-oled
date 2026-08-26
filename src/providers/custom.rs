@@ -204,7 +204,7 @@ impl CustomProvider {
                 continue;
             }
             let _ = empty;
-            if show_label {
+            if show_label && !label.is_empty() {
                 Text::with_baseline(
                     format!("{label}:").as_str(),
                     Point::new(0, y),
@@ -379,7 +379,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         let (path, label) = match spec.split_once(':') {
             Some((p, l)) => {
                 let l = l.trim().to_string();
-                // "-" sentinel: user chose to hide this row's label.
+                // "-" sentinel or empty: user chose to hide this row's label.
                 let l = if l == "-" { String::new() } else { l };
                 (p.trim().to_string(), l)
             }
@@ -390,8 +390,8 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         };
         fields.push(Field {
             path,
+            show_label: !label.is_empty(),
             label,
-            show_label: true,
             show_value,
         });
     }

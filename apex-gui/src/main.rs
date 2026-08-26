@@ -902,45 +902,91 @@ fn text_field_multiline_ok(app: &mut App, ui: &mut egui::Ui, path: &str) {
 #[derive(Clone)]
 struct FieldRow {
     path: String,
-    label: String, // "-" or empty => label hidden
-    show_value: bool,
+    label: String,
+    label_visible: bool,
+    value_visible: bool,
 }
 
 impl FieldRow {
+    /// Parse a legacy/new fields entry. Visibility is stored as explicit
+    /// state, never inferred from the strings themselves.
     fn parse(s: &str) -> Self {
         let s = s.trim();
-        // Value-hidden marker: '!' suffix directly after the path.
-        let (path_part, rest, show_value_default) = match s.split_once('!') {
-            Some((p, r)) if !p.is_empty() => (p.trim().to_string(), Some(r.to_string()), false),
-            _ => {
-                let mut it = s.splitn(2, ':');
-                let p = it.next().unwrap_or("").trim().to_string();
-                (p.clone(), it.next().map(|l| l.to_string()), true)
+        // New format: '!' suffix after the path = value hidden.
+        if let Some(stripped) = s.strip_suffix('!') {
+            let (p, l) = match stripped.split_once(':') {
+                Some((p, l)) => (p.trim(), l.trim()),
+                None => (stripped.trim(), ""),
+            };
+            return FieldRow {
+                path: p.to_string(),
+                label: l.to_string(),
+                label_visible: !l.is_empty(),
+                value_visible: false,
+            };
+        }
+        // Legacy formats:
+        //   "path"          -> both visible, label auto-derived
+        //   "path: -"       -> label hidden
+        //   "path: label"   -> both visible with explicit label
+        match s.split_once(':') {
+            Some((p, l)) => {
+                let l = l.trim();
+                let hidden = l == "-" || l.is_empty();
+                let label = if hidden { String::new() } else { l.to_string() };
+                FieldRow {
+                    path: p.to_string(),
+                    label,
+                    label_visible: !hidden,
+                    value_visible: true,
+                }
             }
-        };
-        let label = match &rest {
-            Some(l) => l.trim().to_string(),
-            None => String::new(),
-        };
-        let _ = show_value_default;
-        // Recompute show_value from the '!' position relative to path end.
-        let sv = s.contains("!:") || s.ends_with('!');
-        FieldRow {
-            path: path_part,
-            label,
-            show_value: sv,
+            None => {
+                let tail = s.rsplit('.').next().unwrap_or(s).to_string();
+                FieldRow {
+                    path: s.to_string(),
+                    label: tail,
+                    label_visible: true,
+                    value_visible: true,
+                }
+            }
         }
     }
 
-    fn to_toml_string(&self) -> String {
+    fn auto_label(&self) -> String {
+        self.path
+            .rsplit('.')
+            .next()
+            .unwrap_or(&self.path)
+            .trim_end_matches("[0]")
+            .to_string()
+    }
+
+    fn effective_label(&self) -> String {
+        if self.label_visible {
+            if self.label.is_empty() {
+                self.auto_label()
+            } else {
+                self.label.clone()
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    fn to_toml_string(&mut self) -> String {
+        // Normalize: hidden label drops the text; visible-but-empty derives it.
+        if !self.label_visible {
+            self.label.clear();
+        } else if self.label.is_empty() {
+            self.label = self.auto_label();
+        }
         let p = self.path.trim();
-        match (self.show_value, self.label.trim()) {
-            (true, "") => p.to_string(),
-            (true, "-") => format!("{p}: -"),
-            (true, l) => format!("{}: {}", p, l),
-            (false, "") => format!("{p}!"),
-            (false, "-") => format!("{p}!: -"),
-            (false, l) => format!("{}!: {}", p, l),
+        match (self.value_visible, self.label_visible) {
+            (true, true) => format!("{}: {}", p, self.label),
+            (true, false) => p.to_string(),
+            (false, true) => format!("{}!", p),
+            (false, false) => format!("{p}!"),
         }
     }
 }
@@ -958,46 +1004,32 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
 
     let mut changed = false;
     let mut remove_idx: Option<usize> = None;
-    let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
     let mut drag_from: Option<usize> = None;
     let mut drag_over: Option<usize> = None;
+    let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
-    ui.label("Fields — [label] [key] [value] [-] [remove]");
+    ui.label("Fields — JSON path : label");
     ui.add_space(2.0);
 
     egui::Grid::new(("fields_grid", base)).show(ui, |ui| {
         for (i, row) in rows.iter_mut().enumerate() {
-            // First checkbox: label visibility ("-" hides the label).
-            let label_hidden = row.label.trim() == "-" || row.label.trim().is_empty();
-            let mut show_label = !label_hidden;
-            if ui.checkbox(&mut show_label, "").changed() {
+            // First checkbox: label visibility ONLY. Never touches path/key.
+            if ui.checkbox(&mut row.label_visible, "").changed() {
                 changed = true;
-                row.label = if show_label {
-                    // Restore auto-derived label from path tail.
-                    row.path
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(&row.path)
-                        .trim_end_matches("[0]")
-                        .to_string()
-                } else {
-                    "-".to_string()
-                };
             }
 
-            // Label / key text field.
+            // Key/label text — editable only while the label is visible.
             let key_resp = ui.add_enabled(
-                show_label,
+                row.label_visible,
                 egui::TextEdit::singleline(&mut row.label)
                     .hint_text("label")
                     .desired_width(110.0),
             );
-            if show_label && (key_resp.changed() || key_resp.lost_focus()) {
+            if row.label_visible && key_resp.changed() {
                 changed = true;
             }
 
-            // Path (JSON selector). Commits on change OR focus loss so
-            // checkbox clicks never discard/fragment in-flight edits.
+            // JSON path.
             let p_resp = ui.add(
                 egui::TextEdit::singleline(&mut row.path)
                     .hint_text("json.path[0].key")
@@ -1007,28 +1039,12 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 changed = true;
             }
 
-            // Second checkbox: value visibility.
-            if ui.checkbox(&mut row.show_value, "").changed() {
+            // Second checkbox: value visibility ONLY.
+            if ui.checkbox(&mut row.value_visible, "").changed() {
                 changed = true;
             }
 
-            // Existing "-" control: keep semantics (toggles label quickly too).
-            if ui.button("-").clicked() {
-                row.label = if row.label.trim() == "-" {
-                    String::new()
-                } else {
-                    "-".to_string()
-                };
-                changed = true;
-            }
-
-            if ui.button("✕ remove").clicked() {
-                remove_idx = Some(i);
-            }
-            ui.end_row();
-
-            // Dedicated drag handle — the ONLY element that initiates
-            // reordering. All other controls stay independent.
+            // Dedicated drag handle — the only drag initiator.
             let handle = ui.add(egui::Button::new("⠿").small().sense(egui::Sense::drag()));
             let handle_rect = handle.rect;
             if handle.drag_started() {
@@ -1042,10 +1058,15 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             }
             handle.on_hover_text("Drag to reorder field");
             row_rects.push((i, handle_rect));
+
+            if ui.button("✕ remove").clicked() {
+                remove_idx = Some(i);
+            }
+            ui.end_row();
         }
 
-        // Drag-over detection across rows (pointer based).
-        if let Some(from) = drag_from {
+        // Drag-over detection (pointer based) across rows.
+        if drag_from.is_some() {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                 drag_over = row_rects
                     .iter()
@@ -1058,7 +1079,8 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             rows.push(FieldRow {
                 path: String::new(),
                 label: String::new(),
-                show_value: true,
+                label_visible: true,
+                value_visible: true,
             });
             changed = true;
         }
@@ -1068,7 +1090,8 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 rows.extend(sugg.iter().map(|(p, l)| FieldRow {
                     path: p.clone(),
                     label: l.clone(),
-                    show_value: true,
+                    label_visible: true,
+                    value_visible: true,
                 }));
                 changed = true;
             }
@@ -1076,7 +1099,8 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
         ui.end_row();
     });
 
-    // Commit drag reorder after the grid closure finishes.
+    // Commit drag reorder after the grid closure finishes. The whole
+    // FieldRow (path, label, both visibilities) moves together.
     if let (Some(from), Some(to)) = (drag_from, drag_over) {
         if from != to {
             let item = rows.remove(from);
@@ -1092,28 +1116,12 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
     }
 
     if changed {
+        // Normalize each row (derive labels for visible-but-empty), then write.
         let serialized: Vec<toml::Value> = rows
-            .iter()
+            .iter_mut()
             .map(|r| toml::Value::String(r.to_toml_string()))
             .collect();
         app.set_value(&fields_path, toml::Value::Array(serialized));
-    }
-
-    ui.add_space(6.0);
-    if let Some(preview) = &app.api_preview {
-        egui::CollapsingHeader::new("Last API response")
-            .default_open(false)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(150.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut preview.as_str())
-                                .desired_width(f32::INFINITY)
-                                .code_editor(),
-                        );
-                    });
-            });
     }
 }
 
