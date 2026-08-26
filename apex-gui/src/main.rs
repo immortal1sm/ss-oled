@@ -357,8 +357,7 @@ impl eframe::App for App {
                                 hb.min.y -= 4.0;
                                 hb.max.y += 4.0;
                                 let row_id = egui::Id::new(("provider_row", name));
-                                let hitbox =
-                                    ui.interact(hb, row_id, egui::Sense::click_and_drag());
+                                let hitbox = ui.interact(hb, row_id, egui::Sense::click_and_drag());
                                 if hitbox.clicked() {
                                     self.selected = Some(name.clone());
                                 }
@@ -801,6 +800,15 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
 
     // Enabled state lives in the sidebar checkbox; no duplicate here.
     ui.horizontal(|ui| {
+        let mut hdr = app
+            .get_value(&format!("{base}.show_header"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if ui.checkbox(&mut hdr, "Show provider name header").changed() {
+            app.set_bool(&format!("{base}.show_header"), hdr);
+        }
+    });
+    ui.horizontal(|ui| {
         ui.label("Duration (s):");
         let mut d = app.get_int(&format!("interval.{name}"));
         if d == 0 {
@@ -830,10 +838,8 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     ui.label("API endpoint:");
     ui.horizontal(|ui| {
         let mut s = app.get_str(&format!("{base}.source"));
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut s)
-                .desired_width(ui.available_width() - 70.0),
-        );
+        let response =
+            ui.add(egui::TextEdit::singleline(&mut s).desired_width(ui.available_width() - 70.0));
         if response.changed() || response.lost_focus() {
             app.set_str(&format!("{base}.source"), &s);
         }
@@ -901,7 +907,11 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
         for v in arr {
             if let Some(s) = v.as_str() {
                 let (path_part, label_part) = match s.split_once(':') {
-                    Some((p, l)) => (p.trim().to_string(), l.trim().to_string()),
+                    Some((p, l)) => (
+                        p.trim().to_string(),
+                        // "path:" with nothing after = label hidden by user.
+                        l.to_string(),
+                    ),
                     None => (s.trim().to_string(), String::new()),
                 };
                 rows.push((path_part, label_part));
@@ -917,14 +927,47 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             let p_resp = ui.add(
                 egui::TextEdit::singleline(path_part)
                     .hint_text("json.path[0].key")
-                    .desired_width(220.0),
+                    .desired_width(200.0),
             );
-            let l_resp = ui.add(
-                egui::TextEdit::singleline(label_part)
-                    .hint_text("Label")
-                    .desired_width(120.0),
+
+            // Auto-derive label from the path when empty.
+            if label_part.trim().is_empty() && !path_part.trim().is_empty() {
+                *label_part = path_part
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(path_part)
+                    .trim_end_matches("[0]")
+                    .to_string();
+            }
+
+            // "-" (or blank) means the label is hidden on the OLED.
+            let hidden = label_part.trim() == "-";
+            let mut cb = !hidden;
+            if ui.checkbox(&mut cb, "").changed() {
+                changed = true;
+                *label_part = if cb {
+                    // Restore auto-derived label.
+                    path_part
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(path_part)
+                        .trim_end_matches("[0]")
+                        .to_string()
+                } else {
+                    "-".to_string()
+                };
+            }
+
+            let mut editable = label_part.clone();
+            let l_resp = ui.add_enabled(
+                cb,
+                egui::TextEdit::singleline(&mut editable).desired_width(110.0),
             );
-            if p_resp.changed() || l_resp.changed() {
+            if cb && l_resp.changed() {
+                *label_part = editable;
+                changed = true;
+            }
+            if p_resp.changed() {
                 changed = true;
             }
             if ui.button("✕").clicked() {
@@ -946,20 +989,16 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
         ui.end_row();
     });
 
-    if let Some(idx) = remove_idx {
-        rows.remove(idx);
-        changed = true;
-    }
-
     if changed {
-        // Keep empty-path rows too: they're work-in-progress entries.
         let serialized: Vec<toml::Value> = rows
             .iter()
             .map(|(p, l)| {
-                if l.trim().is_empty() {
-                    toml::Value::String(p.clone())
-                } else {
-                    toml::Value::String(format!("{}: {}", p.trim(), l.trim()))
+                let p = p.trim();
+                let l = l.trim();
+                match l {
+                    "" => toml::Value::String(p.to_string()),
+                    "-" => toml::Value::String(format!("{p}: -")),
+                    _ => toml::Value::String(format!("{}: {}", p, l)),
                 }
             })
             .collect();
@@ -985,9 +1024,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
 }
 
 /// Walk a JSON value and produce (path, label) suggestions for leaf scalars.
-fn suggest_fields(
-    v: &serde_json::Value,
-) -> Vec<(String, String)> {
+fn suggest_fields(v: &serde_json::Value) -> Vec<(String, String)> {
     fn walk(v: &serde_json::Value, prefix: &str, depth: usize, out: &mut Vec<(String, String)>) {
         if out.len() >= 12 {
             return;

@@ -47,6 +47,8 @@ use tokio::time::{interval, MissedTickBehavior};
 struct Field {
     path: String,
     label: String,
+    /// Draw the label text before the value on the OLED.
+    show_label: bool,
 }
 
 /// A single custom provider instance.
@@ -57,6 +59,8 @@ pub struct CustomProvider {
     fields: Vec<Field>,
     /// Seconds between API refreshes.
     poll_secs: u64,
+    /// Whether to draw the provider-name header row.
+    show_header: bool,
     /// Shared latest values, updated by fetch threads.
     values: Arc<Mutex<Vec<(String, String)>>>,
 }
@@ -148,20 +152,31 @@ fn fetch_values(
 }
 
 impl CustomProvider {
-    fn render_rows(name: &str, values: &[(String, String)], page: u64) -> Result<FrameBuffer> {
+    fn render_rows(
+        name: &str,
+        values: &[(String, String)],
+        page: u64,
+        show_header: bool,
+        labels_enabled: &[bool],
+    ) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
         let header_style = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
         let row_style = MonoTextStyle::new(&iso_8859_15::FONT_5X7, BinaryColor::On);
 
-        Text::with_baseline(
-            name.to_uppercase().as_str(),
-            Point::new(0, 0),
-            header_style,
-            embedded_graphics::text::Baseline::Top,
-        )
-        .draw(&mut buffer)?;
+        let mut y = 0;
 
-        // Page dots top-right.
+        if show_header {
+            Text::with_baseline(
+                name.to_uppercase().as_str(),
+                Point::new(0, y),
+                header_style,
+                embedded_graphics::text::Baseline::Top,
+            )
+            .draw(&mut buffer)?;
+            y += 12;
+        }
+
+        // Page dots always top-right.
         let pages = pages_needed(values.len());
         for i in 0..pages as i32 {
             let x = 126 - pages as i32 * 4 + i * 4;
@@ -169,24 +184,37 @@ impl CustomProvider {
                 .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
                 .draw(&mut buffer)?;
         }
+        if !show_header && y == 0 {
+            y = 4;
+        }
 
         let start = (page as usize % pages) * PER_PAGE;
-        for (row, (label, value)) in values.iter().skip(start).take(PER_PAGE).enumerate() {
-            let y = 14 + row as i32 * 7;
-            Text::with_baseline(
-                label.as_str(),
-                Point::new(0, y),
-                row_style,
-                embedded_graphics::text::Baseline::Top,
-            )
-            .draw(&mut buffer)?;
+        for (row, ((label, value), show_label)) in values
+            .iter()
+            .zip(labels_enabled.iter().chain(std::iter::repeat(&true)))
+            .skip(start)
+            .take(PER_PAGE)
+            .enumerate()
+        {
+            let show_label = *show_label;
+            if show_label {
+                Text::with_baseline(
+                    format!("{label}:").as_str(),
+                    Point::new(0, y),
+                    row_style,
+                    embedded_graphics::text::Baseline::Top,
+                )
+                .draw(&mut buffer)?;
+            }
+            let vx = if show_label { 64 } else { 0 };
             Text::with_baseline(
                 value.as_str(),
-                Point::new(64, y),
+                Point::new(vx, y),
                 row_style,
                 embedded_graphics::text::Baseline::Top,
             )
             .draw(&mut buffer)?;
+            y += 8;
         }
 
         Ok(buffer)
@@ -207,6 +235,7 @@ impl ContentProvider for CustomProvider {
         let header = self.header.clone();
         let fields = self.fields.clone();
         let name = self.name.clone();
+        let labels_enabled: Vec<bool> = self.fields.iter().map(|f| f.show_label).collect();
 
         Ok(try_stream! {
             // Initial fetch off-thread; placeholder rows until first success.
@@ -231,8 +260,18 @@ impl ContentProvider for CustomProvider {
             let mut frames: u64 = 0;
             let mut last_fetch = Instant::now();
 
+            let show_header = self.show_header;
+            let labels_enabled: Vec<bool> =
+                self.fields.iter().map(|f| f.show_label).collect();
+
             loop {
-                yield Self::render_rows(&name, &self.values.lock().unwrap(), frames / page_frames)?;
+                yield Self::render_rows(
+                    &name,
+                    &self.values.lock().unwrap(),
+                    frames / page_frames,
+                    show_header,
+                    &labels_enabled,
+                )?;
 
                 frames += 1;
                 if last_fetch.elapsed() >= poll_every {
@@ -302,6 +341,10 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         .unwrap_or(300)
         .max(10) as u64;
 
+    let show_header = config
+        .get_bool(&format!("{prefix}.show_header"))
+        .unwrap_or(true);
+
     let field_specs: Vec<String> = config
         .get_array(&format!("{prefix}.fields"))
         .unwrap_or_default()
@@ -311,15 +354,25 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
 
     let mut fields = Vec::new();
     for spec in field_specs {
-        // "<json-path>: <label>" — label optional, defaults to the path tail.
+        // "<json-path>: <label>" — label optional. An empty label means the
+        // row shows the bare value with no label text.
         let (path, label) = match spec.split_once(':') {
-            Some((p, l)) => (p.trim().to_string(), l.trim().to_string()),
+            Some((p, l)) => {
+                let l = l.trim().to_string();
+                // "-" sentinel: user chose to hide this row's label.
+                let l = if l == "-" { String::new() } else { l };
+                (p.trim().to_string(), l)
+            }
             None => {
                 let tail = spec.rsplit('.').next().unwrap_or(&spec).to_string();
                 (spec.trim().to_string(), tail)
             }
         };
-        fields.push(Field { path, label });
+        fields.push(Field {
+            path,
+            label,
+            show_label: true,
+        });
     }
 
     if fields.is_empty() {
@@ -332,6 +385,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         header,
         fields,
         poll_secs,
+        show_header,
         values: Arc::new(Mutex::new(Vec::new())),
     }))
 }
