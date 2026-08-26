@@ -992,17 +992,18 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     .hint_text("label")
                     .desired_width(110.0),
             );
-            if show_label && key_resp.changed() {
+            if show_label && (key_resp.changed() || key_resp.lost_focus()) {
                 changed = true;
             }
 
-            // Path (JSON selector).
+            // Path (JSON selector). Commits on change OR focus loss so
+            // checkbox clicks never discard/fragment in-flight edits.
             let p_resp = ui.add(
                 egui::TextEdit::singleline(&mut row.path)
                     .hint_text("json.path[0].key")
                     .desired_width(170.0),
             );
-            if p_resp.changed() {
+            if p_resp.changed() || p_resp.lost_focus() {
                 changed = true;
             }
 
@@ -1026,20 +1027,21 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             }
             ui.end_row();
 
-            // Drag handle: whole-row hitbox registered AFTER widgets so it
-            // never steals clicks; drag only activates on the small gap area
-            // via pointer capture on this row's rect through a separate id.
-            let row_id = egui::Id::new(("field_row_drag", base, i));
-            let rect = ui.max_rect();
-            let resp = ui.interact(
-                rect.shrink2(egui::vec2(0.0, 1.0)),
-                row_id,
-                egui::Sense::drag(),
-            );
-            if resp.drag_started() {
+            // Dedicated drag handle — the ONLY element that initiates
+            // reordering. All other controls stay independent.
+            let handle = ui.add(egui::Button::new("⠿").small().sense(egui::Sense::drag()));
+            let handle_rect = handle.rect;
+            if handle.drag_started() {
                 drag_from = Some(i);
             }
-            row_rects.push((i, rect));
+            if handle.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            if handle.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            handle.on_hover_text("Drag to reorder field");
+            row_rects.push((i, handle_rect));
         }
 
         // Drag-over detection across rows (pointer based).
