@@ -3,7 +3,7 @@
 # GUI is on-demand via the tray's "Open settings…".
 set -euo pipefail
 
-BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 TRAY="$(dirname "$BIN_DIR")/target/release/apex-tray"
 DAEMON="apex-tux"
 
@@ -17,7 +17,7 @@ start_daemon() {
 }
 
 start_tray() {
-    if pgrep -x apex-tray >/dev/null; then
+    if pgrep -x apex-tray >/dev/null 2>&1; then
         echo "tray:   already running"
     else
         # Ensure a display connection exists even when launched from a bare shell.
@@ -57,8 +57,8 @@ case "${1:-start}" in
         else
             echo "daemon: stopped"
         fi
-        pgrep -x apex-tray >/dev/null && echo "tray:   running" || echo "tray:   stopped"
-        pgrep -f apex-gui >/dev/null && echo "gui:    running" || echo "gui:    closed"
+        pgrep -x apex-tray >/dev/null 2>&1 && echo "tray:   running" || echo "tray:   stopped"
+        pgrep -f apex-gui >/dev/null 2>&1 && echo "gui:    running" || echo "gui:    closed"
         socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/apex-tux.sock"
         [ -S "$socket" ] && echo "ipc: $(printf 'status -> %s' "$(echo status | socat - UNIX-CONNECT:"$socket" 2>/dev/null || echo unreachable)")"
         ;;
