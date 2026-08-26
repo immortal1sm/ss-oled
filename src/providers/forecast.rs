@@ -1,8 +1,8 @@
 //! Forecast page rendering shared with the weather provider's combined
 //! cycle (today view -> day 2..6 push slides).
 
-use anyhow::Result;
 use crate::providers::weather_icons::draw_condition_icon;
+use anyhow::Result;
 use apex_hardware::FrameBuffer;
 use embedded_graphics::{
     geometry::Size,
@@ -82,4 +82,3 @@ pub(crate) fn render_day(
 
     Ok(())
 }
-

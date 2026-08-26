@@ -130,8 +130,7 @@ fn register_callback(config: &Config, focus_tx: FocusChannel) -> Result<Box<dyn 
 
     let event_focus = config.get_bool("mpris2.event_focus").unwrap_or(true);
     let show_timer = config.get_bool("mpris2.show_timer").unwrap_or(true);
-    let show_source_label =
-        config.get_bool("mpris2.show_source_label").unwrap_or(true);
+    let show_source_label = config.get_bool("mpris2.show_source_label").unwrap_or(true);
 
     let player = match config.get_str("mpris2.preferred_player") {
         Ok(name) => MediaPlayerBuilder::new()
