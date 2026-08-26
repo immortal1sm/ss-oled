@@ -111,6 +111,16 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             .map(|f| (f)(&mut config, focus_tx.clone()))
             .collect::<Result<Vec<_>>>()?;
 
+        // Dynamic custom providers from [providers.custom.*] sections.
+        #[cfg(feature = "custom")]
+        for name in crate::providers::custom::list_custom_sections(&config) {
+            match crate::providers::custom::from_config_section(&name, &config) {
+                Ok(Some(p)) => providers.push(Box::new(p)),
+                Ok(None) => {}
+                Err(e) => log::warn!("skipping custom provider '{name}': {e}"),
+            }
+        }
+
         #[cfg(target_os = "macos")]
         let mut providers = [
             crate::providers::clock::PROVIDER_INIT(&mut config)?,
