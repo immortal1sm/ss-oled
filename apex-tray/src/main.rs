@@ -9,10 +9,12 @@ use ksni::{
     menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu},
     Tray,
 };
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use tokio::time::{interval, Duration};
 
 /// One request/response over the daemon socket (blocking; called from
@@ -149,8 +151,15 @@ impl Tray for SsOledTray {
 
         items.push(
             StandardItem {
-                label: "Quit tray".into(),
+                label: "Quit — stop OLED & close settings".into(),
                 activate: Box::new(|_tray: &mut Self| {
+                    // Full-suite shutdown: config editor, then daemon, then us.
+                    let _ = std::process::Command::new("pkill")
+                        .args(["-f", "apex-gui"])
+                        .spawn();
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "stop", "apex-tux"])
+                        .spawn();
                     std::process::exit(0);
                 }),
                 ..Default::default()
