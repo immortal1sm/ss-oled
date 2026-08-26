@@ -122,13 +122,28 @@ impl Tray for SsOledTray {
 
         items.push(MenuItem::Separator);
 
+        // Open the settings GUI (single instance: focus existing via pkill-less
+        // check is overkill; spawning a second window is harmless but avoid it
+        // by testing for a running apex-gui first).
         items.push(
             StandardItem {
-                label: "Edit settings…".into(),
+                label: "Open settings…".into(),
                 activate: Box::new(|_tray: &mut Self| {
+                    let already = std::process::Command::new("pgrep")
+                        .arg("-f")
+                        .arg("apex-gui")
+                        .output()
+                        .map(|o| !o.stdout.is_empty())
+                        .unwrap_or(false);
+                    if already {
+                        return;
+                    }
                     let _ = std::process::Command::new("sh")
                         .arg("-c")
-                        .arg("${EDITOR:-kate} ~/.config/apex-tux/settings.toml")
+                        .arg(
+                            "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui \
+                             >/dev/null 2>&1 &",
+                        )
                         .spawn();
                 }),
                 ..Default::default()
