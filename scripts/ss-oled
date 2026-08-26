@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# ss-oled launcher — starts the full suite (daemon + tray).
+# GUI is on-demand via the tray's "Open settings…".
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+TRAY="$(dirname "$BIN_DIR")/target/release/apex-tray"
+DAEMON="apex-tux"
+
+start_daemon() {
+    if systemctl --user is-active --quiet $DAEMON; then
+        echo "daemon: already running"
+    else
+        systemctl --user start $DAEMON
+        echo "daemon: started"
+    fi
+}
+
+start_tray() {
+    if pgrep -x apex-tray >/dev/null; then
+        echo "tray:   already running"
+    else
+        # Ensure a display connection exists even when launched from a bare shell.
+        : "${WAYLAND_DISPLAY:=wayland-0}"
+        export WAYLAND_DISPLAY
+        # Detached spawn that survives the launcher exiting (new session).
+        python3 - "$TRAY" <<'PYEOF' >/dev/null 2>&1
+import os, sys, subprocess
+subprocess.Popen([sys.argv[1]], stdout=subprocess.DEVNULL,
+                 stderr=subprocess.DEVNULL, start_new_session=True)
+PYEOF
+        echo "tray:   started"
+    fi
+}
+
+case "${1:-start}" in
+    start)
+        start_daemon
+        start_tray
+        ;;
+    stop)
+        pkill -x apex-tray 2>/dev/null || true
+        pkill -f apex-gui 2>/dev/null || true
+        systemctl --user stop $DAEMON
+        echo "suite stopped"
+        ;;
+    restart)
+        pkill -x apex-tray 2>/dev/null || true
+        pkill -f apex-gui 2>/dev/null || true
+        systemctl --user restart $DAEMON
+        start_tray
+        echo "suite restarted"
+        ;;
+    status)
+        if systemctl --user is-active --quiet $DAEMON; then
+            echo "daemon: running"
+        else
+            echo "daemon: stopped"
+        fi
+        pgrep -x apex-tray >/dev/null && echo "tray:   running" || echo "tray:   stopped"
+        pgrep -f apex-gui >/dev/null && echo "gui:    running" || echo "gui:    closed"
+        socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/apex-tux.sock"
+        [ -S "$socket" ] && echo "ipc: $(printf 'status -> %s' "$(echo status | socat - UNIX-CONNECT:"$socket" 2>/dev/null || echo unreachable)")"
+        ;;
+    *)
+        echo "usage: ss-oled {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
