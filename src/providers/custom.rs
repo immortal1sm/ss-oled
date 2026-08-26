@@ -49,6 +49,8 @@ struct Field {
     label: String,
     /// Draw the label text before the value on the OLED.
     show_label: bool,
+    /// Draw the value after the label on the OLED.
+    show_value: bool,
 }
 
 /// A single custom provider instance.
@@ -142,6 +144,7 @@ fn fetch_values(
     let json: serde_json::Value = serde_json::from_str(&body)?;
     Ok(fields
         .iter()
+        .filter(|f| f.show_label || f.show_value)
         .map(|f| {
             let val = get_path(&json, &f.path)
                 .map(value_to_string)
@@ -152,12 +155,14 @@ fn fetch_values(
 }
 
 impl CustomProvider {
+    #[allow(clippy::too_many_arguments)]
     fn render_rows(
         name: &str,
         values: &[(String, String)],
         page: u64,
         show_header: bool,
         labels_enabled: &[bool],
+        values_show_value: &[bool],
     ) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
         let header_style = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
@@ -189,14 +194,16 @@ impl CustomProvider {
         }
 
         let start = (page as usize % pages) * PER_PAGE;
-        for (row, ((label, value), show_label)) in values
-            .iter()
-            .zip(labels_enabled.iter().chain(std::iter::repeat(&true)))
-            .skip(start)
-            .take(PER_PAGE)
-            .enumerate()
-        {
-            let show_label = *show_label;
+        for row_idx in start..(start + PER_PAGE).min(values.len()) {
+            let (label, value) = &values[row_idx];
+            let empty = &String::new();
+            let show_label = labels_enabled.get(row_idx).unwrap_or(&true);
+            let show_value = values_show_value.get(row_idx).unwrap_or(&true);
+            let (show_label, show_value) = (*show_label, *show_value);
+            if !show_label && !show_value {
+                continue;
+            }
+            let _ = empty;
             if show_label {
                 Text::with_baseline(
                     format!("{label}:").as_str(),
@@ -206,7 +213,13 @@ impl CustomProvider {
                 )
                 .draw(&mut buffer)?;
             }
-            let vx = if show_label { 64 } else { 0 };
+            let vx = if show_label && show_value {
+                64
+            } else if show_value {
+                0
+            } else {
+                64
+            };
             Text::with_baseline(
                 value.as_str(),
                 Point::new(vx, y),
@@ -236,6 +249,7 @@ impl ContentProvider for CustomProvider {
         let fields = self.fields.clone();
         let name = self.name.clone();
         let labels_enabled: Vec<bool> = self.fields.iter().map(|f| f.show_label).collect();
+        let values_show_value: Vec<bool> = self.fields.iter().map(|f| f.show_value).collect();
 
         Ok(try_stream! {
             // Initial fetch off-thread; placeholder rows until first success.
@@ -271,6 +285,7 @@ impl ContentProvider for CustomProvider {
                     frames / page_frames,
                     show_header,
                     &labels_enabled,
+                    &values_show_value,
                 )?;
 
                 frames += 1;
@@ -356,6 +371,11 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
     for spec in field_specs {
         // "<json-path>: <label>" — label optional. An empty label means the
         // row shows the bare value with no label text.
+        // '!' immediately after the path = value hidden ("path!: label").
+        let (spec, show_value) = match spec.strip_suffix('!') {
+            Some(p) => (p.to_string(), false),
+            None => (spec.clone(), true),
+        };
         let (path, label) = match spec.split_once(':') {
             Some((p, l)) => {
                 let l = l.trim().to_string();
@@ -372,6 +392,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
             path,
             label,
             show_label: true,
+            show_value,
         });
     }
 

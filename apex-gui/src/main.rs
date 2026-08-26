@@ -899,58 +899,85 @@ fn text_field_multiline_ok(app: &mut App, ui: &mut egui::Ui, path: &str) {
     });
 }
 
+#[derive(Clone)]
+struct FieldRow {
+    path: String,
+    label: String, // "-" or empty => label hidden
+    show_value: bool,
+}
+
+impl FieldRow {
+    fn parse(s: &str) -> Self {
+        let s = s.trim();
+        // Value-hidden marker: '!' suffix directly after the path.
+        let (path_part, rest, show_value_default) = match s.split_once('!') {
+            Some((p, r)) if !p.is_empty() => (p.trim().to_string(), Some(r.to_string()), false),
+            _ => {
+                let mut it = s.splitn(2, ':');
+                let p = it.next().unwrap_or("").trim().to_string();
+                (p.clone(), it.next().map(|l| l.to_string()), true)
+            }
+        };
+        let label = match &rest {
+            Some(l) => l.trim().to_string(),
+            None => String::new(),
+        };
+        let _ = show_value_default;
+        // Recompute show_value from the '!' position relative to path end.
+        let sv = s.contains("!:") || s.ends_with('!');
+        FieldRow {
+            path: path_part,
+            label,
+            show_value: sv,
+        }
+    }
+
+    fn to_toml_string(&self) -> String {
+        let p = self.path.trim();
+        match (self.show_value, self.label.trim()) {
+            (true, "") => p.to_string(),
+            (true, "-") => format!("{p}: -"),
+            (true, l) => format!("{}: {}", p, l),
+            (false, "") => format!("{p}!"),
+            (false, "-") => format!("{p}!: -"),
+            (false, l) => format!("{}!: {}", p, l),
+        }
+    }
+}
+
 fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
     let fields_path = format!("{base}.fields");
-    // Read current entries as strings.
-    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut rows: Vec<FieldRow> = Vec::new();
     if let Some(toml::Value::Array(arr)) = app.get_value_owned(&fields_path) {
         for v in arr {
             if let Some(s) = v.as_str() {
-                let (path_part, label_part) = match s.split_once(':') {
-                    Some((p, l)) => (
-                        p.trim().to_string(),
-                        // "path:" with nothing after = label hidden by user.
-                        l.to_string(),
-                    ),
-                    None => (s.trim().to_string(), String::new()),
-                };
-                rows.push((path_part, label_part));
+                rows.push(FieldRow::parse(s));
             }
         }
     }
 
     let mut changed = false;
     let mut remove_idx: Option<usize> = None;
+    let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut drag_from: Option<usize> = None;
+    let mut drag_over: Option<usize> = None;
+
+    ui.label("Fields — [label] [key] [value] [-] [remove]");
+    ui.add_space(2.0);
 
     egui::Grid::new(("fields_grid", base)).show(ui, |ui| {
-        for (i, (path_part, label_part)) in rows.iter_mut().enumerate() {
-            let p_resp = ui.add(
-                egui::TextEdit::singleline(path_part)
-                    .hint_text("json.path[0].key")
-                    .desired_width(200.0),
-            );
-
-            // Auto-derive label from the path when empty.
-            if label_part.trim().is_empty() && !path_part.trim().is_empty() {
-                *label_part = path_part
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(path_part)
-                    .trim_end_matches("[0]")
-                    .to_string();
-            }
-
-            // "-" (or blank) means the label is hidden on the OLED.
-            let hidden = label_part.trim() == "-";
-            let mut cb = !hidden;
-            if ui.checkbox(&mut cb, "").changed() {
+        for (i, row) in rows.iter_mut().enumerate() {
+            // First checkbox: label visibility ("-" hides the label).
+            let label_hidden = row.label.trim() == "-" || row.label.trim().is_empty();
+            let mut show_label = !label_hidden;
+            if ui.checkbox(&mut show_label, "").changed() {
                 changed = true;
-                *label_part = if cb {
-                    // Restore auto-derived label.
-                    path_part
+                row.label = if show_label {
+                    // Restore auto-derived label from path tail.
+                    row.path
                         .rsplit('.')
                         .next()
-                        .unwrap_or(path_part)
+                        .unwrap_or(&row.path)
                         .trim_end_matches("[0]")
                         .to_string()
                 } else {
@@ -958,49 +985,114 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 };
             }
 
-            let mut editable = label_part.clone();
-            let l_resp = ui.add_enabled(
-                cb,
-                egui::TextEdit::singleline(&mut editable).desired_width(110.0),
+            // Label / key text field.
+            let key_resp = ui.add_enabled(
+                show_label,
+                egui::TextEdit::singleline(&mut row.label)
+                    .hint_text("label")
+                    .desired_width(110.0),
             );
-            if cb && l_resp.changed() {
-                *label_part = editable;
+            if show_label && key_resp.changed() {
                 changed = true;
             }
+
+            // Path (JSON selector).
+            let p_resp = ui.add(
+                egui::TextEdit::singleline(&mut row.path)
+                    .hint_text("json.path[0].key")
+                    .desired_width(170.0),
+            );
             if p_resp.changed() {
                 changed = true;
             }
-            if ui.button("✕").clicked() {
+
+            // Second checkbox: value visibility.
+            if ui.checkbox(&mut row.show_value, "").changed() {
+                changed = true;
+            }
+
+            // Existing "-" control: keep semantics (toggles label quickly too).
+            if ui.button("-").clicked() {
+                row.label = if row.label.trim() == "-" {
+                    String::new()
+                } else {
+                    "-".to_string()
+                };
+                changed = true;
+            }
+
+            if ui.button("✕ remove").clicked() {
                 remove_idx = Some(i);
             }
             ui.end_row();
+
+            // Drag handle: whole-row hitbox registered AFTER widgets so it
+            // never steals clicks; drag only activates on the small gap area
+            // via pointer capture on this row's rect through a separate id.
+            let row_id = egui::Id::new(("field_row_drag", base, i));
+            let rect = ui.max_rect();
+            let resp = ui.interact(
+                rect.shrink2(egui::vec2(0.0, 1.0)),
+                row_id,
+                egui::Sense::drag(),
+            );
+            if resp.drag_started() {
+                drag_from = Some(i);
+            }
+            row_rects.push((i, rect));
         }
+
+        // Drag-over detection across rows (pointer based).
+        if let Some(from) = drag_from {
+            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                drag_over = row_rects
+                    .iter()
+                    .find(|(_, r)| r.contains(pos))
+                    .map(|(i, _)| *i);
+            }
+        }
+
         if ui.button("+ Add field").clicked() {
-            rows.push((String::new(), String::new()));
+            rows.push(FieldRow {
+                path: String::new(),
+                label: String::new(),
+                show_value: true,
+            });
             changed = true;
         }
         if app.api_preview.is_some() && ui.button("Auto-fill from response").clicked() {
             if let Some(sugg) = &app.api_suggested {
                 rows.clear();
-                rows.extend(sugg.iter().cloned());
+                rows.extend(sugg.iter().map(|(p, l)| FieldRow {
+                    path: p.clone(),
+                    label: l.clone(),
+                    show_value: true,
+                }));
                 changed = true;
             }
         }
         ui.end_row();
     });
 
+    // Commit drag reorder after the grid closure finishes.
+    if let (Some(from), Some(to)) = (drag_from, drag_over) {
+        if from != to {
+            let item = rows.remove(from);
+            let to_adj = if to > from { to - 1 } else { to };
+            rows.insert(to_adj, item);
+            changed = true;
+        }
+    }
+
+    if let Some(idx) = remove_idx {
+        rows.remove(idx);
+        changed = true;
+    }
+
     if changed {
         let serialized: Vec<toml::Value> = rows
             .iter()
-            .map(|(p, l)| {
-                let p = p.trim();
-                let l = l.trim();
-                match l {
-                    "" => toml::Value::String(p.to_string()),
-                    "-" => toml::Value::String(format!("{p}: -")),
-                    _ => toml::Value::String(format!("{}: {}", p, l)),
-                }
-            })
+            .map(|r| toml::Value::String(r.to_toml_string()))
             .collect();
         app.set_value(&fields_path, toml::Value::Array(serialized));
     }
