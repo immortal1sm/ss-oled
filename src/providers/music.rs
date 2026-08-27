@@ -166,6 +166,13 @@ pub struct MediaPlayerBuilder {
     show_timer: bool,
     /// Show media source label (mpris2.show_source_label).
     show_source_label: bool,
+    /// Position (microseconds) at the moment status last transitioned
+    /// out of Playing. Firefox's MPRIS plugin keeps reporting a
+    /// monotonically-increasing position even when paused/stopped, which
+    /// would otherwise let the elapsed timer tick up while the player is
+    /// idle. We snapshot position on each Playing read and freeze it
+    /// when status changes to Paused/Stopped.
+    last_playing_position: i64,
 }
 
 // Ok so the plan for the MPRIS2 module is to wait for two DBUS events
@@ -188,6 +195,13 @@ pub struct MediaPlayerRenderer {
     show_timer: bool,
     /// Show media source label (mpris2.show_source_label).
     show_source_label: bool,
+    /// Position (microseconds) at the moment status last transitioned
+    /// out of Playing. Firefox's MPRIS plugin keeps reporting a
+    /// monotonically-increasing position even when paused/stopped, which
+    /// would otherwise let the elapsed timer tick up while the player is
+    /// idle. We snapshot position on each Playing read and freeze it
+    /// when status changes to Paused/Stopped.
+    last_playing_position: i64,
 }
 
 /// Map a raw MPRIS bus name (e.g.
@@ -249,6 +263,7 @@ impl MediaPlayerRenderer {
             source: None,
             show_timer: true,
             show_source_label: true,
+            last_playing_position: 0,
         })
     }
 
@@ -279,10 +294,17 @@ impl MediaPlayerRenderer {
 
         #[cfg(not(target_os = "windows"))]
         {
-            // ----- progress bar (unchanged position) -----
+            // ----- progress bar -----
+            // Snapshot position when actively Playing. When Paused/Stopped,
+            // freeze the bar at the last Playing position so Firefox's
+            // stale monotonic position doesn't drift the elapsed display.
+            match progress.status {
+                PlaybackStatus::Playing => self.last_playing_position = progress.position,
+                PlaybackStatus::Paused => {}
+                PlaybackStatus::Stopped => self.last_playing_position = 0,
+            }
             let length = metadata.length().unwrap_or(0) as f64;
-
-            let current = progress.position.max(0) as f64;
+            let current = self.last_playing_position.max(0) as f64;
 
             let completion = if length > 0.0 {
                 (current / length).clamp(0_f64, 1_f64)
@@ -307,7 +329,7 @@ impl MediaPlayerRenderer {
             // otherwise show the timer advancing on a stopped track.
             let elapsed_us = match progress.status {
                 PlaybackStatus::Stopped => 0,
-                _ => progress.position.max(0) as u64,
+                _ => self.last_playing_position.max(0) as u64,
             };
             let total_us = metadata.length().unwrap_or(0);
             let timer_text = if total_us > 0 {
