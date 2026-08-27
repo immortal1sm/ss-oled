@@ -150,18 +150,13 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let focus_rx = focus_tx.subscribe();
         pin_mut!(focus_rx);
 
-        // Forward media keys to the active MPRIS player. kded6's
-        // mprisservice handles next/prev reliably but does not always
-        // forward play/pause/stop on KDE Plasma 6 Wayland. By listening
-        // to the kglobalaccel `mediacontrol` signal and calling Player
-        // methods directly, we ensure those transport actions reach the
-        // active player regardless of kded6's routing. next/prev are
-        // intentionally NOT forwarded here - the system handles those
-        // natively and we don't want to race.
-        let media_key_focus_enabled = Arc::new(AtomicBool::new(
+        // Media-key forwarding to the active player was tested but
+        // appeared unreliable on the user's setup. Leave the kglobalaccel
+        // subscription off and let KDE handle media keys natively.
+        // Re-enable when a tested alternative path is in place.
+        let _media_key_focus_enabled = Arc::new(AtomicBool::new(
             config.get_bool("mpris2.event_focus").unwrap_or(true),
         ));
-        tokio::spawn(subscribe_media_keys(Arc::clone(&media_key_focus_enabled)));
 
         let current = Arc::new(AtomicUsize::new(0));
         info!("Found {} registered providers", providers.len());
