@@ -1178,6 +1178,29 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             .collect();
         app.set_value(&fields_path, toml::Value::Array(serialized));
     }
+
+    // Last API response — collapsible panel below the fields so users can
+    // see the raw JSON returned by their endpoint (and verify which paths
+    // to fill into the fields above).
+    if let Some(body) = &app.api_preview {
+        ui.add_space(4.0);
+        let pretty = serde_json::from_str::<serde_json::Value>(body)
+            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.clone()))
+            .unwrap_or_else(|_| body.clone());
+        egui::CollapsingHeader::new("Last API response")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut pretty.clone())
+                                .code_editor()
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            });
+    }
 }
 
 /// Walk a JSON value and produce (path, label) suggestions for leaf scalars.
