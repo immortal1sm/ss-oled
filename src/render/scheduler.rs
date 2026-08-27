@@ -14,6 +14,7 @@ use crate::render::{
 use apex_hardware::{AsyncDevice, FrameBuffer};
 use apex_input::Command;
 use config::Config;
+use dbus::Error as DBusError;
 use futures::{pin_mut, stream, stream::Stream, StreamExt};
 use itertools::Itertools;
 use linkme::distributed_slice;
@@ -486,6 +487,50 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
 /// We filter to `componentUnique == "mediacontrol"` so we don't react to
 /// volume/brightness/etc. shortcuts.
 
+/// Map a KDE media shortcut name to the corresponding MPRIS Player method.
+fn shortcut_to_method(shortcut: &str) -> Option<String> {
+    match shortcut {
+        "playpausemedia" => Some("PlayPause".into()),
+        "pausemedia" => Some("Pause".into()),
+        "playmedia" => Some("Play".into()),
+        "stopmedia" => Some("Stop".into()),
+        "nextmedia" => Some("Next".into()),
+        "prevmedia" => Some("Previous".into()),
+        _ => None,
+    }
+}
+
+/// Send a Player method to every running MPRIS player. The active session
+/// accepts the call; the rest return an error which we swallow. Uses the
+/// blocking DBus API on a worker thread.
+fn send_player_action(method: &str) -> Result<(), String> {
+    let conn = dbus::blocking::Connection::new_session().map_err(|e| e.to_string())?;
+    // Enumerate running media sessions (raw method call: ListNames returns
+    // Vec<String>).
+    let proxy = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        Duration::from_millis(500),
+    );
+    let (names,): (Vec<String>,) = proxy
+        .method_call("org.freedesktop.DBus", "ListNames", ())
+        .map_err(|e| e.to_string())?;
+    for name in names {
+        if !name.starts_with("org.mpris.MediaPlayer2.") {
+            continue;
+        }
+        // Call the method on this player. Active session accepts; others
+        // return "Not the active session" which we silently ignore.
+        let proxy = conn.with_proxy(&name, "/org/mpris/MediaPlayer2", Duration::from_millis(500));
+        let r: Result<(), DBusError> =
+            proxy.method_call("org.mpris.MediaPlayer2.Player", method, ());
+        if let Err(e) = r {
+            log::debug!("mpris {} to {}: {}", method, name, e);
+        }
+    }
+    Ok(())
+}
+
 async fn subscribe_media_keys(focus_tx: FocusChannel, event_focus_enabled: Arc<AtomicBool>) {
     use dbus::message::{MatchRule, MessageType};
     use dbus_tokio::connection;
@@ -544,20 +589,22 @@ async fn subscribe_media_keys(focus_tx: FocusChannel, event_focus_enabled: Arc<A
             _ => ("", ""),
         };
         if component == "mediacontrol" {
-            // Only next/prev trigger our focus jump (they were already
-            // working). Play/pause/stop are NOT consumed here so the
-            // kglobalaccel default handler forwards them to the active
-            // MPRIS player via DBus Player.PlayPause/Stop. This restores
-            // the user's "play key pauses music" expectation.
-            let wants_focus = matches!(shortcut, "nextmedia" | "prevmedia");
-            if wants_focus && event_focus_enabled.load(Ordering::SeqCst) {
-                log::info!("KDE media key pressed: {} (sending focus)", shortcut);
-                let _ = focus_tx.send(ProviderWantsFocus);
+            // Forward the action to the active MPRIS player. This works
+            // regardless of whether kglobalaccel also delivered the key
+            // (the player method is idempotent). For next/prev we also
+            // focus the mpris2 provider so the user sees the change.
+            if let Some(method) = shortcut_to_method(shortcut) {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = send_player_action(&method) {
+                        log::debug!("mpris dispatch {} failed: {}", method, e);
+                    }
+                });
+                let wants_focus = matches!(shortcut, "nextmedia" | "prevmedia");
+                if wants_focus && event_focus_enabled.load(Ordering::SeqCst) {
+                    let _ = focus_tx.send(ProviderWantsFocus);
+                }
             } else {
-                log::debug!(
-                    "KDE media key pressed: {} (passing through to player)",
-                    shortcut
-                );
+                log::debug!("media key: unknown shortcut '{}'", shortcut);
             }
         } else if !component.is_empty() {
             log::debug!(
