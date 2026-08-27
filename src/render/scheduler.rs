@@ -150,12 +150,17 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let focus_rx = focus_tx.subscribe();
         pin_mut!(focus_rx);
 
-        // Media-key forwarding to the active player was tested but
-        // appeared unreliable on the user's setup. Leave the kglobalaccel
-        // subscription off and let KDE handle media keys natively.
-        // Re-enable when a tested alternative path is in place.
-        let _media_key_focus_enabled = Arc::new(AtomicBool::new(
+        // Subscribe to kglobalaccel's media-shortcut signal and jump to
+        // the mpris2 provider when a media key is pressed. Forwarding
+        // Player.PlayPause/Next/etc. to the active player is intentionally
+        // NOT done here — KDE handles that natively, and adding our own
+        // forward raced with kded6's routing on some setups.
+        let media_key_focus_enabled = Arc::new(AtomicBool::new(
             config.get_bool("mpris2.event_focus").unwrap_or(true),
+        ));
+        tokio::spawn(subscribe_media_keys(
+            focus_tx.clone(),
+            Arc::clone(&media_key_focus_enabled),
         ));
 
         let current = Arc::new(AtomicUsize::new(0));
@@ -505,7 +510,12 @@ fn send_player_action(method: &'static str) -> Result<(), String> {
 /// Listen to KDE kglobalaccel's media-shortcut signals and forward
 /// play/pause/stop to the active MPRIS player. next/prev are passed
 /// through (kded6 handles them natively).
-async fn subscribe_media_keys(event_focus_enabled: Arc<AtomicBool>) {
+
+/// Listen to KDE kglobalaccel's media-shortcut signals and request focus
+/// on the mpris2 provider so the user sees the change on the OLED. The
+/// active player action itself (PlayPause / Next / etc.) is handled by
+/// KDE natively — we only react to the focus jump.
+async fn subscribe_media_keys(focus_tx: FocusChannel, event_focus_enabled: Arc<AtomicBool>) {
     use dbus::{
         arg::messageitem::MessageItem,
         message::{MatchRule, MessageType},
@@ -540,7 +550,6 @@ async fn subscribe_media_keys(event_focus_enabled: Arc<AtomicBool>) {
     log::info!("media-keys: kglobalaccel listener registered");
     let (_msg_match, mut msg_stream) = msg_match.msg_stream();
 
-    let _ = event_focus_enabled; // reserved for future use
     while let Some(msg) = msg_stream.next().await {
         let items = msg.get_items();
         let mut strs = Vec::new();
@@ -552,20 +561,17 @@ async fn subscribe_media_keys(event_focus_enabled: Arc<AtomicBool>) {
                 }
             }
         }
-        let shortcut = match strs.as_slice() {
-            [_, s] => s.as_str(),
-            _ => "",
-        };
-        if let Some(method) = shortcut_to_method(shortcut) {
-            log::info!("media-keys: {} -> forwarding {}", shortcut, method);
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = send_player_action(method) {
-                    log::debug!("media dispatch {} failed: {}", method, e);
-                }
-            });
-        } else {
-            log::debug!("media-keys: {} (not forwarded)", shortcut);
+        let component = strs.get(0).map(|s| s.as_str()).unwrap_or("");
+        let shortcut = strs.get(1).map(|s| s.as_str()).unwrap_or("");
+        if component != "mediacontrol" {
+            continue;
         }
+        if !event_focus_enabled.load(Ordering::SeqCst) {
+            log::debug!("media-keys: {} (event_focus off, no jump)", shortcut);
+            continue;
+        }
+        log::info!("media-keys: {} -> jumping to mpris2", shortcut);
+        let _ = focus_tx.send(ProviderWantsFocus);
     }
     log::warn!("media-keys: listener stream ended");
 }
