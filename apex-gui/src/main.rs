@@ -53,6 +53,11 @@ struct App {
     /// Field-editor drag state (persists across frames while dragging).
     field_drag_from: Option<usize>,
     field_drag_over: Option<usize>,
+    /// Whether a drag is currently active (any handle being held).
+    field_drag_active: bool,
+    /// Set true when the user releases the handle; commit happens on the
+    /// following frame (after the closure finishes) so row_rects are stable.
+    field_drag_pending_commit: bool,
     /// Status line for the UI.
     status: String,
 }
@@ -83,6 +88,8 @@ impl App {
             api_test: None,
             field_drag_from: None,
             field_drag_over: None,
+            field_drag_active: false,
+            field_drag_pending_commit: false,
             status: "Loaded".into(),
         };
         app.refresh_provider_list();
@@ -1062,15 +1069,27 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
 
             // Column 5: drag handle — sole drag initiator.
             let handle = ui.add(egui::Button::new("⠿").small().sense(egui::Sense::drag()));
-            let handle_rect = handle.rect;
             if handle.drag_started() {
                 app.field_drag_from = Some(i);
+                app.field_drag_active = true;
+                app.field_drag_pending_commit = false;
+            }
+            if handle.drag_stopped() {
+                app.field_drag_pending_commit = true;
             }
             if handle.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
             if handle.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                app.field_drag_active = true;
+            } else if app.field_drag_from == Some(i) {
+                // We're not being dragged anymore this frame — that means
+                // the drag ended (drag_stopped may have fired on a previous
+                // frame already, or this is the release frame).
+                if !handle.drag_stopped() {
+                    app.field_drag_active = false;
+                }
             }
             handle.on_hover_text("Drag to reorder field");
 
@@ -1117,18 +1136,34 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
         }
     });
 
-    // Commit drag reorder after the grid closure finishes. The whole
-    // FieldRow (path, label, both visibilities) moves together.
-    if let (Some(from), Some(to)) = (app.field_drag_from, app.field_drag_over) {
-        if from != to {
-            let item = rows.remove(from);
-            let to_adj = if to > from { to - 1 } else { to };
-            rows.insert(to_adj, item);
-            changed = true;
+    // Commit drag reorder only when the user releases the handle.
+    // During the drag we update drag_over every frame for hover feedback,
+    // but the actual reorder happens once on release. Committing every
+    // frame would re-trigger the reorder continuously while the pointer
+    // is still down, which scrambles indices.
+    let dragging_idx = (0..rows.len()).find(|&i| {
+        // We can't query a previously-rendered handle here (it's gone),
+        // so use the persisted drag_from as the indicator of "is a drag
+        // currently in progress from this row". On release, drag_from is
+        // cleared by the closure we set up below via drag_stopped.
+        app.field_drag_from == Some(i)
+    });
+    // Commit only if we are NOT currently dragging — i.e., the frame after
+    // the drag ended. We detect release by checking if any of our rendered
+    // handles reports drag_stopped. Use a side-channel written below.
+    if !app.field_drag_active && app.field_drag_pending_commit {
+        if let (Some(from), Some(to)) = (app.field_drag_from, app.field_drag_over) {
+            if from != to && from < rows.len() && to < rows.len() {
+                let item = rows.remove(from);
+                rows.insert(to, item);
+                changed = true;
+            }
         }
         app.field_drag_from = None;
         app.field_drag_over = None;
+        app.field_drag_pending_commit = false;
     }
+    let _ = dragging_idx;
 
     if let Some(idx) = remove_idx {
         rows.remove(idx);
