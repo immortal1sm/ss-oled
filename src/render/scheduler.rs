@@ -14,7 +14,6 @@ use crate::render::{
 use apex_hardware::{AsyncDevice, FrameBuffer};
 use apex_input::Command;
 use config::Config;
-use dbus::Error as DBusError;
 use futures::{pin_mut, stream, stream::Stream, StreamExt};
 use itertools::Itertools;
 use linkme::distributed_slice;
@@ -150,23 +149,23 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let focus_rx = focus_tx.subscribe();
         pin_mut!(focus_rx);
 
-        // KDE global media-key subscription as a robust fallback. KDE's
-        // kglobalaccel intercepts media keys at the system level BEFORE any
-        // application sees them, so we get a signal even when Firefox's MPRIS
-        // publisher is inconsistent (no-op keypresses, busy UI, etc.). When a
-        // media shortcut is pressed we fire focus on mpris2 via focus_tx.
+        // The kglobalaccel media-key subscription is currently disabled.
         //
-        // Errors are non-fatal: if the system doesn't have kglobalaccel (rare),
-        // we just don't get this bonus signal source.
-        // Media-key jumps honor mpris2.event_focus: when the user disables
-        // event focus, physical media keys no longer yank the screen either.
-        let media_key_focus_enabled = Arc::new(AtomicBool::new(
+        // Our match rule consumed kglobalaccel signals in a way that
+        // blocked play/pause/stop from reaching the active MPRIS player
+        // on some setups (next/prev happened to still work because the
+        // active player also got parallel forwarding from
+        // plasma-browser-integration). Until a tested alternative path
+        // is in place, leave the subscription off and let the system
+        // handle media keys natively. The mpris2.event_focus config
+        // key remains available for when a fix is wired up.
+        let _media_key_focus_enabled = Arc::new(AtomicBool::new(
             config.get_bool("mpris2.event_focus").unwrap_or(true),
         ));
-        tokio::spawn(subscribe_media_keys(
-            focus_tx.clone(),
-            Arc::clone(&media_key_focus_enabled),
-        ));
+        // tokio::spawn(subscribe_media_keys(
+        //     focus_tx.clone(),
+        //     Arc::clone(&media_key_focus_enabled),
+        // ));
 
         let current = Arc::new(AtomicUsize::new(0));
         info!("Found {} registered providers", providers.len());
@@ -469,150 +468,4 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             })
             .unwrap_or(30)
     }
-}
-
-/// Subscribe to KDE's kglobalaccel media shortcut signals and forward
-/// them as focus requests on `focus_tx`. Returns a join handle; dropping
-/// it cancels nothing (the task lives until the daemon exits).
-///
-/// Signal listened to:
-/// `org.kde.kglobalaccel.Component.globalShortcutPressed(componentUnique,
-///   shortcutUnique, timestamp)`
-///
-/// This fires every time the user presses a registered media key
-/// (play/pause/next/prev/stop), independent of whether the focused app
-/// responds. That's the key advantage over MPRIS: even when Firefox's
-/// MPRIS publisher ignores a no-op keypress, kglobalaccel still reports it.
-///
-/// We filter to `componentUnique == "mediacontrol"` so we don't react to
-/// volume/brightness/etc. shortcuts.
-
-/// Map a KDE media shortcut name to the corresponding MPRIS Player method.
-fn shortcut_to_method(shortcut: &str) -> Option<String> {
-    match shortcut {
-        "playpausemedia" => Some("PlayPause".into()),
-        "pausemedia" => Some("Pause".into()),
-        "playmedia" => Some("Play".into()),
-        "stopmedia" => Some("Stop".into()),
-        "nextmedia" => Some("Next".into()),
-        "prevmedia" => Some("Previous".into()),
-        _ => None,
-    }
-}
-
-/// Send a Player method to every running MPRIS player. The active session
-/// accepts the call; the rest return an error which we swallow. Uses the
-/// blocking DBus API on a worker thread.
-fn send_player_action(method: &str) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session().map_err(|e| e.to_string())?;
-    // Enumerate running media sessions (raw method call: ListNames returns
-    // Vec<String>).
-    let proxy = conn.with_proxy(
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        Duration::from_millis(500),
-    );
-    let (names,): (Vec<String>,) = proxy
-        .method_call("org.freedesktop.DBus", "ListNames", ())
-        .map_err(|e| e.to_string())?;
-    for name in names {
-        if !name.starts_with("org.mpris.MediaPlayer2.") {
-            continue;
-        }
-        // Call the method on this player. Active session accepts; others
-        // return "Not the active session" which we silently ignore.
-        let proxy = conn.with_proxy(&name, "/org/mpris/MediaPlayer2", Duration::from_millis(500));
-        let r: Result<(), DBusError> =
-            proxy.method_call("org.mpris.MediaPlayer2.Player", method, ());
-        if let Err(e) = r {
-            log::debug!("mpris {} to {}: {}", method, name, e);
-        }
-    }
-    Ok(())
-}
-
-async fn subscribe_media_keys(focus_tx: FocusChannel, event_focus_enabled: Arc<AtomicBool>) {
-    use dbus::message::{MatchRule, MessageType};
-    use dbus_tokio::connection;
-
-    // Create our own dedicated session connection. Pattern mirrored
-    // exactly from apex-mpris2::MPRIS2::new() which is proven to work:
-    // new_session_sync() + tokio::spawn(resource.await).
-    let (resource, conn) = match connection::new_session_sync() {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("media-keys: failed to create DBus connection: {}", e);
-            return;
-        }
-    };
-
-    // Drive the connection's I/O loop. Panicking here mirrors apex-mpris2.
-    tokio::spawn(async move {
-        let err = resource.await;
-        panic!("media-keys: lost D-Bus connection: {}", err);
-    });
-
-    let mr = MatchRule::new()
-        .with_type(MessageType::Signal)
-        .with_path("/component/mediacontrol")
-        .with_interface("org.kde.kglobalaccel.Component")
-        .with_member("globalShortcutPressed");
-
-    let msg_match = match conn.add_match(mr).await {
-        Ok(m) => m,
-        Err(e) => {
-            log::warn!("media-keys: failed to add match rule: {}", e);
-            return;
-        }
-    };
-    log::info!("media-keys: kglobalaccel match rule registered");
-    let (_msg_match, mut msg_stream) = msg_match.msg_stream();
-    log::info!("media-keys: listener running");
-
-    use dbus::arg::messageitem::MessageItem;
-    use futures::stream::StreamExt;
-    while let Some(msg) = msg_stream.next().await {
-        // globalShortcutPressed has 3 positional args: componentUnique,
-        // shortcutUnique, timestamp. Extract the first two strings.
-        let items = msg.get_items();
-        let mut strs = Vec::new();
-        for item in items {
-            if let MessageItem::Str(s) = item {
-                strs.push(s);
-                if strs.len() == 2 {
-                    break;
-                }
-            }
-        }
-        let (component, shortcut) = match strs.as_slice() {
-            [c, s] => (c.as_str(), s.as_str()),
-            _ => ("", ""),
-        };
-        if component == "mediacontrol" {
-            // Forward the action to the active MPRIS player. This works
-            // regardless of whether kglobalaccel also delivered the key
-            // (the player method is idempotent). For next/prev we also
-            // focus the mpris2 provider so the user sees the change.
-            if let Some(method) = shortcut_to_method(shortcut) {
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = send_player_action(&method) {
-                        log::debug!("mpris dispatch {} failed: {}", method, e);
-                    }
-                });
-                let wants_focus = matches!(shortcut, "nextmedia" | "prevmedia");
-                if wants_focus && event_focus_enabled.load(Ordering::SeqCst) {
-                    let _ = focus_tx.send(ProviderWantsFocus);
-                }
-            } else {
-                log::debug!("media key: unknown shortcut '{}'", shortcut);
-            }
-        } else if !component.is_empty() {
-            log::debug!(
-                "KDE global shortcut from non-media component '{}': {}",
-                component,
-                shortcut
-            );
-        }
-    }
-    log::warn!("media-keys: listener stream ended");
 }
