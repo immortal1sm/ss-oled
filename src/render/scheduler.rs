@@ -14,6 +14,7 @@ use crate::render::{
 use apex_hardware::{AsyncDevice, FrameBuffer};
 use apex_input::Command;
 use config::Config;
+use dbus::Error as DBusError;
 use futures::{pin_mut, stream, stream::Stream, StreamExt};
 use itertools::Itertools;
 use linkme::distributed_slice;
@@ -149,23 +150,18 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let focus_rx = focus_tx.subscribe();
         pin_mut!(focus_rx);
 
-        // The kglobalaccel media-key subscription is currently disabled.
-        //
-        // Our match rule consumed kglobalaccel signals in a way that
-        // blocked play/pause/stop from reaching the active MPRIS player
-        // on some setups (next/prev happened to still work because the
-        // active player also got parallel forwarding from
-        // plasma-browser-integration). Until a tested alternative path
-        // is in place, leave the subscription off and let the system
-        // handle media keys natively. The mpris2.event_focus config
-        // key remains available for when a fix is wired up.
-        let _media_key_focus_enabled = Arc::new(AtomicBool::new(
+        // Forward media keys to the active MPRIS player. kded6's
+        // mprisservice handles next/prev reliably but does not always
+        // forward play/pause/stop on KDE Plasma 6 Wayland. By listening
+        // to the kglobalaccel `mediacontrol` signal and calling Player
+        // methods directly, we ensure those transport actions reach the
+        // active player regardless of kded6's routing. next/prev are
+        // intentionally NOT forwarded here - the system handles those
+        // natively and we don't want to race.
+        let media_key_focus_enabled = Arc::new(AtomicBool::new(
             config.get_bool("mpris2.event_focus").unwrap_or(true),
         ));
-        // tokio::spawn(subscribe_media_keys(
-        //     focus_tx.clone(),
-        //     Arc::clone(&media_key_focus_enabled),
-        // ));
+        tokio::spawn(subscribe_media_keys(Arc::clone(&media_key_focus_enabled)));
 
         let current = Arc::new(AtomicUsize::new(0));
         info!("Found {} registered providers", providers.len());
@@ -468,4 +464,113 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             })
             .unwrap_or(30)
     }
+}
+
+/// Map a kglobalaccel shortcut name to the corresponding MPRIS Player
+/// method. Returns None for shortcuts we don't forward (next/prev) so
+/// kded6's native routing handles them.
+fn shortcut_to_method(shortcut: &str) -> Option<&'static str> {
+    match shortcut {
+        "playpausemedia" => Some("PlayPause"),
+        "pausemedia" => Some("Pause"),
+        "playmedia" => Some("Play"),
+        "stopmedia" => Some("Stop"),
+        _ => None,
+    }
+}
+
+/// Forward a Player method to every running MPRIS player. The active
+/// session accepts the call; the rest no-op. Uses the blocking DBus
+/// API on a worker thread so it doesn't interfere with the tokio
+/// runtime or the kglobalaccel listener's own DBus connection.
+fn send_player_action(method: &'static str) -> Result<(), String> {
+    let conn = dbus::blocking::Connection::new_session().map_err(|e| e.to_string())?;
+    let proxy = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        Duration::from_millis(500),
+    );
+    let (names,): (Vec<String>,) = proxy
+        .method_call("org.freedesktop.DBus", "ListNames", ())
+        .map_err(|e| e.to_string())?;
+    for name in names {
+        if !name.starts_with("org.mpris.MediaPlayer2.") {
+            continue;
+        }
+        let proxy = conn.with_proxy(&name, "/org/mpris/MediaPlayer2", Duration::from_millis(500));
+        let r: Result<(), DBusError> =
+            proxy.method_call("org.mpris.MediaPlayer2.Player", method, ());
+        if let Err(e) = r {
+            log::debug!("mpris {} to {}: {}", method, name, e);
+        }
+    }
+    Ok(())
+}
+
+/// Listen to KDE kglobalaccel's media-shortcut signals and forward
+/// play/pause/stop to the active MPRIS player. next/prev are passed
+/// through (kded6 handles them natively).
+async fn subscribe_media_keys(event_focus_enabled: Arc<AtomicBool>) {
+    use dbus::{
+        arg::messageitem::MessageItem,
+        message::{MatchRule, MessageType},
+    };
+    use dbus_tokio::connection;
+    use futures::stream::StreamExt;
+
+    let (resource, conn) = match connection::new_session_sync() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("media-keys: dbus connect failed: {e}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let err = resource.await;
+        panic!("media-keys: lost DBus connection: {err}");
+    });
+
+    let mr = MatchRule::new()
+        .with_type(MessageType::Signal)
+        .with_path("/component/mediacontrol")
+        .with_interface("org.kde.kglobalaccel.Component")
+        .with_member("globalShortcutPressed");
+    let msg_match = match conn.add_match(mr).await {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("media-keys: add_match failed: {e}");
+            return;
+        }
+    };
+    log::info!("media-keys: kglobalaccel listener registered");
+    let (_msg_match, mut msg_stream) = msg_match.msg_stream();
+
+    let _ = event_focus_enabled; // reserved for future use
+    while let Some(msg) = msg_stream.next().await {
+        let items = msg.get_items();
+        let mut strs = Vec::new();
+        for item in items {
+            if let MessageItem::Str(s) = item {
+                strs.push(s);
+                if strs.len() == 2 {
+                    break;
+                }
+            }
+        }
+        let shortcut = match strs.as_slice() {
+            [_, s] => s.as_str(),
+            _ => "",
+        };
+        if let Some(method) = shortcut_to_method(shortcut) {
+            log::info!("media-keys: {} -> forwarding {}", shortcut, method);
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = send_player_action(method) {
+                    log::debug!("media dispatch {} failed: {}", method, e);
+                }
+            });
+        } else {
+            log::debug!("media-keys: {} (not forwarded)", shortcut);
+        }
+    }
+    log::warn!("media-keys: listener stream ended");
 }
