@@ -915,46 +915,52 @@ struct FieldRow {
 impl FieldRow {
     /// Parse a legacy/new fields entry. Visibility is stored as explicit
     /// state, never inferred from the strings themselves.
+    /// Parse a fields entry. Format: `[path][: <label>][!]` where:
+    ///   * `!` after path = value hidden
+    ///   * `-` in label slot = label hidden
+    ///   * anything else in label slot = label visible with that text
+    ///   * legacy `path` (no colon, no `!`) = both visible, label auto-derived
+    ///   * legacy `path!` (no colon) = value hidden, label auto-derived
     fn parse(s: &str) -> Self {
         let s = s.trim();
-        // New format: '!' suffix after the path = value hidden.
-        if let Some(stripped) = s.strip_suffix('!') {
-            let (p, l) = match stripped.split_once(':') {
-                Some((p, l)) => (p.trim(), l.trim()),
-                None => (stripped.trim(), ""),
-            };
-            return FieldRow {
-                path: p.to_string(),
-                label: l.to_string(),
-                label_visible: !l.is_empty(),
-                value_visible: false,
-            };
-        }
-        // Legacy formats:
-        //   "path"          -> both visible, label auto-derived
-        //   "path: -"       -> label hidden
-        //   "path: label"   -> both visible with explicit label
-        match s.split_once(':') {
+        // Strip trailing `!` for value visibility (then re-check inside the
+        // colon branch since `: !` is not legal — only path! is).
+        let (head, value_visible) = if let Some(stripped) = s.strip_suffix('!') {
+            (stripped, false)
+        } else {
+            (s, true)
+        };
+        let (path, label_text, label_visible) = match head.split_once(':') {
             Some((p, l)) => {
                 let l = l.trim();
-                let hidden = l == "-" || l.is_empty();
-                let label = if hidden { String::new() } else { l.to_string() };
-                FieldRow {
-                    path: p.to_string(),
-                    label,
-                    label_visible: !hidden,
-                    value_visible: true,
+                if l == "-" {
+                    (p.trim().to_string(), String::new(), false)
+                } else if l.is_empty() {
+                    // "path:" — explicit empty label, treat as hidden to avoid
+                    // round-trip ambiguity.
+                    (p.trim().to_string(), String::new(), false)
+                } else {
+                    (p.trim().to_string(), l.to_string(), true)
                 }
             }
             None => {
-                let tail = s.rsplit('.').next().unwrap_or(s).to_string();
-                FieldRow {
-                    path: s.to_string(),
-                    label: tail,
-                    label_visible: true,
-                    value_visible: true,
-                }
+                // No colon: legacy format. Path-only entry = both visible
+                // with label auto-derived; we set label_visible=true and
+                // store the auto-derived text in the label field.
+                let tail = head
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(head)
+                    .trim_end_matches("[0]")
+                    .to_string();
+                (head.to_string(), tail, true)
             }
+        };
+        FieldRow {
+            path,
+            label: label_text,
+            label_visible,
+            value_visible,
         }
     }
 
@@ -979,20 +985,27 @@ impl FieldRow {
         }
     }
 
+    /// Serialize back to TOML. Always emits `path: <label>` form so
+    /// `parse` can recover visibility on round-trip regardless of how
+    /// the user toggled checkboxes:
+    ///   * label_visible=false → emit `-`
+    ///   * label_visible=true, empty label → emit auto-derived label
+    ///   * label_visible=true, text label → emit that text
+    /// A trailing `!` after the label marks value_visible=false.
     fn to_toml_string(&mut self) -> String {
-        // Normalize: hidden label drops the text; visible-but-empty derives it.
-        if !self.label_visible {
-            self.label.clear();
+        let label_slot = if !self.label_visible {
+            String::from("-")
         } else if self.label.is_empty() {
-            self.label = self.auto_label();
-        }
+            // Auto-derive so we have something concrete to write.
+            let auto = self.auto_label();
+            self.label = auto.clone();
+            auto
+        } else {
+            self.label.clone()
+        };
         let p = self.path.trim();
-        match (self.value_visible, self.label_visible) {
-            (true, true) => format!("{}: {}", p, self.label),
-            (true, false) => p.to_string(),
-            (false, true) => format!("{}!", p),
-            (false, false) => format!("{p}!"),
-        }
+        let suffix = if self.value_visible { "" } else { "!" };
+        format!("{p}: {label_slot}{suffix}")
     }
 }
 
