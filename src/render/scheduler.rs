@@ -544,15 +544,21 @@ async fn subscribe_media_keys(focus_tx: FocusChannel, event_focus_enabled: Arc<A
             _ => ("", ""),
         };
         if component == "mediacontrol" {
-            if !event_focus_enabled.load(Ordering::SeqCst) {
+            // Only next/prev trigger our focus jump (they were already
+            // working). Play/pause/stop are NOT consumed here so the
+            // kglobalaccel default handler forwards them to the active
+            // MPRIS player via DBus Player.PlayPause/Stop. This restores
+            // the user's "play key pauses music" expectation.
+            let wants_focus = matches!(shortcut, "nextmedia" | "prevmedia");
+            if wants_focus && event_focus_enabled.load(Ordering::SeqCst) {
+                log::info!("KDE media key pressed: {} (sending focus)", shortcut);
+                let _ = focus_tx.send(ProviderWantsFocus);
+            } else {
                 log::debug!(
-                    "KDE media key pressed: {} (event_focus off, no jump)",
+                    "KDE media key pressed: {} (passing through to player)",
                     shortcut
                 );
-                continue;
             }
-            log::info!("KDE media key pressed: {} (sending focus)", shortcut);
-            let _ = focus_tx.send(ProviderWantsFocus);
         } else if !component.is_empty() {
             log::debug!(
                 "KDE global shortcut from non-media component '{}': {}",
