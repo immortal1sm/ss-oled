@@ -257,7 +257,9 @@ impl CustomProvider {
             y += 12;
         }
 
-        // No data retrieved yet — explicit placeholder.
+        // No data retrieved yet — explicit placeholder centered in the
+        // available vertical space. FONT_9X15 is 15px tall, so a 40px
+        // panel centers at top_y = 12 (no header) or 14 (with header).
         if values.is_empty() {
             let placeholder = MonoTextStyle::new(&iso_8859_15::FONT_9X15, BinaryColor::On);
             let text = "NO DATA";
@@ -267,9 +269,10 @@ impl CustomProvider {
                 embedded_graphics::text::Baseline::Top,
             );
             let x = (128 - m.bounding_box.size.width as i32) / 2;
+            let top_y = if show_header { 14 } else { 12 };
             Text::with_baseline(
                 text,
-                Point::new(x, y + 4),
+                Point::new(x, top_y),
                 placeholder,
                 embedded_graphics::text::Baseline::Top,
             )
@@ -278,7 +281,7 @@ impl CustomProvider {
         }
 
         if !show_header && y == 0 {
-            y = 4;
+            y = 2;
         }
 
         // Render plan: one entry per visible field. Explicit `row` slots
