@@ -48,9 +48,9 @@ Configure your location with the GUI\'s city search or directly in
 enabled = true
 latitude = 15.71611
 longitude = 120.90306
-timezone = "Asia/Manila"
+timezone = ""
 units = "metric"          # or "imperial" for °F
-label = "Muñoz"
+label = ""
 
 [forecast]
 enabled = true
