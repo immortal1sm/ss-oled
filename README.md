@@ -50,7 +50,7 @@ latitude = 15.71611
 longitude = 120.90306
 timezone = "Asia/Manila"
 units = "metric"          # or "imperial" for °F
-label = "Muñoz"
+label = "City"
 
 [forecast]
 enabled = true
