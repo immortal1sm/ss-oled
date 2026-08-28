@@ -48,7 +48,7 @@ coordinates, timezone, and label automatically) or directly in `settings.toml`:
 enabled = true
 latitude = 15.71611
 longitude = 120.90306
-timezone = "Asia/Manila"
+timezone = ""
 units = "metric"          # or "imperial" for °F
 label = "City"
 
