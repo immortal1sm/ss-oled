@@ -936,12 +936,82 @@ fn text_field_multiline_ok(app: &mut App, ui: &mut egui::Ui, path: &str) {
     });
 }
 
+#[derive(Clone, PartialEq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+impl Align {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Align::Left => "L",
+            Align::Center => "C",
+            Align::Right => "R",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "L" | "l" => Some(Align::Left),
+            "C" | "c" => Some(Align::Center),
+            "R" | "r" => Some(Align::Right),
+            _ => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Align::Left => "Left",
+            Align::Center => "Center",
+            Align::Right => "Right",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum SizeCls {
+    Small,
+    Medium,
+    Large,
+}
+impl SizeCls {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SizeCls::Small => "S",
+            SizeCls::Medium => "M",
+            SizeCls::Large => "L",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "S" | "s" => Some(SizeCls::Small),
+            "M" | "m" => Some(SizeCls::Medium),
+            "L" | "l" => Some(SizeCls::Large),
+            _ => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            SizeCls::Small => "S",
+            SizeCls::Medium => "M",
+            SizeCls::Large => "L",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FieldRow {
     path: String,
     label: String,
     label_visible: bool,
     value_visible: bool,
+    align: Align,
+    size: SizeCls,
+    /// Explicit y-row slot. None = auto-pack top-down in array order.
+    row: Option<usize>,
 }
 
 impl FieldRow {
@@ -955,12 +1025,30 @@ impl FieldRow {
     ///   * legacy `path!` (no colon) = value hidden, label auto-derived
     fn parse(s: &str) -> Self {
         let s = s.trim();
-        // Strip trailing `!` for value visibility (then re-check inside the
-        // colon branch since `: !` is not legal — only path! is).
-        let (head, value_visible) = if let Some(stripped) = s.strip_suffix('!') {
+        // Layout metadata (after " | "): space-separated k=v pairs.
+        // Currently: a={L|C|R}, s={S|M|L}, r=<row index>
+        let mut align = Align::Left;
+        let mut size = SizeCls::Medium;
+        let mut row: Option<usize> = None;
+        let (head, layout) = match s.split_once('|') {
+            Some((h, l)) => (h, l),
+            None => (s, ""),
+        };
+        for kv in layout.split_whitespace() {
+            if let Some((k, v)) = kv.split_once('=') {
+                match k {
+                    "a" => align = Align::parse(v).unwrap_or(Align::Left),
+                    "s" => size = SizeCls::parse(v).unwrap_or(SizeCls::Medium),
+                    "r" => row = v.parse::<usize>().ok(),
+                    _ => {}
+                }
+            }
+        }
+        // Strip trailing `!` for value visibility.
+        let (head, value_visible) = if let Some(stripped) = head.strip_suffix('!') {
             (stripped, false)
         } else {
-            (s, true)
+            (head, true)
         };
         let (path, label_text, label_visible) = match head.split_once(':') {
             Some((p, l)) => {
@@ -968,17 +1056,12 @@ impl FieldRow {
                 if l == "-" {
                     (p.trim().to_string(), String::new(), false)
                 } else if l.is_empty() {
-                    // "path:" — explicit empty label, treat as hidden to avoid
-                    // round-trip ambiguity.
                     (p.trim().to_string(), String::new(), false)
                 } else {
                     (p.trim().to_string(), l.to_string(), true)
                 }
             }
             None => {
-                // No colon: legacy format. Path-only entry = both visible
-                // with label auto-derived; we set label_visible=true and
-                // store the auto-derived text in the label field.
                 let tail = head
                     .rsplit('.')
                     .next()
@@ -993,6 +1076,9 @@ impl FieldRow {
             label: label_text,
             label_visible,
             value_visible,
+            align,
+            size,
+            row,
         }
     }
 
@@ -1037,7 +1123,28 @@ impl FieldRow {
         };
         let p = self.path.trim();
         let suffix = if self.value_visible { "" } else { "!" };
-        format!("{p}: {label_slot}{suffix}")
+        let layout = self.layout_suffix();
+        if layout.is_empty() {
+            format!("{p}: {label_slot}{suffix}")
+        } else {
+            format!("{p}: {label_slot}{suffix} | {layout}")
+        }
+    }
+
+    /// Build the trailing "a=… s=… r=…" string for non-default layout
+    /// values. Empty string means "all defaults; don't write metadata".
+    fn layout_suffix(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.align != Align::Left {
+            parts.push(format!("a={}", self.align.as_str()));
+        }
+        if self.size != SizeCls::Medium {
+            parts.push(format!("s={}", self.size.as_str()));
+        }
+        if let Some(r) = self.row {
+            parts.push(format!("r={r}"));
+        }
+        parts.join(" ")
     }
 }
 
@@ -1092,6 +1199,57 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 changed = true;
             }
 
+            // Column 4.5: layout controls (align, size, row slot).
+            // Rendered as a compact horizontal block so each row stays
+            // single-line.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let prev = row.align.clone();
+                egui::ComboBox::from_id_source(("align", i))
+                    .selected_text(row.align.label())
+                    .show_ui(ui, |ui| {
+                        for a in [Align::Left, Align::Center, Align::Right] {
+                            if ui.selectable_label(row.align == a, a.label()).clicked() {
+                                row.align = a.clone();
+                                changed = true;
+                            }
+                        }
+                    });
+                if prev != row.align {
+                    changed = true;
+                }
+                let prev = row.size.clone();
+                egui::ComboBox::from_id_source(("size", i))
+                    .selected_text(row.size.label())
+                    .show_ui(ui, |ui| {
+                        for s in [SizeCls::Small, SizeCls::Medium, SizeCls::Large] {
+                            if ui.selectable_label(row.size == s, s.label()).clicked() {
+                                row.size = s.clone();
+                                changed = true;
+                            }
+                        }
+                    });
+                if prev != row.size {
+                    changed = true;
+                }
+                // Row slot: 0-5 (panel is 40px tall, 1 row ≈ 8-14px depending on size)
+                let mut row_str = row.row.map(|n| n.to_string()).unwrap_or_default();
+                let r_resp = ui.add(
+                    egui::TextEdit::singleline(&mut row_str)
+                        .hint_text("row")
+                        .desired_width(28.0),
+                );
+                if r_resp.changed() || r_resp.lost_focus() {
+                    let trimmed = row_str.trim();
+                    row.row = if trimmed.is_empty() {
+                        None
+                    } else {
+                        trimmed.parse::<usize>().ok().map(|n| n.min(5))
+                    };
+                    changed = true;
+                }
+            });
+
             // Column 5: drag handle — sole drag initiator.
             let handle = ui.add(egui::Button::new("⠿").small().sense(egui::Sense::drag()));
             if handle.drag_started() {
@@ -1144,6 +1302,9 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 label: String::new(),
                 label_visible: true,
                 value_visible: true,
+                align: Align::Left,
+                size: SizeCls::Medium,
+                row: None,
             });
             changed = true;
         }
@@ -1155,6 +1316,9 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     label: l.clone(),
                     label_visible: true,
                     value_visible: true,
+                    align: Align::Left,
+                    size: SizeCls::Medium,
+                    row: None,
                 }));
                 changed = true;
             }
