@@ -16,13 +16,13 @@ Seven providers rotate automatically (dwell times configurable per provider):
 
 | Provider | Dwell | Content |
 |---|---|---|
-| **MPRIS2** (music) | 30s + event jumps | Title, artist, elapsed/total timer (with frozen-on-pause display), media source label in the top-left corner ("Firefox", "Spotify", "Phone"...), progress bar. Jumps to front on any play/pause/track-change/media-key press. Position is snapshotted on every Playing read and held when paused so the timer doesn\'t drift |
+| **MPRIS2** (music) | 30s + event jumps | Title, artist, elapsed/total timer, media source label, progress bar. Jumps to front on any play/pause/track-change/media-key press |
 | **Sysinfo** | 30s | CPU/RAM/network/temperature bars |
-| **Image** | 5s | Your own GIF/logo — rendered with Floyd–Steinberg dithering so multi-tone images keep their shades on the 1-bit panel (same trick SteelSeries GG uses) |
-| **Weather** | 10s | Today: big °C temp, condition label, precipitation %, animated icon — spinning sun rays, falling rain, lightning flashes, snow, fog wisps, drifting clouds. Explicit "NO DATA" placeholder when the cache is empty or a fetch fails |
-| **Forecast** | 30s | Next 5 days with a push-slide transition between pages, hi/lo temps, weekday labels (M/T/W/TH/F/ST/S). Falls back to "NO DATA" until the first fetch lands |
+| **Image** | 5s | Your own GIF/logo with Floyd–Steinberg dithering so multi-tone images keep their shades on the 1-bit panel |
+| **Weather** | 10s | Big °C temp, condition label, precipitation %, animated icon (spinning sun rays, rain, lightning, snow, fog, drifting clouds) |
+| **Forecast** | 30s | Next 5 days with slide transition between pages, hi/lo temps, weekday labels |
 | **Clock** | 5s | 12h/24h configurable |
-| **Custom** (HTTP-JSON) | per-provider | User-defined HTTP endpoints rendered with configurable fields. Each field supports visibility toggles, alignment (L/C/R), font size (S/M/L/XL), explicit y-slot, bold faux-bold, and word-wrap onto up to 3 lines. Height-aware auto-pack reserves exactly the vertical space each field needs so wrapped values don\'t overlap the next field |
+| **Custom** (HTTP-JSON) | per-provider | User-defined HTTP endpoints rendered with configurable fields |
 
 ## Hotkeys
 
@@ -32,25 +32,25 @@ All combos use **Ctrl+Shift** + numpad keys:
 |---|---|
 | `Ctrl+Shift+Numpad /` | Next provider |
 | `Ctrl+Shift+Numpad *` | Previous provider |
-| `Ctrl+Shift+Numpad -` | **Lock** — pins the current screen absolutely: no rotation, no media-event jumps |
-| `Ctrl+Shift+Numpad +` | **Unlock** — resumes auto-rotation and event reactions |
+| `Ctrl+Shift+Numpad -` | Lock — pins the current screen absolutely: no rotation, no media-event jumps |
+| `Ctrl+Shift+Numpad +` | Unlock — resumes auto-rotation and event reactions |
 
 Moving between providers while locked keeps the lock — you choose what stays.
 
 ## Weather data
 
 Powered by [Open-Meteo](https://open-meteo.com/) — free, no API key.
-Configure your location with the GUI\'s city search (writes `[weather]`
-coordinates, timezone, and label automatically) or directly in `settings.toml`:
+Configure your location with the GUI\'s city search or directly in
+`settings.toml`:
 
 ```toml
 [weather]
 enabled = true
 latitude = 15.71611
 longitude = 120.90306
-timezone = ""
+timezone = "Asia/Manila"
 units = "metric"          # or "imperial" for °F
-label = "City"
+label = "Muñoz"
 
 [forecast]
 enabled = true
@@ -90,20 +90,19 @@ fields = [
 | `!` suffix | Hide value (label-only display) |
 | `| a=L/C/R` | Horizontal alignment |
 | `| s=S/M/L/X` | Font size (4×6 / 5×7 / 6×10 / 8×13) |
-| `| r=0..5` | Explicit y-slot (0-5 on a 40px panel) |
-| `| b=1` | Faux-bold double-strike at +1px X |
+| `| r=0..5` | Explicit y-slot on the 40px panel |
+| `| b=1` | Faux-bold double-strike |
 
 The daemon handles fetching on a configurable interval, JSON-path resolution,
-word-wrap onto multiple lines (height-aware so wrapped values don\'t overlap
-the next field), and an explicit "NO DATA" placeholder for the period
-between fetches. The GUI adds live **Test** endpoint button and an
+word-wrap onto multiple lines, and a "NO DATA" placeholder while waiting
+for the first fetch. The GUI adds a live **Test** endpoint button and an
 auto-fill suggestion pass over the response.
 
 ## Configuration GUI + system tray
 
 The companion `apex-gui` is an `egui`-based editor for every settings.toml
 key. **Spawn-on-demand:** tray menu **Open settings…** launches it; closing
-the window frees the memory (the daemon and tray keep running).
+the window frees the memory while the daemon and tray keep running.
 
 ```bash
 ss-oled start    # launches daemon + tray
@@ -120,7 +119,7 @@ The tray (`apex-tray`, `ksni`-based) lets you:
 - **Quit suite** — shuts down daemon + tray + GUI cleanly
 
 The GUI and tray talk to the daemon over a **Unix-socket IPC**
-(`/run/user/1000/apex-tux.sock`) so the daemon stays small and pure.
+(`/run/user/1000/apex-tux.sock`), keeping the daemon small and focused.
 
 ## Why this architecture
 
@@ -135,8 +134,8 @@ ss-oled talks to the keyboard\'s panel **directly over native USB HID**:
 - One interrupt transfer per frame (<1ms) instead of a 115200-baud crawl
 - Fully event-driven — the daemon sleeps until DBus signals, hotkeys, or
   dwell timers actually fire (~0.4% idle CPU, ~12 MB RSS)
-- GUI and tray are **separate processes** (~85 MB and ~3 MB respectively),
-  spawned on demand; the daemon itself stays lean
+- GUI and tray are **separate processes** spawned on demand; the daemon
+  itself stays lean
 - No middleman hardware — the keyboard\'s own MCU drives its panel
 
 Smaller pipeline, faster frames, fewer devices. That speed is what makes the
@@ -206,12 +205,12 @@ Carried over from upstream, plus this fork\'s own roadmap:
 - [ ] Add support for more notifications
 
 **ss-oled roadmap:**
-- [x] **GUI + Tray suite** ✅ — schema-driven config editor, drag-rearrange providers,
-  live API Test button, embedded city geocoding search, auto-fill from response,
+- [x] **GUI + Tray suite** ✅ — schema-driven config editor, drag-rearrange
+  providers, live API Test button, embedded city geocoding search,
   spawn-on-demand lifecycle, IPC-over-Unix-socket daemon control
 - [x] **Custom JSON-API provider engine** ✅ — generic HTTP poll, JSON-path
-  resolution, per-field layout (alignment, size, row, bold), height-aware
-  word-wrap, explicit NO DATA placeholders
+  resolution, per-field layout (alignment, size, row, bold), word-wrap,
+  NO DATA placeholders
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
 - [ ] **Rebindable hotkeys** — current Ctrl+Shift+Numpad combos are hardcoded;
