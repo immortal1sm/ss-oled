@@ -45,19 +45,17 @@ impl Weather {
         let mut buffer = FrameBuffer::new();
         let data = self.cache.get();
 
-        let (condition, temp, precip) = match &data {
-            Some(d) => (
-                d.current_condition
-                    .unwrap_or(crate::providers::weather_data::Condition::Overcast),
-                Some(d.current_temp),
-                Some(d.current_precip_prob),
-            ),
-            None => (
-                crate::providers::weather_data::Condition::PartlyCloudy,
-                None,
-                None,
-            ),
+        // If we have no data yet (or only partial data with no current
+        // condition), render an explicit "NO DATA" placeholder rather than
+        // guess at conditions — we never want to falsely report weather.
+        let d = match data.as_ref() {
+            Some(d) if d.current_condition.is_some() => d,
+            _ => return Ok(no_data_placeholder(&self.label)),
         };
+
+        let condition = d.current_condition.expect("checked above");
+        let temp = Some(d.current_temp);
+        let precip = Some(d.current_precip_prob);
 
         draw_condition_icon(&mut buffer, condition, anim_frame);
 
@@ -242,4 +240,31 @@ fn register_callback(config: &Config, _focus_tx: FocusChannel) -> Result<Box<dyn
         today_secs,
         forecast_secs,
     }))
+}
+/// Render an explicit "NO DATA" placeholder so we never falsely
+/// report weather we haven't actually retrieved. Layout:
+///   y=4..6   provider label (e.g. "WEATHER") in FONT_6X10
+///   y=14..24 "NO DATA" centered in FONT_9X15
+fn no_data_placeholder(label: &str) -> FrameBuffer {
+    let mut buffer = FrameBuffer::new();
+    let big = MonoTextStyle::new(&iso_8859_15::FONT_9X15, BinaryColor::On);
+    let small = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
+
+    let label_upper = label.to_uppercase();
+    if !label_upper.is_empty() {
+        let m = small.measure_string(&label_upper, Point::zero(), Baseline::Top);
+        let lx = ((128 - m.bounding_box.size.width as i32) / 2).max(0);
+        Text::with_baseline(&label_upper, Point::new(lx, 4), small, Baseline::Top)
+            .draw(&mut buffer)
+            .ok();
+    }
+
+    let text = "NO DATA";
+    let m = big.measure_string(text, Point::zero(), Baseline::Top);
+    let x = (128 - m.bounding_box.size.width as i32) / 2;
+    Text::with_baseline(text, Point::new(x, 14), big, Baseline::Top)
+        .draw(&mut buffer)
+        .ok();
+
+    buffer
 }
