@@ -147,17 +147,82 @@ animated weather icons, slide transitions, and instant focus jumps possible.
 > standalone displays; ss-oled is where that experience lands when a
 > SteelSeries Apex keyboard is available.
 
-## Building
+## Build & install
 
-Requires Rust nightly, libusb and dbus dev headers:
+### 1. System dependencies
+
+Install Rust nightly plus the libusb and DBus dev headers:
 
 ```bash
+# Arch / CachyOS
+sudo pacman -S rustup libusb dbus
+rustup install nightly
+rustup default nightly
+
+# Debian / Ubuntu
+sudo apt install cargo rustc libusb-1.0-0-dev libdbus-1-dev
+```
+
+### 2. Build the binaries
+
+```bash
+git clone https://github.com/immortal1sm/ss-oled.git
+cd ss-oled
 cargo build --release --features sysinfo,image,weather,hotkeys,custom
 ```
 
-Install the udev rule (`97-steelseries.rules`, vendor `1038` product `1610`
-with `uaccess` tag), then run as a user systemd unit with
-`DBUS_SESSION_BUS_ADDRESS` inherited so MPRIS works under Wayland.
+This produces three binaries in `target/release/`:
+- `apex-tux` — the daemon (talks to the keyboard)
+- `apex-tray` — the system-tray controller
+- `apex-gui` — the settings editor (launched on demand by the tray)
+
+### 3. Install the udev rule
+
+The Apex Pro needs the user-level permission to access the USB device:
+
+```bash
+sudo cp 97-steelseries.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger
+# Unplug + replug the keyboard (or `sudo udevadm trigger --action=add`).
+```
+
+### 4. Install the systemd unit
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/apex-tux.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now apex-tux
+```
+
+The unit inherits `DBUS_SESSION_BUS_ADDRESS` from the graphical session so
+MPRIS works under Wayland.
+
+### 5. Install the suite launcher (optional but recommended)
+
+```bash
+ln -s "$(pwd)/scripts/ss-oled" ~/.local/bin/ss-oled
+```
+
+Then use the convenience verbs:
+
+```bash
+ss-oled start    # daemon + tray
+ss-oled stop     # all three
+ss-oled status   # what\'s running
+ss-oled restart  # apply config changes
+```
+
+### Verifying the install
+
+- `systemctl --user status apex-tux` — daemon is active
+- An icon appears in the system tray
+- `journalctl --user -u apex-tux -f` — log output
+- The OLED on the keyboard lights up with the first provider (usually sysinfo)
+
+If the OLED stays dark, check `journalctl` for permission errors — usually
+the udev rule didn\'t pick up (replug, or `sudo udevadm trigger`).
 
 ### Writing your own providers
 
