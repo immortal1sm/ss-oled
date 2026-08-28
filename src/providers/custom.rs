@@ -311,7 +311,9 @@ impl CustomProvider {
         }
 
         // Render plan: one entry per visible field. Explicit `row` slots
-        // are reserved first; auto-packed fields fill remaining vertical space.
+        // are reserved first; auto-packed fields fill remaining vertical
+        // space and consume exactly as much height as wrap_text() reports
+        // for their value (so wrapped fields don't overlap the next one).
         let mut plan: Vec<(usize, i32)> = Vec::new();
         let mut taken_rows: [bool; 6] = [false; 6];
         let mut next_auto_y = y;
@@ -322,9 +324,22 @@ impl CustomProvider {
             if !f.show_label && !f.show_value {
                 continue;
             }
+            // Per-field metrics used by both planning and rendering.
+            let char_w = match f.size {
+                FieldSize::Small => 4,
+                FieldSize::Medium => 5,
+                FieldSize::Large => 6,
+                FieldSize::XLarge => 8,
+            };
+            let line_h = match f.size {
+                FieldSize::XLarge => char_w + 6,
+                _ => char_w + 2,
+            };
+
             let row_y = match f.row {
                 Some(r) if r < taken_rows.len() && !taken_rows[r] => {
                     taken_rows[r] = true;
+                    // Explicit slot: 1-line height only (truncate, no wrap).
                     let target = match f.size {
                         FieldSize::XLarge => r as i32 * 18,
                         FieldSize::Large => r as i32 * 14,
@@ -334,19 +349,43 @@ impl CustomProvider {
                     target.max(y)
                 }
                 _ => {
-                    let h = match f.size {
-                        FieldSize::XLarge => 18,
-                        FieldSize::Large => 14,
-                        FieldSize::Medium => 8,
-                        FieldSize::Small => 6,
-                    };
+                    // Auto-pack: simulate wrap to learn the actual height
+                    // this field will consume, then advance the cursor by
+                    // exactly that many lines so the next field starts
+                    // immediately below the wrapped output.
                     let t = next_auto_y;
-                    // Advance by max possible wrap height (5 lines) so the
-                    // next field starts below even the worst-case wrap.
-                    // Over-estimates spacing slightly but guarantees no
-                    // overlap with subsequent fields.
-                    let max_wrap_h = h + 4 * h; // 1 + 4 wrap lines
-                    next_auto_y += max_wrap_h;
+                    if idx < values.len() {
+                        let (_label, value) = &values[idx];
+                        let label_text = if f.show_label && !_label.is_empty() {
+                            format!("{_label}:")
+                        } else {
+                            String::new()
+                        };
+                        let label_w = if !label_text.is_empty() {
+                            char_w * label_text.chars().count() as i32
+                        } else {
+                            0
+                        };
+                        let reserved_left = if label_text.is_empty() {
+                            0
+                        } else {
+                            label_w + 4
+                        };
+                        let avail_w = (128 - reserved_left).max(8);
+                        let max_lines = if t < 40 {
+                            (((40 - t) / line_h) as usize).min(3)
+                        } else {
+                            0
+                        };
+                        let lines = if value.is_empty() || max_lines == 0 {
+                            1
+                        } else {
+                            wrap_text(value, avail_w, char_w, max_lines).len()
+                        };
+                        next_auto_y += (lines as i32) * line_h;
+                    } else {
+                        next_auto_y += line_h;
+                    }
                     t
                 }
             };
