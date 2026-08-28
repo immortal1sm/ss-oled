@@ -115,7 +115,11 @@ fn get_path<'a>(json: &'a serde_json::Value, path: &str) -> Option<&'a serde_jso
             continue;
         }
         if let Some((key, idx)) = seg.split_once('[') {
-            cur = cur.get(key.trim_end_matches('['))?;
+            // Segment like "[0]" (no key, just an array index) or "key[0]"
+            // (key + array index). Only do the key lookup if key is non-empty.
+            if !key.is_empty() {
+                cur = cur.get(key.trim_end_matches('['))?;
+            }
             let idx: usize = idx.trim_end_matches(']').parse().ok()?;
             cur = cur.get(idx)?;
         } else {
