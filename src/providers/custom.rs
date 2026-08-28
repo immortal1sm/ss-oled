@@ -72,6 +72,8 @@ struct Field {
     size: FieldSize,
     /// Explicit y-row slot (0-5). None = auto-pack in array order.
     row: Option<usize>,
+    /// Render the text with a faux-bold double-strike at +1px X.
+    bold: bool,
 }
 
 /// A single custom provider instance.
@@ -232,6 +234,29 @@ fn wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> Vec<Stri
         lines.push(format!("{truncated}…"));
     }
     lines
+}
+
+/// Draw `text` at `pos`. When `bold` is true, draw it twice with a 1px
+/// horizontal offset to produce a faux-bold appearance (no real bold
+/// variant exists for the embedded-graphics mono fonts we use).
+fn draw_text(
+    buffer: &mut FrameBuffer,
+    text: &str,
+    pos: Point,
+    style: MonoTextStyle<BinaryColor>,
+    bold: bool,
+) -> Result<()> {
+    Text::with_baseline(text, pos, style, embedded_graphics::text::Baseline::Top).draw(buffer)?;
+    if bold {
+        Text::with_baseline(
+            text,
+            Point::new(pos.x + 1, pos.y),
+            style,
+            embedded_graphics::text::Baseline::Top,
+        )
+        .draw(buffer)?;
+    }
+    Ok(())
 }
 
 impl CustomProvider {
@@ -404,13 +429,13 @@ impl CustomProvider {
             };
 
             if !label_text.is_empty() {
-                Text::with_baseline(
+                draw_text(
+                    &mut buffer,
                     &label_text,
                     Point::new(x_offset, row_y),
                     style,
-                    embedded_graphics::text::Baseline::Top,
-                )
-                .draw(&mut buffer)?;
+                    f.bold,
+                );
             }
             let value_x = if label_text.is_empty() {
                 x_offset
@@ -426,13 +451,7 @@ impl CustomProvider {
                 if y_pos + line_h > 40 {
                     break; // off-panel
                 }
-                Text::with_baseline(
-                    line,
-                    Point::new(value_x, y_pos),
-                    style,
-                    embedded_graphics::text::Baseline::Top,
-                )
-                .draw(&mut buffer)?;
+                draw_text(&mut buffer, line, Point::new(value_x, y_pos), style, f.bold);
             }
         }
 
@@ -572,11 +591,12 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
 
     let mut fields = Vec::new();
     for spec in field_specs {
-        // "<json-path>: <label>[!]" + optional " | a=L s=M r=N" layout suffix.
+        // "<json-path>: <label>[!]" + optional " | a=L s=M r=N b=1" layout suffix.
         // '!' marks value hidden; " -" in the label slot marks label hidden.
         let mut align = FieldAlign::Left;
         let mut size = FieldSize::Medium;
         let mut row: Option<usize> = None;
+        let mut bold = false;
         let (base, layout) = match spec.split_once('|') {
             Some((b, l)) => (b, l),
             None => (spec.as_str(), ""),
@@ -602,6 +622,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
                         }
                     }
                     "r" => row = v.parse::<usize>().ok(),
+                    "b" => bold = matches!(v, "1" | "true" | "yes" | "on"),
                     _ => {}
                 }
             }
@@ -629,6 +650,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
             align,
             size,
             row,
+            bold,
         });
     }
 

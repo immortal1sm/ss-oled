@@ -1016,6 +1016,8 @@ struct FieldRow {
     size: SizeCls,
     /// Explicit y-row slot. None = auto-pack top-down in array order.
     row: Option<usize>,
+    /// Render with a faux-bold double-strike.
+    bold: bool,
 }
 
 impl FieldRow {
@@ -1034,6 +1036,7 @@ impl FieldRow {
         let mut align = Align::Left;
         let mut size = SizeCls::Medium;
         let mut row: Option<usize> = None;
+        let mut bold = false;
         let (head, layout) = match s.split_once('|') {
             Some((h, l)) => (h, l),
             None => (s, ""),
@@ -1044,6 +1047,7 @@ impl FieldRow {
                     "a" => align = Align::parse(v).unwrap_or(Align::Left),
                     "s" => size = SizeCls::parse(v).unwrap_or(SizeCls::Medium),
                     "r" => row = v.parse::<usize>().ok(),
+                    "b" => bold = matches!(v, "1" | "true" | "yes" | "on"),
                     _ => {}
                 }
             }
@@ -1083,6 +1087,7 @@ impl FieldRow {
             align,
             size,
             row,
+            bold,
         }
     }
 
@@ -1147,6 +1152,9 @@ impl FieldRow {
         }
         if let Some(r) = self.row {
             parts.push(format!("r={r}"));
+        }
+        if self.bold {
+            parts.push("b=1".to_string());
         }
         parts.join(" ")
     }
@@ -1241,6 +1249,11 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 if prev != row.size {
                     changed = true;
                 }
+                // Bold toggle: faux-bold via double-strike at the daemon.
+                if ui.selectable_label(row.bold, "B").clicked() {
+                    row.bold = !row.bold;
+                    changed = true;
+                }
                 // Row slot: 0-5 (panel is 40px tall, 1 row ≈ 8-14px depending on size)
                 let mut row_str = row.row.map(|n| n.to_string()).unwrap_or_default();
                 let r_resp = ui.add(
@@ -1314,6 +1327,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 align: Align::Left,
                 size: SizeCls::Medium,
                 row: None,
+                bold: false,
             });
             changed = true;
         }
@@ -1328,6 +1342,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     align: Align::Left,
                     size: SizeCls::Medium,
                     row: None,
+                    bold: false,
                 }));
                 changed = true;
             }
