@@ -531,7 +531,37 @@ impl ContentProvider for MediaPlayerBuilder {
                 let tracker = mpris.stream().await?;
                 pin_mut!(tracker);
 
-                while let Some(event) = tracker.next().await {
+                // Tick: re-poll position periodically so the timer advances
+                // while Playing. Events from `tracker` still drive immediate
+                // refreshes (PropertiesChanged / Seeked). Tick rate: 1s when
+                // actively Playing, 5s otherwise (no need to poll a stopped
+                // player more often than reconnects).
+                let mut poll = time::interval(Duration::from_millis(1000));
+                poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+                loop {
+                    let event = tokio::select! {
+                        e = tracker.next() => e,
+                        _ = poll.tick() => None,
+                    };
+                    let event = match event {
+                        Some(e) => e,
+                        None => {
+                            // Periodic tick — only re-render if the player is
+                            // actively playing, so paused/stopped stays frozen.
+                            if let Ok(progress) = player.progress().await {
+                                if matches!(
+                                    progress.status,
+                                    PlaybackStatus::Playing
+                                ) {
+                                    if let Ok(image) = renderer.update(&progress) {
+                                        yield image;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     log::debug!("MPRIS event: {:?}", event);
                     // React to MPRIS events. We fire focus on PropertiesChanged
                     // AND Seeked. The latter catches cases where Firefox
