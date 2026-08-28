@@ -174,6 +174,46 @@ fn fetch_values(
         .collect())
 }
 
+/// Wrap `text` to fit `max_px` pixels at `char_w` pixels per character.
+/// Returns 1 line if it fits; otherwise splits at the last word
+/// boundary within the first `max_px / char_w` chars and returns
+/// 2 lines. Falls back to character-level split if no space fits.
+/// The second line has any leading whitespace trimmed.
+fn wrap_text(text: &str, max_px: i32, char_w: i32) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let max_chars = (max_px / char_w).max(1) as usize;
+    if text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+    // Walk to find the byte offset that corresponds to the max_chars-th char.
+    let mut prefix_end_byte = text.len();
+    for (i, (byte_idx, _ch)) in text.char_indices().enumerate() {
+        if i == max_chars {
+            prefix_end_byte = byte_idx;
+            break;
+        }
+    }
+    let prefix = &text[..prefix_end_byte];
+    let split_chars = match prefix.rfind(' ') {
+        Some(byte_idx) if byte_idx > 0 => prefix[..byte_idx].chars().count(),
+        _ => max_chars,
+    };
+    let first: String = text.chars().take(split_chars).collect();
+    let rest: String = text
+        .chars()
+        .skip(split_chars)
+        .collect::<String>()
+        .trim_start()
+        .to_string();
+    if rest.is_empty() {
+        vec![first]
+    } else {
+        vec![first, rest]
+    }
+}
+
 impl CustomProvider {
     fn render_rows(
         name: &str,
@@ -184,7 +224,6 @@ impl CustomProvider {
     ) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
         let header_style = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
-        let row_style = MonoTextStyle::new(&iso_8859_15::FONT_5X7, BinaryColor::On);
 
         let mut y = 0;
 
@@ -199,8 +238,7 @@ impl CustomProvider {
             y += 12;
         }
 
-        // No data retrieved yet — explicit placeholder so we never silently
-        // render a blank panel between API fetches.
+        // No data retrieved yet — explicit placeholder.
         if values.is_empty() {
             let placeholder = MonoTextStyle::new(&iso_8859_15::FONT_9X15, BinaryColor::On);
             let text = "NO DATA";
@@ -232,9 +270,8 @@ impl CustomProvider {
             y = 4;
         }
 
-        // Build render plan: one entry per non-empty field with layout
-        // (size, alignment, row slot) honored. Rows without an explicit
-        // `row` slot auto-pack below explicit slots in field order.
+        // Render plan: one entry per visible field. Explicit `row` slots
+        // are reserved first; auto-packed fields fill remaining vertical space.
         let mut plan: Vec<(usize, i32)> = Vec::new();
         let mut taken_rows: [bool; 6] = [false; 6];
         let mut next_auto_y = y;
@@ -277,6 +314,13 @@ impl CustomProvider {
                 FieldSize::Medium => MonoTextStyle::new(&iso_8859_15::FONT_5X7, BinaryColor::On),
                 FieldSize::Large => MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On),
             };
+            let char_w = match f.size {
+                FieldSize::Small => 4,
+                FieldSize::Medium => 5,
+                FieldSize::Large => 6,
+            };
+            let line_h = char_w + 2;
+
             let label_text = if f.show_label && !label.is_empty() {
                 format!("{label}:")
             } else {
@@ -287,33 +331,46 @@ impl CustomProvider {
             } else {
                 String::new()
             };
+
             let label_w = if !label_text.is_empty() {
-                style
-                    .measure_string(
-                        &label_text,
-                        Point::zero(),
-                        embedded_graphics::text::Baseline::Top,
-                    )
-                    .bounding_box
-                    .size
-                    .width as i32
+                char_w * label_text.chars().count() as i32
             } else {
                 0
             };
-            let text_w = if !text.is_empty() {
-                style
-                    .measure_string(&text, Point::zero(), embedded_graphics::text::Baseline::Top)
-                    .bounding_box
-                    .size
-                    .width as i32
-            } else {
+            let reserved_left = if label_text.is_empty() {
                 0
+            } else {
+                label_w + 4
             };
+            let avail_w = (128 - reserved_left).max(8);
+
+            // Wrap only in auto-pack mode; explicit slots reserve vertical
+            // space and a wrapped 2nd line would collide with the next slot.
+            let can_wrap = f.row.is_none();
+            let wrapped: Vec<String> = if text.is_empty() {
+                vec![String::new()]
+            } else if can_wrap {
+                wrap_text(&text, avail_w, char_w)
+            } else {
+                vec![text
+                    .chars()
+                    .take((avail_w / char_w).max(0) as usize)
+                    .collect()]
+            };
+
+            // Use FIRST line width for horizontal alignment; subsequent
+            // wrapped lines hang at y + n*line_h.
+            let first_w = wrapped
+                .first()
+                .map(|l| char_w * l.chars().count() as i32)
+                .unwrap_or(0);
+            let total_w = reserved_left + first_w;
             let x_offset = match f.align {
                 FieldAlign::Left => 0,
-                FieldAlign::Center => (128 - label_w - text_w - 4).max(0) / 2,
-                FieldAlign::Right => 128 - label_w - text_w - 4,
+                FieldAlign::Center => (128 - total_w).max(0) / 2,
+                FieldAlign::Right => 128 - total_w,
             };
+
             if !label_text.is_empty() {
                 Text::with_baseline(
                     &label_text,
@@ -323,10 +380,23 @@ impl CustomProvider {
                 )
                 .draw(&mut buffer)?;
             }
-            if !text.is_empty() {
+            let value_x = if label_text.is_empty() {
+                x_offset
+            } else {
+                x_offset + label_w + 4
+            };
+
+            for (line_idx, line) in wrapped.iter().enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let y_pos = row_y + (line_idx as i32) * line_h;
+                if y_pos + line_h > 40 {
+                    break; // off-panel
+                }
                 Text::with_baseline(
-                    &text,
-                    Point::new(x_offset + label_w + 4, row_y),
+                    line,
+                    Point::new(value_x, y_pos),
                     style,
                     embedded_graphics::text::Baseline::Top,
                 )
