@@ -354,25 +354,17 @@ impl MediaPlayerRenderer {
             }
         }
 
-        // ----- media source label (bottom-right of timer row) -----
-        // Right-aligned in FONT_4X6 on the same y band as the timer. The
-        // centered timer leaves enough room for labels up to ~8 chars
-        // ("Firefox", "Spotify"); longer names are simply truncated by the
-        // 128px screen edge.
+        // ----- media source label (top-left corner) -----
+        // FONT_4X6 (4px tall) at y=0 sits in the 3px gap above the title
+        // row, so it doesn't collide with the timer at y=27 or the title
+        // at y=3..13. Labels up to ~16 chars fit; longer ones are truncated
+        // at the right edge of the panel.
         if self.show_source_label {
             if let Some(src) = &self.source {
                 if !src.is_empty() {
                     let src_style = MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On);
-                    let metrics = src_style.measure_string(src, Point::zero(), Baseline::Top);
-                    let src_width = metrics.bounding_box.size.width as i32;
-                    // Right edge at x=127, on the timer's baseline (y=27).
-                    Text::with_baseline(
-                        src,
-                        Point::new(127 - src_width, 27),
-                        src_style,
-                        Baseline::Top,
-                    )
-                    .draw(&mut display)?;
+                    Text::with_baseline(src, Point::new(0, 0), src_style, Baseline::Top)
+                        .draw(&mut display)?;
                 }
             }
         }
