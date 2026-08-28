@@ -277,13 +277,25 @@ impl CustomProvider {
             return Ok(buffer);
         }
 
-        // Page dots always top-right.
+        // Page dots top-right - only when there are actually multiple
+        // pages to indicate between. Single-page panels stay clean.
         let pages = pages_needed(values.len());
-        for i in 0..pages as i32 {
-            let x = 126 - pages as i32 * 4 + i * 4;
-            Rectangle::new(Point::new(x, 2), Size::new(2, 2))
-                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
-                .draw(&mut buffer)?;
+        if pages > 1 {
+            // Highlight the currently-visible page with a filled square;
+            // remaining pages are hollow outlines. Falls back to all
+            // hollow if the active page index is out of range (defensive).
+            let active = (page as usize) % pages;
+            for i in 0..pages as i32 {
+                let x = 126 - pages as i32 * 4 + i * 4;
+                let style = if i as usize == active {
+                    PrimitiveStyle::with_fill(BinaryColor::On)
+                } else {
+                    PrimitiveStyle::with_stroke(BinaryColor::On, 1)
+                };
+                Rectangle::new(Point::new(x, 2), Size::new(2, 2))
+                    .into_styled(style)
+                    .draw(&mut buffer)?;
+            }
         }
         if !show_header && y == 0 {
             y = 4;
