@@ -341,7 +341,12 @@ impl CustomProvider {
                         FieldSize::Small => 6,
                     };
                     let t = next_auto_y;
-                    next_auto_y += h;
+                    // Advance by max possible wrap height (5 lines) so the
+                    // next field starts below even the worst-case wrap.
+                    // Over-estimates spacing slightly but guarantees no
+                    // overlap with subsequent fields.
+                    let max_wrap_h = h + 4 * h; // 1 + 4 wrap lines
+                    next_auto_y += max_wrap_h;
                     t
                 }
             };
@@ -396,10 +401,11 @@ impl CustomProvider {
             // Wrap only in auto-pack mode; explicit slots reserve vertical
             // space and a wrapped 2nd line would collide with the next slot.
             // max_lines = how many additional lines fit in the remaining
-            // vertical space below row_y. Clamped to 0 so wrap_text is a
-            // no-op if there's no room.
+            // vertical space below row_y, capped at 3 to keep the panel
+            // usable (most API values fit in 3 lines). Clamped to 0 so
+            // wrap_text is a no-op if there's no room.
             let max_lines = if row_y < 40 {
-                ((40 - row_y) / line_h).max(0) as usize
+                (((40 - row_y) / line_h) as usize).min(3)
             } else {
                 0
             };
