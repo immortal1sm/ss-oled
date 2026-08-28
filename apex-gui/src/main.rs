@@ -60,13 +60,6 @@ struct App {
     field_drag_pending_commit: bool,
     /// Status line for the UI.
     status: String,
-    /// When true, the window has been hidden via close-button interception.
-    /// The user re-shows it via the tray's "Open settings…" command (which
-    /// sends a `show` to the apex-gui IPC socket).
-    hidden: bool,
-    /// Receives `show` commands from the apex-gui IPC socket. When one
-    /// arrives, we clear `hidden` and send ViewportCommand::Visible(true).
-    show_rx: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl App {
@@ -98,8 +91,6 @@ impl App {
             field_drag_active: false,
             field_drag_pending_commit: false,
             status: "Loaded".into(),
-            hidden: false,
-            show_rx: None,
         };
         app.refresh_provider_list();
         eprintln!(
@@ -326,31 +317,6 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Hide-on-close: when the user clicks the window close button,
-        // cancel the close and hide the window instead of quitting. The
-        // process stays resident so subsequent tray "Open settings…"
-        // commands can re-show it without spawning a fresh window.
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.hidden = true;
-        }
-        // Drain the show IPC channel (non-blocking).
-        if let Some(rx) = &self.show_rx {
-            while rx.try_recv().is_ok() {}
-            // Simpler: just check once per frame for any pending signal.
-            if rx.try_recv().is_ok() {
-                self.hidden = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            }
-        }
-        if self.hidden {
-            // Keep the process responsive but draw nothing — no widgets, no
-            // CPU spent on rendering. The IPC listener is on its own thread.
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
-            return;
-        }
-
         let panel_h = ctx.screen_rect().height() - 70.0;
 
         // ---------- LEFT SIDEBAR: provider list ----------
@@ -1330,63 +1296,7 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(default_config_path);
 
-    let mut app = App::load(path)?;
-
-    // IPC: listen on /run/user/<uid>/apex-gui.sock for "show" commands
-    // sent by the system tray. A single shared channel forwards into the
-    // App so the update loop can re-show the window without spawning a
-    // new GUI process. Socket is removed on exit and replaced if a
-    // stale file is left behind.
-    let (show_tx, show_rx) = std::sync::mpsc::channel::<()>();
-    app.show_rx = Some(show_rx);
-    std::thread::spawn(move || {
-        use std::{
-            io::{Read, Write},
-            os::unix::net::UnixListener,
-        };
-        let sock_path = format!(
-            "/run/user/{}/apex-gui.sock",
-            std::env::var("UID")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(1000)
-        );
-        let _ = std::fs::remove_file(&sock_path); // stale from a prior run
-        let listener = match UnixListener::bind(&sock_path) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("apex-gui: could not bind {}: {}", sock_path, e);
-                return;
-            }
-        };
-        // Best-effort restrictive permissions: owner-only. Use std::os::unix::fs
-        // to set mode to 0600 so only this user can send a show command.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&sock_path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&sock_path, perms);
-            }
-        }
-        for stream in listener.incoming() {
-            match stream {
-                Ok(mut s) => {
-                    let mut buf = [0u8; 16];
-                    let _ = s.read(&mut buf);
-                    let _ = s.write_all(
-                        b"ok
-",
-                    );
-                    let _ = s.flush();
-                    let _ = show_tx.send(());
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
+    let app = App::load(path)?;
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 560.0])
