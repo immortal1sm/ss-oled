@@ -129,21 +129,31 @@ impl Tray for SsOledTray {
             StandardItem {
                 label: "Open settings…".into(),
                 activate: Box::new(|_tray: &mut Self| {
-                    let already = std::process::Command::new("pgrep")
-                        .arg("-f")
-                        .arg("apex-gui")
-                        .output()
-                        .map(|o| !o.stdout.is_empty())
-                        .unwrap_or(false);
-                    if already {
+                    // If the GUI is already running, send "show" to its
+                    // IPC socket so the window re-appears (it may be hidden
+                    // after the user closed it). The GUI intercepts the
+                    // close button to hide instead of quit.
+                    let sock = format!(
+                        "/run/user/{}/apex-gui.sock",
+                        std::env::var("UID")
+                            .ok()
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(1000),
+                    );
+                    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+                        use std::io::Write;
+                        let _ = s.write_all(
+                            b"show
+",
+                        );
+                        let _ = s.flush();
                         return;
                     }
-                    // The GUI needs a display connection; if this tray was
-                    // started without one in its environment, supply the usual
-                    // Plasma session defaults.
+                    // GUI is not running — spawn it.
                     let mut cmd = std::process::Command::new("sh");
                     cmd.arg("-c").arg(
-                        "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui >/dev/null 2>&1 &",
+                        "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui \
+                         >/dev/null 2>&1 &",
                     );
                     let have_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
                         || std::env::var_os("DISPLAY").is_some();
