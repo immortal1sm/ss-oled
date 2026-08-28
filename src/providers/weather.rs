@@ -52,7 +52,11 @@ impl Weather {
                 Some(d.current_temp),
                 Some(d.current_precip_prob),
             ),
-            None => (crate::providers::weather_data::Condition::Fog, None, None),
+            None => (
+                crate::providers::weather_data::Condition::PartlyCloudy,
+                None,
+                None,
+            ),
         };
 
         draw_condition_icon(&mut buffer, condition, anim_frame);
