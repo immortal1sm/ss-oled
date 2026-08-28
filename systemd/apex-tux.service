@@ -1,0 +1,32 @@
+# User-level systemd unit for the ss-oled daemon.
+#
+# Requires DBus session bus (for MPRIS) and the udev rule that grants
+# access to the Apex Pro keyboard (vendor 1038, product 1610). Both are
+# inherited from the graphical session via DBUS_SESSION_BUS_ADDRESS and
+# the uaccess tag.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/apex-tux.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now apex-tux
+#
+# Logs:
+#   journalctl --user -u apex-tux -f
+
+[Unit]
+Description=ss-oled — Apex Pro OLED heads-up display daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Inherit DBus session bus and runtime dir from the graphical session so
+# MPRIS works under Wayland.
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=%h/projects/apex-tux/target/release/apex-tux
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
