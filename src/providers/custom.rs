@@ -181,6 +181,27 @@ impl CustomProvider {
             y += 12;
         }
 
+        // No data retrieved yet — explicit placeholder so we never silently
+        // render a blank panel between API fetches.
+        if values.is_empty() {
+            let placeholder = MonoTextStyle::new(&iso_8859_15::FONT_9X15, BinaryColor::On);
+            let text = "NO DATA";
+            let m = placeholder.measure_string(
+                text,
+                Point::zero(),
+                embedded_graphics::text::Baseline::Top,
+            );
+            let x = (128 - m.bounding_box.size.width as i32) / 2;
+            Text::with_baseline(
+                text,
+                Point::new(x, y + 4),
+                placeholder,
+                embedded_graphics::text::Baseline::Top,
+            )
+            .draw(&mut buffer)?;
+            return Ok(buffer);
+        }
+
         // Page dots always top-right.
         let pages = pages_needed(values.len());
         for i in 0..pages as i32 {

@@ -21,9 +21,13 @@ pub(crate) fn render_day(
     offset_x: i32,
     unit_sym: &str,
 ) -> Result<()> {
+    // No data yet (or out-of-range day) — show explicit placeholder so we
+    // never silently render an empty panel.
     let day = match days.get(idx) {
-        Some(d) => d,
-        None => return Ok(()),
+        Some(d) if !days.is_empty() => d,
+        _ => {
+            return render_placeholder(buffer, offset_x);
+        }
     };
 
     // Layout — panel is only 40px tall, everything must end by y=39.
@@ -80,5 +84,17 @@ pub(crate) fn render_day(
         .ok();
     }
 
+    Ok(())
+}
+
+/// Render a "NO DATA" placeholder centered in the forecast panel. Offsets
+/// the text by `offset_x` so it slides cleanly during push transitions.
+fn render_placeholder(buffer: &mut FrameBuffer, offset_x: i32) -> Result<()> {
+    let style = MonoTextStyle::new(&iso_8859_15::FONT_9X15, BinaryColor::On);
+    let text = "NO DATA";
+    let m = style.measure_string(text, Point::zero(), Baseline::Top);
+    let x = ((128 - m.bounding_box.size.width as i32) / 2) + offset_x;
+    let y = 14;
+    Text::with_baseline(text, Point::new(x, y), style, Baseline::Top).draw(buffer)?;
     Ok(())
 }
