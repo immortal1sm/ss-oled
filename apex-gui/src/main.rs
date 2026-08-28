@@ -974,6 +974,7 @@ enum SizeCls {
     Small,
     Medium,
     Large,
+    XLarge,
 }
 impl SizeCls {
     fn as_str(&self) -> &'static str {
@@ -981,6 +982,7 @@ impl SizeCls {
             SizeCls::Small => "S",
             SizeCls::Medium => "M",
             SizeCls::Large => "L",
+            SizeCls::XLarge => "X",
         }
     }
 
@@ -989,6 +991,7 @@ impl SizeCls {
             "S" | "s" => Some(SizeCls::Small),
             "M" | "m" => Some(SizeCls::Medium),
             "L" | "l" => Some(SizeCls::Large),
+            "X" | "x" => Some(SizeCls::XLarge),
             _ => None,
         }
     }
@@ -998,6 +1001,7 @@ impl SizeCls {
             SizeCls::Small => "S",
             SizeCls::Medium => "M",
             SizeCls::Large => "L",
+            SizeCls::XLarge => "X",
         }
     }
 }
@@ -1222,7 +1226,12 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 egui::ComboBox::from_id_source(("size", i))
                     .selected_text(row.size.label())
                     .show_ui(ui, |ui| {
-                        for s in [SizeCls::Small, SizeCls::Medium, SizeCls::Large] {
+                        for s in [
+                            SizeCls::Small,
+                            SizeCls::Medium,
+                            SizeCls::Large,
+                            SizeCls::XLarge,
+                        ] {
                             if ui.selectable_label(row.size == s, s.label()).clicked() {
                                 row.size = s.clone();
                                 changed = true;
@@ -1488,8 +1497,8 @@ fn main() -> Result<()> {
     let app = App::load(path)?;
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 560.0])
-            .with_min_inner_size([700.0, 480.0])
+            .with_inner_size([900.0, 620.0])
+            .with_min_inner_size([820.0, 540.0])
             .with_title("ss-oled settings"),
         ..Default::default()
     };

@@ -55,6 +55,7 @@ enum FieldSize {
     Small,
     Medium,
     Large,
+    XLarge,
 }
 
 #[derive(Clone)]
@@ -300,6 +301,7 @@ impl CustomProvider {
                 Some(r) if r < taken_rows.len() && !taken_rows[r] => {
                     taken_rows[r] = true;
                     let target = match f.size {
+                        FieldSize::XLarge => r as i32 * 18,
                         FieldSize::Large => r as i32 * 14,
                         FieldSize::Medium => r as i32 * 8,
                         FieldSize::Small => r as i32 * 6,
@@ -308,6 +310,7 @@ impl CustomProvider {
                 }
                 _ => {
                     let h = match f.size {
+                        FieldSize::XLarge => 18,
                         FieldSize::Large => 14,
                         FieldSize::Medium => 8,
                         FieldSize::Small => 6,
@@ -327,13 +330,20 @@ impl CustomProvider {
                 FieldSize::Small => MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On),
                 FieldSize::Medium => MonoTextStyle::new(&iso_8859_15::FONT_5X7, BinaryColor::On),
                 FieldSize::Large => MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On),
+                FieldSize::XLarge => MonoTextStyle::new(&iso_8859_15::FONT_8X13, BinaryColor::On),
             };
             let char_w = match f.size {
                 FieldSize::Small => 4,
                 FieldSize::Medium => 5,
                 FieldSize::Large => 6,
+                FieldSize::XLarge => 8,
             };
-            let line_h = char_w + 2;
+            // XLarge uses 2-char ascender + base so it gets extra leading
+            // room vs the simple char_w + 2 heuristic used for other sizes.
+            let line_h = match f.size {
+                FieldSize::XLarge => char_w + 6,
+                _ => char_w + 2,
+            };
 
             let label_text = if f.show_label && !label.is_empty() {
                 format!("{label}:")
@@ -587,6 +597,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
                             "S" | "s" => FieldSize::Small,
                             "M" | "m" => FieldSize::Medium,
                             "L" | "l" => FieldSize::Large,
+                            "X" | "x" => FieldSize::XLarge,
                             _ => FieldSize::Medium,
                         }
                     }
