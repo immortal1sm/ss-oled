@@ -176,12 +176,31 @@ impl App {
         }
     }
 
-    /// Rewrite priorities from the provider list order.
+    /// Rewrite priorities from the provider list order so the new order
+    /// survives save + daemon restart. Built-in providers have their
+    /// section at the top level; custom providers nest under
+    /// `[providers.custom.<name>]`, so we update both paths.
     fn sync_priorities(&mut self) {
+        let names: Vec<String> = self.providers.clone();
         if let Some(table) = self.doc.as_table_mut() {
-            for (idx, name) in self.providers.iter().enumerate() {
+            for (idx, name) in names.iter().enumerate() {
+                let prio = toml::Value::Integer((idx + 1) as i64);
                 if let Some(section) = table.get_mut(name.as_str()).and_then(|v| v.as_table_mut()) {
-                    section.insert("priority".into(), toml::Value::Integer((idx + 1) as i64));
+                    section.insert("priority".into(), prio.clone());
+                }
+                // Custom provider path: [providers.custom.<name>]
+                if let Some(custom_table) = table
+                    .get_mut("providers")
+                    .and_then(|p| p.as_table_mut())
+                    .and_then(|p| p.get_mut("custom"))
+                    .and_then(|c| c.as_table_mut())
+                {
+                    if let Some(section) = custom_table
+                        .get_mut(name.as_str())
+                        .and_then(|v| v.as_table_mut())
+                    {
+                        section.insert("priority".into(), prio);
+                    }
                 }
             }
         }
