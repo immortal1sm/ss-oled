@@ -174,44 +174,63 @@ fn fetch_values(
         .collect())
 }
 
-/// Wrap `text` to fit `max_px` pixels at `char_w` pixels per character.
-/// Returns 1 line if it fits; otherwise splits at the last word
-/// boundary within the first `max_px / char_w` chars and returns
-/// 2 lines. Falls back to character-level split if no space fits.
-/// The second line has any leading whitespace trimmed.
-fn wrap_text(text: &str, max_px: i32, char_w: i32) -> Vec<String> {
+/// Wrap `text` into up to `max_lines` lines, each fitting within
+/// `max_px` pixels at `char_w` pixels per character. Splits at the
+/// last word boundary within each line; falls back to character-level
+/// split when no space fits. Returns fewer lines if the text wraps to
+/// fewer than `max_lines`. Returns one entry per line.
+fn wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return vec![];
+    }
     if text.is_empty() {
         return vec![String::new()];
     }
     let max_chars = (max_px / char_w).max(1) as usize;
-    if text.chars().count() <= max_chars {
-        return vec![text.to_string()];
-    }
-    // Walk to find the byte offset that corresponds to the max_chars-th char.
-    let mut prefix_end_byte = text.len();
-    for (i, (byte_idx, _ch)) in text.char_indices().enumerate() {
-        if i == max_chars {
-            prefix_end_byte = byte_idx;
+    let mut lines: Vec<String> = Vec::new();
+    // Convert to owned String once so the loop can reassign remaining
+    // without lifetime gymnastics. We shadow `text` to keep the loop body
+    // reading naturally.
+    let mut remaining = text.to_string();
+    while lines.len() < max_lines {
+        if remaining.chars().count() <= max_chars {
+            lines.push(remaining.to_string());
+            return lines;
+        }
+        // Find the rightmost space within the first max_chars chars.
+        let mut prefix_end_byte = remaining.len();
+        for (i, (byte_idx, _ch)) in remaining.char_indices().enumerate() {
+            if i == max_chars {
+                prefix_end_byte = byte_idx;
+                break;
+            }
+        }
+        let prefix = &remaining[..prefix_end_byte];
+        let split_chars = match prefix.rfind(' ') {
+            Some(byte_idx) if byte_idx > 0 => prefix[..byte_idx].chars().count(),
+            _ => max_chars,
+        };
+        let first: String = remaining.chars().take(split_chars).collect();
+        remaining = remaining
+            .chars()
+            .skip(split_chars)
+            .collect::<String>()
+            .trim_start()
+            .to_string();
+        if first.is_empty() {
+            // Safety: avoid infinite loop if split produced nothing.
             break;
         }
+        lines.push(first);
     }
-    let prefix = &text[..prefix_end_byte];
-    let split_chars = match prefix.rfind(' ') {
-        Some(byte_idx) if byte_idx > 0 => prefix[..byte_idx].chars().count(),
-        _ => max_chars,
-    };
-    let first: String = text.chars().take(split_chars).collect();
-    let rest: String = text
-        .chars()
-        .skip(split_chars)
-        .collect::<String>()
-        .trim_start()
-        .to_string();
-    if rest.is_empty() {
-        vec![first]
-    } else {
-        vec![first, rest]
+    // If we hit max_lines with content still unrendered, truncate
+    // remaining to fit on the last line.
+    if !remaining.is_empty() {
+        let take = max_chars.saturating_sub(1); // leave 1 char for ellipsis
+        let truncated: String = remaining.chars().take(take).collect::<String>();
+        lines.push(format!("{truncated}…"));
     }
+    lines
 }
 
 impl CustomProvider {
@@ -346,16 +365,24 @@ impl CustomProvider {
 
             // Wrap only in auto-pack mode; explicit slots reserve vertical
             // space and a wrapped 2nd line would collide with the next slot.
+            // max_lines = how many additional lines fit in the remaining
+            // vertical space below row_y. Clamped to 0 so wrap_text is a
+            // no-op if there's no room.
+            let max_lines = if row_y < 40 {
+                ((40 - row_y) / line_h).max(0) as usize
+            } else {
+                0
+            };
             let can_wrap = f.row.is_none();
             let wrapped: Vec<String> = if text.is_empty() {
                 vec![String::new()]
-            } else if can_wrap {
-                wrap_text(&text, avail_w, char_w)
+            } else if can_wrap && max_lines > 0 {
+                wrap_text(&text, avail_w, char_w, max_lines)
             } else {
-                vec![text
-                    .chars()
-                    .take((avail_w / char_w).max(0) as usize)
-                    .collect()]
+                // Explicit row slot OR no room for any wrap: one truncated
+                // line that fits the available width.
+                let take = (avail_w / char_w).max(0) as usize;
+                vec![text.chars().take(take).collect()]
             };
 
             // Use FIRST line width for horizontal alignment; subsequent
