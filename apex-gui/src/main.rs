@@ -731,7 +731,13 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
                         }
                         anyhow::bail!("no results - try a shorter city name")
                     })();
-                    result
+                    // Send result back so the GUI's delivery poll can apply
+                    // it. Without this send the receiver never fires and
+                    // the status stays stuck on "Searching..." forever.
+                    // Convert anyhow::Error to String to match the channel
+                    // type the receiver expects.
+                    let payload = result.map_err(|e| format!("{e}"));
+                    let _ = tx.send(payload);
                 });
                 *SEARCH.lock().unwrap() = Some(rx);
             }
