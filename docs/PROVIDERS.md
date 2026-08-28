@@ -1,8 +1,9 @@
 # Writing Custom Providers
 
-A provider is a screen on your Apex keyboard's OLED. This guide shows how to
-write one — from a minimal working example to the full conventions used by
-ss-oled's built-in providers (clock, sysinfo, image, music, weather, forecast).
+A provider is a screen on your Apex keyboard\'s OLED. This guide shows how
+to write one — from a minimal working example to the conventions used by
+ss-oled\'s built-in providers (clock, sysinfo, image, music, weather,
+forecast, custom).
 
 ## The mental model
 
@@ -17,7 +18,7 @@ and event-driven providers can jump to the front of the queue.
 
 ## Minimal working example
 
-A provider that shows "hello" plus the system's uptime. Complete file —
+A provider that shows "hello" plus the system\'s uptime. Complete file —
 drop it in as `src/providers/uptime.rs`:
 
 ```rust
@@ -40,7 +41,7 @@ use futures::Stream;
 use linkme::distributed_slice;
 use log::info;
 
-// 1. Self-registration: this static hooks into the scheduler's provider list.
+// 1. Self-registration: this static hooks into the scheduler\'s provider list.
 #[distributed_slice(CONTENT_PROVIDERS)]
 static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper>> =
     register_callback;
@@ -116,7 +117,7 @@ priority = 6
 interval = 30   # dwell time on screen, seconds
 ```
 
-That's it — rebuild and the rotation includes it.
+That\'s it — rebuild and the rotation includes it.
 
 ## The three pieces, explained
 
@@ -133,7 +134,7 @@ the parsed config and returns either a boxed provider or `Err`, which means
 Two required items:
 
 - `type ContentStream<'a>` + `stream()` — an async stream of frames.
-- `fn name()` — the provider's settings/identity key ("weather", "mpris2").
+- `fn name()` — the provider\'s settings/identity key ("weather", "mpris2").
   Must match the `[section]` name in settings.toml.
 
 ### 3. Frame rendering
@@ -143,8 +144,8 @@ A `FrameBuffer` is a 128×40 monochrome canvas. Anything from
 `Text`, `Line`, `Circle`, `Rectangle`, raw `ImageRaw` bitmaps.
 
 **Hard bounds:** y must stay within 0..=39, x within 0..=127. Content drawn
-past those rows is silently clipped — this has bitten us before (see git log,
-"fit layouts in 40px panel"). Compute your layout against DISPLAY_HEIGHT.
+past those rows is silently clipped. Compute your layout against
+`DISPLAY_HEIGHT`.
 
 ## Conventions
 
@@ -167,7 +168,7 @@ Yield frames on a schedule, not in a tight loop:
 
 ```rust
 let mut tick = tokio::time::interval(Duration::from_millis(300));
-tick.set_missed_tick_behavior(MissedTickBehavior::Skip);  // don't burst after stalls
+tick.set_missed_tick_behavior(MissedTickBehavior::Skip);  // don\'t burst after stalls
 loop {
     yield self.render()?;
     tick.tick().await;
@@ -202,8 +203,8 @@ are ignored by design.
 
 ### Config schema declaration (GUI integration)
 
-To make your provider configurable from the upcoming GUI/tray suite, declare
-its schema (convention being introduced alongside docs/DESIGN.md):
+To make your provider configurable from the GUI/tray suite, declare its
+schema:
 
 ```rust
 fn config_schema() -> Vec<crate::config_schema::ConfigField> {
@@ -226,8 +227,7 @@ pushing to the keyboard:
 cargo build --release --features simulator --no-default-features
 ```
 
-Or verify layout math by rendering to an offscreen buffer and dumping it —
-the weather icons were developed entirely this way before touching hardware.
+Or verify layout math by rendering to an offscreen buffer and dumping it.
 
 ## Checklist before merging a new provider
 
