@@ -44,6 +44,20 @@ use tokio::time::{interval, MissedTickBehavior};
 
 /// One configured field: JSON path + display label.
 #[derive(Clone)]
+enum FieldAlign {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone)]
+enum FieldSize {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Clone)]
 struct Field {
     path: String,
     label: String,
@@ -51,6 +65,12 @@ struct Field {
     show_label: bool,
     /// Draw the value after the label on the OLED.
     show_value: bool,
+    /// Horizontal alignment. Default: Left.
+    align: FieldAlign,
+    /// Font size class. Default: Medium.
+    size: FieldSize,
+    /// Explicit y-row slot (0-5). None = auto-pack in array order.
+    row: Option<usize>,
 }
 
 /// A single custom provider instance.
@@ -155,14 +175,12 @@ fn fetch_values(
 }
 
 impl CustomProvider {
-    #[allow(clippy::too_many_arguments)]
     fn render_rows(
         name: &str,
         values: &[(String, String)],
         page: u64,
         show_header: bool,
-        labels_enabled: &[bool],
-        values_show_value: &[bool],
+        fields: &[Field],
     ) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
         let header_style = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
@@ -214,41 +232,106 @@ impl CustomProvider {
             y = 4;
         }
 
-        let start = (page as usize % pages) * PER_PAGE;
-        for row_idx in start..(start + PER_PAGE).min(values.len()) {
-            let (label, value) = &values[row_idx];
-            let empty = &String::new();
-            let show_label = labels_enabled.get(row_idx).unwrap_or(&true);
-            let show_value = values_show_value.get(row_idx).unwrap_or(&true);
-            let (show_label, show_value) = (*show_label, *show_value);
-            if !show_label && !show_value {
+        // Build render plan: one entry per non-empty field with layout
+        // (size, alignment, row slot) honored. Rows without an explicit
+        // `row` slot auto-pack below explicit slots in field order.
+        let mut plan: Vec<(usize, i32)> = Vec::new();
+        let mut taken_rows: [bool; 6] = [false; 6];
+        let mut next_auto_y = y;
+        for (idx, f) in fields.iter().enumerate() {
+            if idx >= values.len() {
+                break;
+            }
+            if !f.show_label && !f.show_value {
                 continue;
             }
-            let _ = empty;
-            if show_label && !label.is_empty() {
+            let row_y = match f.row {
+                Some(r) if r < taken_rows.len() && !taken_rows[r] => {
+                    taken_rows[r] = true;
+                    let target = match f.size {
+                        FieldSize::Large => r as i32 * 14,
+                        FieldSize::Medium => r as i32 * 8,
+                        FieldSize::Small => r as i32 * 6,
+                    };
+                    target.max(y)
+                }
+                _ => {
+                    let h = match f.size {
+                        FieldSize::Large => 14,
+                        FieldSize::Medium => 8,
+                        FieldSize::Small => 6,
+                    };
+                    let t = next_auto_y;
+                    next_auto_y += h;
+                    t
+                }
+            };
+            plan.push((idx, row_y));
+        }
+
+        for (row_idx, row_y) in plan {
+            let (label, value) = &values[row_idx];
+            let f = &fields[row_idx];
+            let style = match f.size {
+                FieldSize::Small => MonoTextStyle::new(&iso_8859_15::FONT_4X6, BinaryColor::On),
+                FieldSize::Medium => MonoTextStyle::new(&iso_8859_15::FONT_5X7, BinaryColor::On),
+                FieldSize::Large => MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On),
+            };
+            let label_text = if f.show_label && !label.is_empty() {
+                format!("{label}:")
+            } else {
+                String::new()
+            };
+            let text = if f.show_value {
+                value.clone()
+            } else {
+                String::new()
+            };
+            let label_w = if !label_text.is_empty() {
+                style
+                    .measure_string(
+                        &label_text,
+                        Point::zero(),
+                        embedded_graphics::text::Baseline::Top,
+                    )
+                    .bounding_box
+                    .size
+                    .width as i32
+            } else {
+                0
+            };
+            let text_w = if !text.is_empty() {
+                style
+                    .measure_string(&text, Point::zero(), embedded_graphics::text::Baseline::Top)
+                    .bounding_box
+                    .size
+                    .width as i32
+            } else {
+                0
+            };
+            let x_offset = match f.align {
+                FieldAlign::Left => 0,
+                FieldAlign::Center => (128 - label_w - text_w - 4).max(0) / 2,
+                FieldAlign::Right => 128 - label_w - text_w - 4,
+            };
+            if !label_text.is_empty() {
                 Text::with_baseline(
-                    format!("{label}:").as_str(),
-                    Point::new(0, y),
-                    row_style,
+                    &label_text,
+                    Point::new(x_offset, row_y),
+                    style,
                     embedded_graphics::text::Baseline::Top,
                 )
                 .draw(&mut buffer)?;
             }
-            let vx = if show_label && show_value {
-                64
-            } else if show_value {
-                0
-            } else {
-                64
-            };
-            Text::with_baseline(
-                value.as_str(),
-                Point::new(vx, y),
-                row_style,
-                embedded_graphics::text::Baseline::Top,
-            )
-            .draw(&mut buffer)?;
-            y += 8;
+            if !text.is_empty() {
+                Text::with_baseline(
+                    &text,
+                    Point::new(x_offset + label_w + 4, row_y),
+                    style,
+                    embedded_graphics::text::Baseline::Top,
+                )
+                .draw(&mut buffer)?;
+            }
         }
 
         Ok(buffer)
@@ -269,8 +352,7 @@ impl ContentProvider for CustomProvider {
         let header = self.header.clone();
         let fields = self.fields.clone();
         let name = self.name.clone();
-        let labels_enabled: Vec<bool> = self.fields.iter().map(|f| f.show_label).collect();
-        let values_show_value: Vec<bool> = self.fields.iter().map(|f| f.show_value).collect();
+        // Visibility is read from self.fields directly in render_rows.
 
         Ok(try_stream! {
             // Initial fetch off-thread; placeholder rows until first success.
@@ -296,8 +378,7 @@ impl ContentProvider for CustomProvider {
             let mut last_fetch = Instant::now();
 
             let show_header = self.show_header;
-            let labels_enabled: Vec<bool> =
-                self.fields.iter().map(|f| f.show_label).collect();
+
 
             loop {
                 yield Self::render_rows(
@@ -305,8 +386,7 @@ impl ContentProvider for CustomProvider {
                     &self.values.lock().unwrap(),
                     frames / page_frames,
                     show_header,
-                    &labels_enabled,
-                    &values_show_value,
+                    &self.fields,
                 )?;
 
                 frames += 1;
@@ -390,17 +470,46 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
 
     let mut fields = Vec::new();
     for spec in field_specs {
-        // "<json-path>: <label>" — label optional. An empty label means the
-        // row shows the bare value with no label text.
-        // '!' immediately after the path = value hidden ("path!: label").
-        let (spec, show_value) = match spec.strip_suffix('!') {
+        // "<json-path>: <label>[!]" + optional " | a=L s=M r=N" layout suffix.
+        // '!' marks value hidden; " -" in the label slot marks label hidden.
+        let mut align = FieldAlign::Left;
+        let mut size = FieldSize::Medium;
+        let mut row: Option<usize> = None;
+        let (base, layout) = match spec.split_once('|') {
+            Some((b, l)) => (b, l),
+            None => (spec.as_str(), ""),
+        };
+        for kv in layout.split_whitespace() {
+            if let Some((k, v)) = kv.split_once('=') {
+                match k {
+                    "a" => {
+                        align = match v {
+                            "L" | "l" => FieldAlign::Left,
+                            "C" | "c" => FieldAlign::Center,
+                            "R" | "r" => FieldAlign::Right,
+                            _ => FieldAlign::Left,
+                        }
+                    }
+                    "s" => {
+                        size = match v {
+                            "S" | "s" => FieldSize::Small,
+                            "M" | "m" => FieldSize::Medium,
+                            "L" | "l" => FieldSize::Large,
+                            _ => FieldSize::Medium,
+                        }
+                    }
+                    "r" => row = v.parse::<usize>().ok(),
+                    _ => {}
+                }
+            }
+        }
+        let (spec, show_value) = match base.strip_suffix('!') {
             Some(p) => (p.to_string(), false),
-            None => (spec.clone(), true),
+            None => (base.to_string(), true),
         };
         let (path, label) = match spec.split_once(':') {
             Some((p, l)) => {
                 let l = l.trim().to_string();
-                // "-" sentinel or empty: user chose to hide this row's label.
                 let l = if l == "-" { String::new() } else { l };
                 (p.trim().to_string(), l)
             }
@@ -414,6 +523,9 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
             show_label: !label.is_empty(),
             label,
             show_value,
+            align,
+            size,
+            row,
         });
     }
 
