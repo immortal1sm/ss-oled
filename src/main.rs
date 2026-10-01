@@ -68,9 +68,6 @@ pub async fn main() -> Result<()> {
     #[cfg(all(feature = "usb", target_family = "unix", not(feature = "engine")))]
     let mut device = USBDevice::try_connect()?;
 
-    #[cfg(feature = "hotkeys")]
-    let hkm = apex_input::InputManager::new(tx.clone());
-
     #[cfg(feature = "engine")]
     let mut device = Engine::new().await?;
 
@@ -88,6 +85,28 @@ pub async fn main() -> Result<()> {
         // Add in settings from the environment (with a prefix of APEX)
         // Eg.. `APEX_DEBUG=1 ./target/app` would set the `debug` key
         .merge(config::Environment::with_prefix("APEX_"))?;
+
+    #[cfg(feature = "hotkeys")]
+    let hkm = {
+        let defaults = apex_input::HotkeyBindings::default();
+        let bindings = apex_input::HotkeyBindings {
+            previous: settings
+                .get_str("hotkeys.previous")
+                .unwrap_or(defaults.previous),
+            next: settings.get_str("hotkeys.next").unwrap_or(defaults.next),
+            lock_toggle: settings
+                .get_str("hotkeys.lock_toggle")
+                .or_else(|_| settings.get_str("hotkeys.lock"))
+                .unwrap_or(defaults.lock_toggle),
+        };
+        match apex_input::InputManager::new(tx.clone(), bindings) {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                log::warn!("hotkeys unavailable: {e}");
+                None
+            }
+        }
+    };
 
     #[cfg(feature = "simulator")]
     let mut device = Simulator::connect(tx.clone());

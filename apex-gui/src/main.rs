@@ -50,6 +50,17 @@ struct App {
     api_suggested: Option<Vec<(String, String)>>,
     /// Receiver for the in-flight API test.
     api_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// Hotkey field currently waiting for the next key press.
+    recording_hotkey: Option<String>,
+    /// Numpad flag per hotkey config key (next/previous/lock_toggle).
+    /// egui reports `Key::Num1` for BOTH the top-row and numpad 1 (its own
+    /// docs say "Either from the main row or from the numpad"), so the
+    /// recorder cannot infer this. It must be an explicit user choice, or
+    /// recorded bindings silently become top-row keys that never reach the
+    /// kernel on keyboards whose top row is not delivered.
+    hotkey_numpad_next: bool,
+    hotkey_numpad_previous: bool,
+    hotkey_numpad_lock: bool,
     /// Field-editor drag state (persists across frames while dragging).
     field_drag_from: Option<usize>,
     field_drag_over: Option<usize>,
@@ -73,6 +84,19 @@ impl App {
             .unwrap_or("")
             .to_string();
 
+        // Read existing hotkey strings up front so the numpad checkboxes
+        // reflect what is already in the config.
+        let hotkey_str = |k: &str| {
+            doc.get("hotkeys")
+                .and_then(|h| h.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let prev_hk = hotkey_str("previous");
+        let next_hk = hotkey_str("next");
+        let lock_hk = hotkey_str("lock_toggle");
+
         let mut app = Self {
             config_path: path,
             doc,
@@ -86,6 +110,10 @@ impl App {
             api_preview: None,
             api_suggested: None,
             api_test: None,
+            recording_hotkey: None,
+            hotkey_numpad_previous: hotkey_is_numpad(&prev_hk),
+            hotkey_numpad_next: hotkey_is_numpad(&next_hk),
+            hotkey_numpad_lock: hotkey_is_numpad(&lock_hk),
             field_drag_from: None,
             field_drag_over: None,
             field_drag_active: false,
@@ -99,6 +127,57 @@ impl App {
             app.providers
         );
         Ok(app)
+    }
+
+    fn capture_hotkey_recording(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.recording_hotkey.clone() else {
+            return;
+        };
+        let captured = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    physical_key: _,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                } => {
+                    // Escape cancels recording instead of binding itself.
+                    if *key == egui::Key::Escape {
+                        return Some(Recorded::Cancel);
+                    }
+                    format_recorded_hotkey(*key, *modifiers).map(Recorded::Combo)
+                }
+                _ => None,
+            })
+        });
+        match captured {
+            Some(Recorded::Combo(combo)) => {
+                // egui reports the same Key for a numpad key and its top-row
+                // twin, so the recorded name is applied through the explicit
+                // numpad flag. Without this, recording always produces a
+                // top-row binding.
+                let use_numpad = match path.as_str() {
+                    "hotkeys.next" => self.hotkey_numpad_next,
+                    "hotkeys.previous" => self.hotkey_numpad_previous,
+                    "hotkeys.lock_toggle" => self.hotkey_numpad_lock,
+                    _ => false,
+                };
+                let combo = if use_numpad {
+                    apply_numpad(&combo, true)
+                } else {
+                    combo
+                };
+                self.set_str(&path, &combo);
+                self.recording_hotkey = None;
+                self.status = format!("Recorded {combo}");
+            }
+            Some(Recorded::Cancel) => {
+                self.recording_hotkey = None;
+                self.status = "Recording cancelled".to_string();
+            }
+            None => {}
+        }
     }
 
     /// Collect provider sections in priority order.
@@ -126,6 +205,26 @@ impl App {
             .and_then(|c| c.as_table())
         {
             for (name, v) in custom {
+                if v.get("enabled").and_then(|e| e.as_bool()).is_some() {
+                    let prio = v.get("priority").and_then(|p| p.as_integer()).unwrap_or(99);
+                    list.push((name.clone(), prio));
+                }
+            }
+        }
+
+        // Sibling providers nested under [providers.*] that are not custom
+        // (e.g. [providers.lyrics]) have no `enabled` at the top level, so the
+        // scan above misses them. Pick them up explicitly.
+        if let Some(providers) = self
+            .doc
+            .get("providers")
+            .and_then(|p| p.as_table())
+        {
+            for (name, v) in providers {
+                // `custom` is handled above as a table-of-tables.
+                if name == "custom" {
+                    continue;
+                }
                 if v.get("enabled").and_then(|e| e.as_bool()).is_some() {
                     let prio = v.get("priority").and_then(|p| p.as_integer()).unwrap_or(99);
                     list.push((name.clone(), prio));
@@ -177,9 +276,13 @@ impl App {
     }
 
     /// Rewrite priorities from the provider list order so the new order
-    /// survives save + daemon restart. Built-in providers have their
-    /// section at the top level; custom providers nest under
-    /// `[providers.custom.<name>]`, so we update both paths.
+    /// survives save + daemon restart. Providers live in up to three places:
+    ///   - built-ins at the top level: `[sysinfo]`
+    ///   - custom providers: `[providers.custom.<name>]`
+    ///   - other nested providers: `[providers.<name>]` (e.g. `[providers.lyrics]`)
+    /// All three must be walked or a reorder silently snaps back on restart —
+    /// the original bug for the custom case, reintroduced when `[providers.*]`
+    /// siblings were added.
     fn sync_priorities(&mut self) {
         let names: Vec<String> = self.providers.clone();
         if let Some(table) = self.doc.as_table_mut() {
@@ -188,16 +291,19 @@ impl App {
                 if let Some(section) = table.get_mut(name.as_str()).and_then(|v| v.as_table_mut()) {
                     section.insert("priority".into(), prio.clone());
                 }
-                // Custom provider path: [providers.custom.<name>]
-                if let Some(custom_table) = table
-                    .get_mut("providers")
-                    .and_then(|p| p.as_table_mut())
-                    .and_then(|p| p.get_mut("custom"))
-                    .and_then(|c| c.as_table_mut())
+                let Some(providers) = table.get_mut("providers").and_then(|p| p.as_table_mut())
+                else {
+                    continue;
+                };
+                // `[providers.<name>]` — nested provider like `lyrics`.
+                if let Some(section) = providers.get_mut(name.as_str()).and_then(|v| v.as_table_mut())
                 {
-                    if let Some(section) = custom_table
-                        .get_mut(name.as_str())
-                        .and_then(|v| v.as_table_mut())
+                    section.insert("priority".into(), prio.clone());
+                }
+                // `[providers.custom.<name>]` — custom provider.
+                if let Some(custom) = providers.get_mut("custom").and_then(|c| c.as_table_mut()) {
+                    if let Some(section) =
+                        custom.get_mut(name.as_str()).and_then(|v| v.as_table_mut())
                     {
                         section.insert("priority".into(), prio);
                     }
@@ -336,6 +442,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.capture_hotkey_recording(ctx);
         let panel_h = ctx.screen_rect().height() - 70.0;
 
         // ---------- LEFT SIDEBAR: provider list ----------
@@ -439,13 +546,26 @@ impl eframe::App for App {
                             }
                         }
                     });
+
+                ui.separator();
+                if ui
+                    .selectable_label(self.selected.as_deref() == Some("__hotkeys"), "Hotkeys")
+                    .clicked()
+                {
+                    self.selected = Some("__hotkeys".to_string());
+                }
             });
 
         // ---------- CENTER: selected provider settings ----------
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.selected.clone() {
                 Some(name) => {
-                    ui.heading(name.clone());
+                    let title = if name == "__hotkeys" {
+                        "Hotkeys"
+                    } else {
+                        name.as_str()
+                    };
+                    ui.heading(title);
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_source("settings_scroll")
@@ -526,6 +646,11 @@ impl eframe::App for App {
 }
 
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
+    if name == "__hotkeys" {
+        hotkeys_editor(ui, app);
+        return;
+    }
+
     // Custom providers get their own editor.
     let is_custom = app
         .doc
@@ -578,6 +703,40 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             text_field(ui, app, "sysinfo.sensor_name", "Temperature sensor");
             int_field(ui, app, "sysinfo.polling_interval", "Poll interval (ms)");
             int_field(ui, app, "sysinfo.temperature_max", "Temp max scale");
+        }
+        "lyrics" => {
+            combo_field(
+                ui,
+                app,
+                "providers.lyrics.source",
+                "Lyrics source",
+                &["auto", "local", "lrclib"],
+            );
+            combo_field(
+                ui,
+                app,
+                "providers.lyrics.font",
+                "Font size (auto = largest that fits)",
+                &["auto", "S", "M", "L", "XL"],
+            );
+            combo_field(
+                ui,
+                app,
+                "providers.lyrics.align",
+                "Alignment",
+                &["L", "C", "R"],
+            );
+            toggle(ui, app, "providers.lyrics.bold", "Bold text");
+            toggle(
+                ui,
+                app,
+                "providers.lyrics.show_title",
+                "Show track title above lyrics",
+            );
+            ui.label(
+                "auto sources local .lrc first, then lrclib.net. Cached under \
+                 ~/.cache/apex-tux/lyrics/.",
+            );
         }
         "image" => {
             ui.horizontal(|ui| {
@@ -765,6 +924,294 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
     }
 }
 
+fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
+    ui.label("Click Record, press the desired combo, then Save/Apply. Clear disables that action.");
+    ui.label(
+        "Restart/apply is required because global shortcuts are registered at daemon startup.",
+    );
+    ui.add_space(8.0);
+
+    // Copy the numpad flags out before the calls: `hotkey_text_field` needs
+    // `&mut app`, so we cannot also hand it `&mut app.hotkey_numpad_*`.
+    let mut numpad_previous = app.hotkey_numpad_previous;
+    let mut numpad_next = app.hotkey_numpad_next;
+    let mut numpad_lock = app.hotkey_numpad_lock;
+
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.previous",
+        "Previous provider",
+        "Ctrl+Shift+Numpad *",
+        &mut numpad_previous,
+    );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.next",
+        "Next provider",
+        "Ctrl+Shift+Numpad /",
+        &mut numpad_next,
+    );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.lock_toggle",
+        "Lock / unlock provider",
+        "Ctrl+Shift+Numpad -",
+        &mut numpad_lock,
+    );
+    app.hotkey_numpad_previous = numpad_previous;
+    app.hotkey_numpad_next = numpad_next;
+    app.hotkey_numpad_lock = numpad_lock;
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Reset to defaults").clicked() {
+            app.set_str("hotkeys.next", "Ctrl+Shift+Numpad /");
+            app.set_str("hotkeys.previous", "Ctrl+Shift+Numpad *");
+            app.set_str("hotkeys.lock_toggle", "Ctrl+Shift+Numpad -");
+            app.recording_hotkey = None;
+            app.status = "Hotkeys reset to defaults".to_string();
+        }
+        if ui.button("Clear all").clicked() {
+            app.set_str("hotkeys.next", "");
+            app.set_str("hotkeys.previous", "");
+            app.set_str("hotkeys.lock_toggle", "");
+            app.recording_hotkey = None;
+            app.status = "All hotkeys disabled".to_string();
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(
+        "Tick Numpad for keys on the numeric keypad. egui cannot tell a numpad key \
+         from its top-row twin, so recording needs this hint — without it a recorded \
+         binding is always a top-row key.",
+    );
+    ui.label(
+        "Supported keys: Numpad / * - + and 0-9, letters A-Z, F1-F12, arrows, \
+         Enter, Space, Tab, Escape.",
+    );
+}
+
+fn hotkey_text_field(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    key: &str,
+    label: &str,
+    default: &str,
+    numpad: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        let mut s = app.get_str(key);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut s)
+                .hint_text(default)
+                .desired_width(240.0),
+        );
+        if response.changed() || response.lost_focus() {
+            app.set_str(key, &s);
+            // Keep the checkbox honest when the text is edited by hand.
+            *numpad = hotkey_is_numpad(&s);
+        }
+        let is_recording = app.recording_hotkey.as_deref() == Some(key);
+        let record_label = if is_recording {
+            "Recording…"
+        } else {
+            "Record"
+        };
+        if ui.button(record_label).clicked() {
+            app.recording_hotkey = Some(key.to_string());
+            app.status = format!("Press a key combo for {label}");
+        }
+        if ui.button("Clear").clicked() {
+            app.set_str(key, "");
+            if is_recording {
+                app.recording_hotkey = None;
+            }
+            app.status = format!("{label} hotkey disabled");
+        }
+        // egui cannot tell numpad from top row, so this is explicit.
+        if ui.checkbox(numpad, egui::RichText::new("Numpad").small()).changed() {
+            let cur = app.get_str(key);
+            let updated = apply_numpad(&cur, *numpad);
+            app.set_str(key, &updated);
+            app.status = format!(
+                "{label} numpad {}",
+                if *numpad { "on" } else { "off" }
+            );
+        }
+    });
+}
+
+/// Does this binding string name a numpad key?
+fn hotkey_is_numpad(spec: &str) -> bool {
+    spec.split('+').any(|p| {
+        let p = p.trim().to_ascii_lowercase();
+        p.starts_with("numpad")
+    })
+}
+
+/// Insert or remove the `Numpad` prefix on the final key segment of a binding.
+/// Idempotent in both directions: applying the same state twice is a no-op, and
+/// a literal trailing `+` key (e.g. "Ctrl++") survives a round trip.
+fn apply_numpad(spec: &str, on: bool) -> String {
+    let segs: Vec<&str> = spec.split('+').collect();
+    if segs.is_empty() {
+        return spec.to_string();
+    }
+    let mut out: Vec<String> = segs[..segs.len() - 1]
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    // The final segment is empty when the binding ends in a literal "+" key
+    // (split on '+' turns "Ctrl++" into ["Ctrl", "", ""]).
+    let last = segs[segs.len() - 1].trim();
+    let (last, literal_plus) = if last.is_empty() {
+        ("+", true)
+    } else {
+        (last, false)
+    };
+
+    // Strip a leading "numpad" PREFIX (not a char set - trim_start_matches
+    // would eat the letters of "Numpad" one by one and also mangle keys that
+    // merely start with those characters).
+    let lower = last.to_ascii_lowercase();
+    let stripped = if lower == "numpad" {
+        String::new()
+    } else if let Some(rest) = lower.strip_prefix("numpad") {
+        rest.trim().to_string()
+    } else {
+        last.to_string()
+    };
+
+    let new_last = if on {
+        if stripped.is_empty() {
+            if literal_plus {
+                // Nothing to prefix onto a bare "+" key; keep the key alone.
+                "+".to_string()
+            } else {
+                "Numpad".to_string()
+            }
+        } else {
+            format!("Numpad{stripped}")
+        }
+    } else {
+        if literal_plus {
+            "+".to_string()
+        } else {
+            stripped
+        }
+    };
+
+    // A trailing literal '+' must stay a separate segment so the daemon's
+    // parser (which preserves a trailing '+' before splitting) sees it.
+    out.push(new_last);
+    if literal_plus {
+        out.push(String::new());
+    }
+    out.join("+")
+}
+
+/// Outcome of a single recording attempt.
+enum Recorded {
+    Combo(String),
+    Cancel,
+}
+
+fn format_recorded_hotkey(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> Option<String> {
+    if matches!(key, egui::Key::Copy | egui::Key::Cut | egui::Key::Paste) {
+        return None;
+    }
+    let mut parts: Vec<&'static str> = Vec::new();
+    if modifiers.ctrl {
+        parts.push("Ctrl");
+    }
+    if modifiers.alt {
+        parts.push("Alt");
+    }
+    if modifiers.shift {
+        parts.push("Shift");
+    }
+    if modifiers.mac_cmd {
+        parts.push("Super");
+    }
+    parts.push(recorded_key_name(key)?);
+    Some(parts.join("+"))
+}
+
+fn recorded_key_name(key: egui::Key) -> Option<&'static str> {
+    Some(match key {
+        egui::Key::ArrowDown => "ArrowDown",
+        egui::Key::ArrowLeft => "ArrowLeft",
+        egui::Key::ArrowRight => "ArrowRight",
+        egui::Key::ArrowUp => "ArrowUp",
+        egui::Key::Escape => "Escape",
+        egui::Key::Tab => "Tab",
+        egui::Key::Backspace => "Backspace",
+        egui::Key::Enter => "Enter",
+        egui::Key::Space => "Space",
+        egui::Key::Slash => "/",
+        egui::Key::Minus => "-",
+        egui::Key::Plus => "+",
+        egui::Key::Num0 => "0",
+        egui::Key::Num1 => "1",
+        egui::Key::Num2 => "2",
+        egui::Key::Num3 => "3",
+        egui::Key::Num4 => "4",
+        egui::Key::Num5 => "5",
+        egui::Key::Num6 => "6",
+        egui::Key::Num7 => "7",
+        egui::Key::Num8 => "8",
+        egui::Key::Num9 => "9",
+        egui::Key::A => "A",
+        egui::Key::B => "B",
+        egui::Key::C => "C",
+        egui::Key::D => "D",
+        egui::Key::E => "E",
+        egui::Key::F => "F",
+        egui::Key::G => "G",
+        egui::Key::H => "H",
+        egui::Key::I => "I",
+        egui::Key::J => "J",
+        egui::Key::K => "K",
+        egui::Key::L => "L",
+        egui::Key::M => "M",
+        egui::Key::N => "N",
+        egui::Key::O => "O",
+        egui::Key::P => "P",
+        egui::Key::Q => "Q",
+        egui::Key::R => "R",
+        egui::Key::S => "S",
+        egui::Key::T => "T",
+        egui::Key::U => "U",
+        egui::Key::V => "V",
+        egui::Key::W => "W",
+        egui::Key::X => "X",
+        egui::Key::Y => "Y",
+        egui::Key::Z => "Z",
+        egui::Key::F1 => "F1",
+        egui::Key::F2 => "F2",
+        egui::Key::F3 => "F3",
+        egui::Key::F4 => "F4",
+        egui::Key::F5 => "F5",
+        egui::Key::F6 => "F6",
+        egui::Key::F7 => "F7",
+        egui::Key::F8 => "F8",
+        egui::Key::F9 => "F9",
+        egui::Key::F10 => "F10",
+        egui::Key::F11 => "F11",
+        egui::Key::F12 => "F12",
+        _ => return None,
+    })
+}
+
 // Widget helpers ------------------------------------------------------------
 
 fn toggle(ui: &mut egui::Ui, app: &mut App, key: &str, label: &str) {
@@ -809,6 +1256,32 @@ fn int_field(ui: &mut egui::Ui, app: &mut App, key: &str, label: &str) {
         let mut v = app.get_int(key);
         if ui.add(egui::DragValue::new(&mut v)).changed() {
             app.set_int(key, v);
+        }
+    });
+}
+
+/// Dropdown restricted to a fixed set of string values.
+///
+/// Unlike `text_field`, this cannot produce a value the provider would reject,
+/// which matters for enum-like settings (lyrics source/font/alignment).
+fn combo_field(ui: &mut egui::Ui, app: &mut App, key: &str, label: &str, options: &[&str]) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        let current = app.get_str(key);
+        // Fall back to the first option when unset or holding a stale value.
+        let selected = options.iter().position(|o| *o == current).unwrap_or(0);
+        let mut idx = selected;
+
+        egui::ComboBox::from_id_source(key)
+            .selected_text(options[selected])
+            .show_ui(ui, |ui| {
+                for (i, opt) in options.iter().enumerate() {
+                    ui.selectable_value(&mut idx, i, *opt);
+                }
+            });
+
+        if idx != selected {
+            app.set_str(key, options[idx]);
         }
     });
 }
@@ -1392,6 +1865,9 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
         app.set_value(&fields_path, toml::Value::Array(serialized));
     }
 
+    ui.add_space(8.0);
+    custom_oled_preview(ui, app, base, &rows);
+
     // Last API response — collapsible panel below the fields so users can
     // see the raw JSON returned by their endpoint (and verify which paths
     // to fill into the fields above).
@@ -1414,6 +1890,345 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     });
             });
     }
+}
+
+fn draw_oled_canvas(ui: &mut egui::Ui, draw_fn: impl FnOnce(&egui::Painter, egui::Rect, f32)) {
+    ui.label("Live OLED preview");
+    let scale = 3.0_f32;
+    let size = egui::vec2(128.0 * scale, 40.0 * scale);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, egui::Color32::BLACK);
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
+    );
+    draw_fn(&painter, rect, scale);
+}
+
+fn custom_oled_preview(ui: &mut egui::Ui, app: &App, base: &str, rows: &[FieldRow]) {
+    let provider_name = base.rsplit('.').next().unwrap_or("custom");
+    let show_header = app
+        .get_value(&format!("{base}.show_header"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    draw_oled_canvas(ui, |painter, rect, scale| {
+        let mut y = 0_i32;
+        if show_header {
+            draw_preview_text(
+                painter,
+                rect,
+                provider_name.to_uppercase().as_str(),
+                0,
+                y,
+                SizeCls::Large,
+                false,
+                scale,
+            );
+            y += 12;
+        } else {
+            y = 2;
+        }
+
+        let Some(values) = preview_values_from_last_response(app, rows) else {
+            draw_preview_text(
+                painter,
+                rect,
+                "NO DATA",
+                38,
+                if show_header { 14 } else { 12 },
+                SizeCls::XLarge,
+                false,
+                scale,
+            );
+            return;
+        };
+
+        let mut plan: Vec<(usize, i32)> = Vec::new();
+        let mut taken_rows = [false; 6];
+        let mut next_auto_y = y;
+
+        for (idx, row) in rows.iter().enumerate() {
+            if idx >= values.len() || (!row.label_visible && !row.value_visible) {
+                continue;
+            }
+            let char_w = preview_char_w(&row.size);
+            let line_h = preview_line_h(&row.size);
+            let row_y = match row.row {
+                Some(slot) if slot < taken_rows.len() && !taken_rows[slot] => {
+                    taken_rows[slot] = true;
+                    let target = match row.size {
+                        SizeCls::XLarge => slot as i32 * 18,
+                        SizeCls::Large => slot as i32 * 14,
+                        SizeCls::Medium => slot as i32 * 8,
+                        SizeCls::Small => slot as i32 * 6,
+                    };
+                    target.max(y)
+                }
+                _ => {
+                    let t = next_auto_y;
+                    let (label, value) = &values[idx];
+                    let label_text = if row.label_visible && !label.is_empty() {
+                        format!("{label}:")
+                    } else {
+                        String::new()
+                    };
+                    let label_w = char_w * label_text.chars().count() as i32;
+                    let reserved_left = if label_text.is_empty() {
+                        0
+                    } else {
+                        label_w + 4
+                    };
+                    let avail_w = (128 - reserved_left).max(8);
+                    let max_lines = if t < 40 {
+                        (((40 - t) / line_h) as usize).min(3)
+                    } else {
+                        0
+                    };
+                    let lines = if value.is_empty() || max_lines == 0 {
+                        1
+                    } else {
+                        preview_wrap_text(value, avail_w, char_w, max_lines).len()
+                    };
+                    next_auto_y += (lines as i32) * line_h;
+                    t
+                }
+            };
+            plan.push((idx, row_y));
+        }
+
+        for (idx, row_y) in plan {
+            let row = &rows[idx];
+            let (label, value) = &values[idx];
+            let char_w = preview_char_w(&row.size);
+            let line_h = preview_line_h(&row.size);
+            let label_text = if row.label_visible && !label.is_empty() {
+                format!("{label}:")
+            } else {
+                String::new()
+            };
+            let text = if row.value_visible {
+                value.clone()
+            } else {
+                String::new()
+            };
+            let label_w = char_w * label_text.chars().count() as i32;
+            let reserved_left = if label_text.is_empty() {
+                0
+            } else {
+                label_w + 4
+            };
+            let avail_w = (128 - reserved_left).max(8);
+            let max_lines = if row_y < 40 {
+                (((40 - row_y) / line_h) as usize).min(3)
+            } else {
+                0
+            };
+            let wrapped = if text.is_empty() {
+                vec![String::new()]
+            } else if row.row.is_none() && max_lines > 0 {
+                preview_wrap_text(&text, avail_w, char_w, max_lines)
+            } else {
+                let take = (avail_w / char_w).max(0) as usize;
+                vec![text.chars().take(take).collect()]
+            };
+            let first_w = wrapped
+                .first()
+                .map(|line| char_w * line.chars().count() as i32)
+                .unwrap_or(0);
+            let total_w = reserved_left + first_w;
+            let x_offset = match row.align {
+                Align::Left => 0,
+                Align::Center => (128 - total_w).max(0) / 2,
+                Align::Right => 128 - total_w,
+            };
+            if !label_text.is_empty() {
+                draw_preview_text(
+                    painter,
+                    rect,
+                    &label_text,
+                    x_offset,
+                    row_y,
+                    row.size.clone(),
+                    row.bold,
+                    scale,
+                );
+            }
+            let value_x = if label_text.is_empty() {
+                x_offset
+            } else {
+                x_offset + label_w + 4
+            };
+            for (line_idx, line) in wrapped.iter().enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let y_pos = row_y + (line_idx as i32) * line_h;
+                if y_pos + line_h > 40 {
+                    break;
+                }
+                draw_preview_text(
+                    painter,
+                    rect,
+                    line,
+                    value_x,
+                    y_pos,
+                    row.size.clone(),
+                    row.bold,
+                    scale,
+                );
+            }
+        }
+    });
+}
+
+fn preview_values_from_last_response(
+    app: &App,
+    rows: &[FieldRow],
+) -> Option<Vec<(String, String)>> {
+    let body = app.api_preview.as_ref()?;
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mut values = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|row| row.label_visible || row.value_visible)
+    {
+        let label = row.effective_label();
+        let value = if row.path.trim().is_empty() {
+            "—".to_string()
+        } else {
+            preview_get_path(&json, row.path.trim())
+                .map(preview_value_to_string)
+                .unwrap_or_else(|| "—".to_string())
+        };
+        values.push((label, value));
+    }
+    Some(values)
+}
+
+fn preview_get_path<'a>(json: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = json;
+    for seg in path.split('.') {
+        if seg.is_empty() {
+            continue;
+        }
+        if let Some((key, idx)) = seg.split_once('[') {
+            if !key.is_empty() {
+                cur = cur.get(key.trim_end_matches('['))?;
+            }
+            let idx: usize = idx.trim_end_matches(']').parse().ok()?;
+            cur = cur.get(idx)?;
+        } else {
+            cur = cur.get(seg)?;
+        }
+    }
+    Some(cur)
+}
+
+fn preview_value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn preview_char_w(size: &SizeCls) -> i32 {
+    match size {
+        SizeCls::Small => 4,
+        SizeCls::Medium => 5,
+        SizeCls::Large => 6,
+        SizeCls::XLarge => 8,
+    }
+}
+
+fn preview_line_h(size: &SizeCls) -> i32 {
+    match size {
+        SizeCls::XLarge => preview_char_w(size) + 6,
+        _ => preview_char_w(size) + 2,
+    }
+}
+
+fn preview_font_size(size: &SizeCls, scale: f32) -> f32 {
+    match size {
+        SizeCls::Small => 5.0 * scale,
+        SizeCls::Medium => 6.0 * scale,
+        SizeCls::Large => 8.0 * scale,
+        SizeCls::XLarge => 10.0 * scale,
+    }
+}
+
+fn draw_preview_text(
+    painter: &egui::Painter,
+    panel: egui::Rect,
+    text: &str,
+    x: i32,
+    y: i32,
+    size: SizeCls,
+    bold: bool,
+    scale: f32,
+) {
+    let pos = panel.left_top() + egui::vec2(x as f32 * scale, y as f32 * scale);
+    let font = egui::FontId::monospace(preview_font_size(&size, scale));
+    let color = egui::Color32::WHITE;
+    painter.text(pos, egui::Align2::LEFT_TOP, text, font.clone(), color);
+    if bold {
+        painter.text(
+            pos + egui::vec2(scale, 0.0),
+            egui::Align2::LEFT_TOP,
+            text,
+            font,
+            color,
+        );
+    }
+}
+
+fn preview_wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return vec![];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let max_chars = (max_px / char_w).max(1) as usize;
+    let mut lines = Vec::new();
+    let mut remaining = text.to_string();
+    while lines.len() < max_lines {
+        if remaining.chars().count() <= max_chars {
+            lines.push(remaining);
+            return lines;
+        }
+        let mut prefix_end_byte = remaining.len();
+        for (i, (byte_idx, _ch)) in remaining.char_indices().enumerate() {
+            if i == max_chars {
+                prefix_end_byte = byte_idx;
+                break;
+            }
+        }
+        let prefix = &remaining[..prefix_end_byte];
+        let split_chars = match prefix.rfind(' ') {
+            Some(byte_idx) if byte_idx > 0 => prefix[..byte_idx].chars().count(),
+            _ => max_chars,
+        };
+        let first: String = remaining.chars().take(split_chars).collect();
+        remaining = remaining
+            .chars()
+            .skip(split_chars)
+            .collect::<String>()
+            .trim_start()
+            .to_string();
+        if first.is_empty() {
+            break;
+        }
+        lines.push(first);
+    }
+    if !remaining.is_empty() {
+        let take = max_chars.saturating_sub(1);
+        let truncated: String = remaining.chars().take(take).collect();
+        lines.push(format!("{truncated}…"));
+    }
+    lines
 }
 
 /// Walk a JSON value and produce (path, label) suggestions for leaf scalars.

@@ -5,6 +5,8 @@ pub enum Command {
     /// Pin the current provider: no auto-rotation countdown. / and * still
     /// move between providers while staying locked.
     LockSource,
+    /// Toggle pinned-provider state.
+    ToggleLockSource,
     /// Return to normal auto-rotation.
     UnlockSource,
     Shutdown,

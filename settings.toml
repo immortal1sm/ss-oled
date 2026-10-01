@@ -15,6 +15,13 @@ refresh = 30
 # The clock lives on the system tray already, so it gets only a quick glance.
 # clock = 5
 
+[hotkeys]
+# Global shortcuts. Edit these in apex-gui's Hotkeys tab or here directly.
+# Set any value to an empty string to disable that shortcut.
+next = "Ctrl+Shift+Numpad /"
+previous = "Ctrl+Shift+Numpad *"
+lock_toggle = "Ctrl+Shift+Numpad -"
+
 [clock]
 enabled = true
 priority = 3                  # shown last in the rotation order

@@ -2,6 +2,11 @@
 # will have compiled files and executables
 debug/
 target/
+# `target` may be a SYMLINK to an out-of-tree build dir (e.g.
+# ../apex-tux-upstream.bak/target). The `target/` pattern above only matches a
+# real directory, so the symlink needs its own rule — otherwise it gets
+# committed and the pushed repo carries a broken link.
+/target
 
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
@@ -15,3 +20,8 @@ Cargo.lock
 .idea/
 .env
 .hermes/
+
+# Dead experiment: a C++ KGlobalAccel helper written while investigating
+# Wayland hotkey registration. Not referenced by Cargo, any systemd unit, or
+# scripts/ss-oled — the native-Rust path in apex-input supersedes it.
+apex-hotkeys/
