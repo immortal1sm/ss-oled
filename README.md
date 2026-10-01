@@ -10,9 +10,9 @@ heads-up display** that reacts to your system in real time.
 
 ---
 
-## What\'s on screen
+## What's on screen
 
-Seven providers rotate automatically (dwell times configurable per provider):
+Eight providers rotate automatically (dwell times configurable per provider):
 
 | Provider | Dwell | Content |
 |---|---|---|
@@ -21,12 +21,53 @@ Seven providers rotate automatically (dwell times configurable per provider):
 | **Image** | 5s | Your own GIF/logo with Floyd–Steinberg dithering so multi-tone images keep their shades on the 1-bit panel |
 | **Weather** | 10s | Big °C temp, condition label, precipitation %, animated icon (spinning sun rays, rain, lightning, snow, fog, drifting clouds) |
 | **Forecast** | 30s | Next 5 days with slide transition between pages, hi/lo temps, weekday labels |
+| **Lyrics** | 5s | Synchronized lyrics for the current track, line by line |
 | **Clock** | 5s | 12h/24h configurable |
 | **Custom** (HTTP-JSON) | per-provider | User-defined HTTP endpoints rendered with configurable fields |
 
+## Lyrics
+
+Shows the current lyric line for whatever MPRIS player is active, advancing in
+sync with playback. Independent of the MPRIS2 provider — you can disable or
+reorder either one freely.
+
+```toml
+[providers.lyrics]
+enabled = true
+priority = 6
+source = "auto"      # auto | local | lrclib
+font = "auto"        # auto | S | M | L | XL
+align = "L"          # L | C | R
+bold = false
+show_title = false   # track title above the lyric
+```
+
+Dwell time comes from `[interval]` — `interval.lyrics = 5`, or the global
+`interval.refresh`. It is *not* read from inside `[providers.lyrics]`.
+
+**Where lyrics come from**, in order: a `.lrc` file sitting next to a local track,
+then [lrclib.net](https://lrclib.net/) — an exact match on title/artist/album plus
+track length, falling back to a metadata search and then a title-only search.
+Results are cached under `~/.cache/apex-tux/lyrics/`, so repeats, restarts and
+offline playback all work without another request.
+
+**Sizing.** `font = "auto"` picks the largest size the line fits: XLarge (up to
+3 lines) for short lyrics, Large (up to 5) for longer ones. XLarge's nominal
+capacity is 48 characters, but wrapping breaks on word boundaries and wastes the
+rest of each line, so it steps down well before that — which is why almost
+nothing renders clipped. Anything that still exceeds its size ends with `>`.
+
+Set a specific size (`S`/`M`/`L`/`XL`) to pin it; note that pinning bypasses the
+auto-fit, so a long line will be clipped.
+
+`show_title = true` draws the track title at XLarge above the lyric, wrapping to a
+second line rather than cutting it off. On a 40px panel a wrapped title leaves
+room for about one lyric line.
+
 ## Hotkeys
 
-Default combos use **Ctrl+Shift** + numpad keys and can be changed in the GUI's Hotkeys tab:
+Default combos use **Ctrl+Shift** + numpad keys and can be changed in the GUI's
+Hotkeys tab:
 
 | Keys | Action |
 |---|---|
@@ -34,7 +75,14 @@ Default combos use **Ctrl+Shift** + numpad keys and can be changed in the GUI's 
 | `Ctrl+Shift+Numpad *` | Previous provider |
 | `Ctrl+Shift+Numpad -` | Toggle lock/unlock — pins or releases the current screen |
 
-Moving between providers while locked keeps the lock — you choose what stays. Use the GUI Hotkeys tab to record a new combo or clear a shortcut entirely.
+Moving between providers while locked keeps the lock — you choose what stays.
+Use the GUI Hotkeys tab to record a new combo or clear a shortcut entirely.
+
+> **Recording numpad keys:** the GUI's Record button cannot tell a numpad key from
+> its top-row twin, so tick the **Numpad** checkbox next to a hotkey before
+> recording. Without it the binding is written as a top-row key, which on some
+> keyboards never reaches the panel. You can also type the binding by hand —
+> `Numpad1` and `Numpad 1` both parse.
 
 ## Weather data
 
@@ -167,8 +215,14 @@ sudo apt install cargo rustc libusb-1.0-0-dev libdbus-1-dev
 ```bash
 git clone https://github.com/immortal1sm/ss-oled.git
 cd ss-oled
-cargo build --release --features sysinfo,image,weather,hotkeys,custom
+cargo build --release --features sysinfo,image,weather,hotkeys,custom,lyrics
 ```
+
+> **Build all providers.** The feature list above is not additive by default —
+> `--features sysinfo` alone builds *only* sysinfo. If you omit a provider's
+> feature it is silently absent at runtime (its section in `settings.toml` is
+> ignored), which looks like a config problem rather than a build one. Omitting
+> flags also shrinks the binary and drops features you didn't intend to lose.
 
 This produces three binaries in `target/release/`:
 - `apex-tux` — the daemon (talks to the keyboard)
@@ -261,7 +315,8 @@ Carried over from upstream, plus this fork\'s own roadmap:
   kernel HID, and the network — the codebase contains no X11/Wayland calls, and
   the release binary doesn\'t even link libX11.
 - [x] More providers — GIFs ✅ (image provider + FS dithering), Weather/Forecast ✅,
-  Custom HTTP-JSON provider ✅
+  Custom HTTP-JSON provider ✅, synchronized lyrics ✅ (lrclib + local .lrc,
+  on-disk cache)
 - [ ] More providers — Games?
 - [ ] Switch the USB crate to something async instead *(upstream tracks hidapi-rs#51; `nusb` is the likely successor)*
 - [x] ~~Add documentation on how to add custom providers~~ — [docs/PROVIDERS.md](docs/PROVIDERS.md)
