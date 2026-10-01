@@ -14,6 +14,7 @@ refresh = 30
 # Per-provider overrides (optional). Lower values = shorter dwell.
 # The clock lives on the system tray already, so it gets only a quick glance.
 # clock = 5
+# lyrics = 5                # lyrics flash by; mpris2 lingers
 
 [hotkeys]
 # Global shortcuts. Edit these in apex-gui's Hotkeys tab or here directly.
@@ -21,6 +22,17 @@ refresh = 30
 next = "Ctrl+Shift+Numpad /"
 previous = "Ctrl+Shift+Numpad *"
 lock_toggle = "Ctrl+Shift+Numpad -"
+
+[providers.lyrics]
+# Synchronized lyrics for the current MPRIS track. Independent of the mpris2
+# provider above — enable, disable, or reorder either one freely.
+enabled = true
+priority = 6
+source = "auto"            # auto | local | lrclib
+font = "auto"              # auto | S | M | L | XL — auto picks the largest that fits
+align = "L"                # L | C | R
+bold = false
+show_title = false         # track title above the lyric
 
 [clock]
 enabled = true
