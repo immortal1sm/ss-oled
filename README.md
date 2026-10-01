@@ -26,16 +26,15 @@ Seven providers rotate automatically (dwell times configurable per provider):
 
 ## Hotkeys
 
-All combos use **Ctrl+Shift** + numpad keys:
+Default combos use **Ctrl+Shift** + numpad keys and can be changed in the GUI's Hotkeys tab:
 
 | Keys | Action |
 |---|---|
 | `Ctrl+Shift+Numpad /` | Next provider |
 | `Ctrl+Shift+Numpad *` | Previous provider |
-| `Ctrl+Shift+Numpad -` | Lock — pins the current screen absolutely: no rotation, no media-event jumps |
-| `Ctrl+Shift+Numpad +` | Unlock — resumes auto-rotation and event reactions |
+| `Ctrl+Shift+Numpad -` | Toggle lock/unlock — pins or releases the current screen |
 
-Moving between providers while locked keeps the lock — you choose what stays.
+Moving between providers while locked keeps the lock — you choose what stays. Use the GUI Hotkeys tab to record a new combo or clear a shortcut entirely.
 
 ## Weather data
 
@@ -67,7 +66,7 @@ stays on screen).
 ## Custom JSON providers
 
 A general-purpose HTTP+JSON provider engine — point it at any endpoint,
-declare which fields to show, and it renders them. No code changes required.
+declare which fields to show, preview the 128×40 layout in the GUI, and it renders them. No code changes required.
 
 ```toml
 [providers.custom.joke]
@@ -270,15 +269,15 @@ Carried over from upstream, plus this fork\'s own roadmap:
 - [ ] Add support for more notifications
 
 **ss-oled roadmap:**
-- [x] **GUI + Tray suite** ✅ — schema-driven config editor, drag-rearrange
-  providers, live API Test button, embedded city geocoding search,
+- [x] **GUI + Tray suite** ✅ — config editor, drag-rearrange providers,
+  live API Test button, embedded city geocoding search, Hotkeys tab,
   spawn-on-demand lifecycle, IPC-over-Unix-socket daemon control
 - [x] **Custom JSON-API provider engine** ✅ — generic HTTP poll, JSON-path
   resolution, per-field layout (alignment, size, row, bold), word-wrap,
-  NO DATA placeholders
+  live 128×40 GUI preview, NO DATA placeholders
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
-- [ ] **Rebindable hotkeys** — current Ctrl+Shift+Numpad combos are hardcoded;
-  a Hotkeys tab in the GUI would let users remap (next/prev/lock) to any combo
+- [x] **Rebindable hotkeys** — GUI Hotkeys tab records settings-backed mappings
+  for next, previous, and lock/unlock toggle; shortcuts can also be cleared
 - [ ] Package for Arch (AUR) / Flatpak
 - [ ] Demote diagnostic INFO logs in the focus path to DEBUG

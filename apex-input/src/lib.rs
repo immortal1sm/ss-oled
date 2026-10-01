@@ -2,5 +2,5 @@
 mod hotkey;
 mod input;
 #[cfg(feature = "hotkeys")]
-pub use hotkey::InputManager;
+pub use hotkey::{HotkeyBindings, InputManager};
 pub use input::Command;

@@ -218,6 +218,14 @@ fn config_schema() -> Vec<crate::config_schema::ConfigField> {
 The GUI renders forms generically from these declarations — no GUI-side code
 needed for third-party providers. (See docs/DESIGN.md.)
 
+## Custom-provider GUI preview
+
+For `[providers.custom.<name>]` entries, `apex-gui` includes a live 128×40 OLED
+preview below the fields table. Click **Test** to fetch the endpoint, then edit
+labels, visibility, alignment, size, row slots, and bold state; the preview uses
+the last response to show the expected layout before saving or applying the
+config.
+
 ## Testing without hardware
 
 Build with the simulator feature to preview frames in a window instead of

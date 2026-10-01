@@ -122,6 +122,14 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             }
         }
 
+        // Optional lyrics provider, configured via [providers.lyrics].
+        #[cfg(feature = "lyrics")]
+        {
+            if let Some(p) = crate::providers::lyrics::from_config(&config)? {
+                providers.push(Box::new(p));
+            }
+        }
+
         #[cfg(target_os = "macos")]
         let mut providers = [
             crate::providers::clock::PROVIDER_INIT(&mut config)?,
@@ -258,6 +266,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         // rotation tick so the jump isn't undone by an already-elapsed dwell.
         let mut suppress_next_rotation = false;
         loop {
+            provider_locked = ipc_locked.load(Ordering::SeqCst);
             tokio::select! {
                 cmd = rx.recv() => {
                     //update the last time the screen was updated to now
@@ -267,6 +276,10 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                         Ok(Command::NextSource) => {
                             let new = current.load(Ordering::SeqCst).wrapping_add(1) % size;
                             current.store(new, Ordering::SeqCst);
+                            log::info!(
+                                "Provider switched via hotkey: {}",
+                                provider_names.get(new).map(String::as_str).unwrap_or("?")
+                            );
                             self.device.clear().await?;
                         },
                         Ok(Command::PreviousSource) => {
@@ -275,11 +288,16 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                 n => (n - 1) % size
                             };
                             current.store(new, Ordering::SeqCst);
+                            log::info!(
+                                "Provider switched via hotkey: {}",
+                                provider_names.get(new).map(String::as_str).unwrap_or("?")
+                            );
                             self.device.clear().await?;
                         },
                         Ok(Command::LockSource) => {
                             if !provider_locked {
                                 provider_locked = true;
+                                ipc_locked.store(true, Ordering::SeqCst);
                                 log::info!(
                                     "Provider LOCKED on '{}' — auto-rotation suspended",
                                     provider_names
@@ -289,9 +307,28 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                 );
                             }
                         },
+                        Ok(Command::ToggleLockSource) => {
+                            provider_locked = !provider_locked;
+                            ipc_locked.store(provider_locked, Ordering::SeqCst);
+                            if provider_locked {
+                                log::info!(
+                                    "Provider LOCKED on '{}' — auto-rotation suspended",
+                                    provider_names
+                                        .get(current.load(Ordering::SeqCst))
+                                        .map(String::as_str)
+                                        .unwrap_or("?")
+                                );
+                            } else {
+                                // Restart the dwell from now so unlock doesn't
+                                // instantly rotate away.
+                                *time_last_change.lock().unwrap() = Instant::now();
+                                log::info!("Provider UNLOCKED — auto-rotation resumed");
+                            }
+                        },
                         Ok(Command::UnlockSource) => {
                             if provider_locked {
                                 provider_locked = false;
+                                ipc_locked.store(false, Ordering::SeqCst);
                                 // Restart the dwell from now so unlock doesn't
                                 // instantly rotate away.
                                 *time_last_change.lock().unwrap() = Instant::now();

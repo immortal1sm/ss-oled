@@ -143,7 +143,8 @@ impl Tray for SsOledTray {
                     // Plasma session defaults.
                     let mut cmd = std::process::Command::new("sh");
                     cmd.arg("-c").arg(
-                        "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui >/dev/null 2>&1 &",
+                        "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui \
+                         >/dev/null 2>&1 &",
                     );
                     let have_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
                         || std::env::var_os("DISPLAY").is_some();
