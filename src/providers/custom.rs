@@ -74,6 +74,11 @@ struct Field {
     row: Option<usize>,
     /// Render the text with a faux-bold double-strike at +1px X.
     bold: bool,
+    /// Nudge this field up (negative) or down (positive), in pixels. Applied
+    /// after the row is resolved. Mirrors `notifications.lines.*.dy`, so a tall
+    /// glyph that starts a couple of rows below its cell top can be lined up
+    /// with a smaller neighbour.
+    dy: i32,
 }
 
 /// A single custom provider instance.
@@ -186,7 +191,10 @@ fn fetch_values(
 /// last word boundary within each line; falls back to character-level
 /// split when no space fits. Returns fewer lines if the text wraps to
 /// fewer than `max_lines`. Returns one entry per line.
-fn wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> Vec<String> {
+///
+/// Public so the notification renderer can wrap its body the same way —
+/// two independent wrap implementations drift apart on edge cases.
+pub fn wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> Vec<String> {
     if max_lines == 0 {
         return vec![];
     }
@@ -393,7 +401,11 @@ impl CustomProvider {
                     t
                 }
             };
-            plan.push((idx, row_y));
+            // Apply the per-field vertical nudge LAST, after the row/auto-pack
+            // has resolved, so it shifts the rendered text without disturbing
+            // the packing cursor (which must keep advancing by real heights or
+            // later fields collide).
+            plan.push((idx, row_y + f.dy));
         }
 
         for (row_idx, row_y) in plan {
@@ -646,6 +658,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         let mut size = FieldSize::Medium;
         let mut row: Option<usize> = None;
         let mut bold = false;
+        let mut dy: i32 = 0;
         let (base, layout) = match spec.split_once('|') {
             Some((b, l)) => (b, l),
             None => (spec.as_str(), ""),
@@ -672,10 +685,16 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
                     }
                     "r" => row = v.parse::<usize>().ok(),
                     "b" => bold = matches!(v, "1" | "true" | "yes" | "on"),
+                    // Signed: `d=-2` nudges up, `d=2` nudges down.
+                    "d" => dy = v.parse::<i32>().unwrap_or(0),
                     _ => {}
                 }
             }
         }
+        // TRIM first: splitting on `|` leaves `"path: Label "` with a trailing
+        // space, so `strip_suffix('!')` would never match and a hidden value
+        // would silently reappear on any field carrying layout metadata.
+        let base = base.trim_end();
         let (spec, show_value) = match base.strip_suffix('!') {
             Some(p) => (p.to_string(), false),
             None => (base.to_string(), true),
@@ -700,6 +719,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
             size,
             row,
             bold,
+            dy,
         });
     }
 
@@ -716,4 +736,59 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         show_header,
         values: Arc::new(Mutex::new(Vec::new())),
     }))
+}
+
+
+#[cfg(test)]
+mod dy_tests {
+    use super::*;
+
+    fn build_with(field_spec: &str) -> CustomProvider {
+        // This `config` version has no Config::builder(), so parse the TOML
+        // directly and use `Config::new`.
+        let toml_src = format!(
+            r#"
+[providers.custom.t]
+enabled = true
+source = "https://example.com/x.json"
+fields = ["{field_spec}"]
+"#
+        );
+        // Same pattern main.rs uses for the daemon's config load.
+        let mut cfg = Config::default();
+        cfg.merge(config::File::from_str(
+            &toml_src,
+            config::FileFormat::Toml,
+        ))
+        .expect("config merge");
+        from_config_section("t", &cfg)
+            .expect("parse")
+            .expect("enabled")
+    }
+
+    /// `d=` must reach the Field through the real config parser, and default to
+    /// 0 when absent so existing fields are unaffected.
+    #[test]
+    fn field_dy_parses_from_spec() {
+        assert_eq!(build_with("a.b: -").fields[0].dy, 0);
+        assert_eq!(build_with("a.b: - | d=-3").fields[0].dy, -3);
+        assert_eq!(build_with("a.b: - | d=4").fields[0].dy, 4);
+        // Alongside other layout keys.
+        let f = build_with("a.b: - | s=L r=2 b=1 d=-2");
+        assert_eq!(f.fields[0].dy, -2);
+        assert_eq!(f.fields[0].row, Some(2));
+        assert!(f.fields[0].bold);
+        // A malformed value must not panic the parser.
+        assert_eq!(build_with("a.b: - | d=xyz").fields[0].dy, 0);
+    }
+
+    /// A hidden value must survive a layout suffix. Before the trim fix,
+    /// splitting on `|` left a trailing space and `strip_suffix('!')` silently
+    /// failed, so `!` was ignored on any field carrying layout metadata.
+    #[test]
+    fn hidden_value_survives_layout_suffix() {
+        assert!(!build_with("a.b: Lbl! | d=2").fields[0].show_value);
+        assert!(!build_with("a.b: Lbl! | s=L").fields[0].show_value);
+        assert!(build_with("a.b: Lbl").fields[0].show_value);
+    }
 }
