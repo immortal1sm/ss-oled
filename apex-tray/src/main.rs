@@ -35,7 +35,7 @@ struct SsOledTray {
     socket_path: PathBuf,
     locked: Arc<std::sync::atomic::AtomicBool>,
     current_provider: Arc<Mutex<String>>,
-    providers: Vec<String>,
+    providers: Arc<Mutex<Vec<String>>>,
 }
 
 impl SsOledTray {
@@ -76,6 +76,35 @@ impl Tray for SsOledTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items: Vec<MenuItem<Self>> = vec![];
 
+        // Next / previous provider. The daemon has always accepted `next` and
+        // `prev` over IPC; these entries expose it from the tray the same way
+        // the hotkeys do. Disabled when there is nothing to switch between.
+        let multi_provider = self.providers.lock().unwrap().len() > 1;
+        items.push(
+            StandardItem {
+                label: "Next provider".into(),
+                enabled: multi_provider,
+                activate: Box::new(|tray: &mut Self| {
+                    tray.send_and_refresh("next");
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Previous provider".into(),
+                enabled: multi_provider,
+                activate: Box::new(|tray: &mut Self| {
+                    tray.send_and_refresh("prev");
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        items.push(MenuItem::Separator);
+
         // Lock toggle
         items.push(
             CheckmarkItem {
@@ -97,6 +126,8 @@ impl Tray for SsOledTray {
         // Provider submenu
         let submenu: Vec<MenuItem<Self>> = self
             .providers
+            .lock()
+            .unwrap()
             .iter()
             .map(|p| {
                 let name = p.clone();
@@ -220,13 +251,26 @@ async fn main() -> Result<()> {
         socket_path: socket_path.clone(),
         locked: Arc::new(std::sync::atomic::AtomicBool::new(locked_state)),
         current_provider: Arc::new(Mutex::new(current)),
-        providers,
+        providers: Arc::new(Mutex::new(providers)),
     };
 
     // Poll status every 3s to keep the title in sync with external changes
     // (hotkeys pressed on the keyboard, other clients).
+    // Clone the shared state out of `tray` BEFORE it moves into the service
+    // (`ksni::Handle::model` is private, so it cannot be read back later).
     let poll_locked = Arc::clone(&tray.locked);
     let poll_current = Arc::clone(&tray.current_provider);
+    let poll_providers = Arc::clone(&tray.providers);
+
+    let service = ksni::TrayService::new(tray);
+    // Grab the handle before `spawn` consumes the service.
+    let handle = service.state();
+    service.spawn();
+
+    // The SNI menu is cached DBus-side; ksni only rebuilds it when asked. The
+    // poll loop mutates shared state, which is NOT enough on its own — without
+    // `Handle::update` the checkmark keeps showing whatever was true when the
+    // menu was first built.
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(3));
         loop {
@@ -235,14 +279,49 @@ async fn main() -> Result<()> {
                 let mut it = status.split_whitespace();
                 let state = it.next() == Some("locked");
                 let name = it.next().unwrap_or("?").to_string();
-                poll_locked.store(state, std::sync::atomic::Ordering::SeqCst);
-                *poll_current.lock().unwrap() = name;
+                let prev = poll_locked.swap(state, std::sync::atomic::Ordering::SeqCst);
+                let mut changed = false;
+                if prev != state {
+                    eprintln!("apex-tray: lock state {prev} -> {state} (via poll)");
+                    changed = true;
+                }
+                {
+                    let mut cur = poll_current.lock().unwrap();
+                    if *cur != name {
+                        *cur = name;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    // Mutating the atomics is NOT enough: the SNI menu is
+                    // cached on the DBus side and only rebuilt when ksni is
+                    // told to update. Without this the checkmark keeps showing
+                    // whatever was true when the menu was first built.
+                    handle.update(|_| ());
+                }
+            }
+            // The provider list is NOT static: enabling, disabling, adding or
+            // removing one in the GUI changes what the daemon reports, and the
+            // daemon only re-reads the config on restart. Without this the
+            // dropdown stays frozen at whatever it saw at startup.
+            if let Ok(list) = ipc("providers", &socket_path) {
+                let fresh: Vec<String> =
+                    list.split_whitespace().map(String::from).collect();
+                let mut guard = poll_providers.lock().unwrap();
+                if *guard != fresh {
+                    eprintln!(
+                        "apex-tray: provider list changed ({} -> {}): {:?}",
+                        guard.len(),
+                        fresh.len(),
+                        fresh
+                    );
+                    *guard = fresh;
+                    drop(guard);
+                    handle.update(|_| ());
+                }
             }
         }
     });
-
-    let service = ksni::TrayService::new(tray);
-    service.spawn();
 
     // Park forever.
     loop {
