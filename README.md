@@ -139,11 +139,70 @@ fields = [
 | `| s=S/M/L/X` | Font size (4×6 / 5×7 / 6×10 / 8×13) |
 | `| r=0..5` | Explicit y-slot on the 40px panel |
 | `| b=1` | Faux-bold double-strike |
+| `| d=-10..10` | Nudge the row up (negative) or down (positive), in pixels |
 
 The daemon handles fetching on a configurable interval, JSON-path resolution,
 word-wrap onto multiple lines, and a "NO DATA" placeholder while waiting
 for the first fetch. The GUI adds a live **Test** endpoint button and an
 auto-fill suggestion pass over the response.
+
+`r` picks a y-slot; `d` then nudges that slot, which is how you line up a
+field whose glyphs start a couple of pixels below the row's top edge (an `X`
+size next to an `M` size, say). Add as many `[providers.custom.<name>]`
+sections as you like — each is an independent screen.
+
+## Notifications
+
+Desktop notifications from any application are rendered on the panel and
+interrupt the rotation. The sending app's requested timeout is honoured
+(`notify-send -t 10` displays for about 10 seconds); when an app doesn't ask for
+one, `default_duration` applies.
+
+```toml
+[notifications]
+override = true          # show immediately, even while a provider is locked
+default_duration = 5     # fallback when the app doesn't request a duration
+show_timer = true        # draw the countdown indicator
+
+[notifications.lines.app]
+shown = true
+size = "s"
+align = "left"
+row = 1
+
+[notifications.lines.title]
+shown = true
+size = "xl"
+align = "center"
+row = 10
+dy = -2                  # nudge this line up 2px
+
+[notifications.lines.content]
+shown = true
+size = "m"
+align = "left"
+row = 20
+wrap = true              # use the space below instead of truncating
+```
+
+Each line is configured independently, so a centred title above a left-aligned
+body is just a matter of two entries. Sizes use the same ladder as custom
+providers (`S`/`M`/`L`/`XL`). `row = 0` auto-packs below the previous line; `dy`
+nudges the resolved row and is useful for lining up a tall font next to a small
+one. `wrap` applies to the body only — the title scrolls horizontally instead,
+and gets as long as it needs to.
+
+The countdown is a 1px progress frame around the panel edge, so it occupies no
+interior space and the body can use the full width. Set `timer_border = false`
+for a corner ring instead, which reserves a small area in the bottom-right that
+text is kept clear of.
+
+With `override = false` a notification waits in a one-slot queue and appears
+when the current screen's dwell expires, without advancing the rotation.
+`override = true` takes the highest priority and displays even while the
+provider list is locked.
+
+Notifications are currently text-only — app icons are not rendered.
 
 ## Configuration GUI + system tray
 
@@ -162,6 +221,11 @@ The tray (`apex-tray`, `ksni`-based) lets you:
 - **Open settings…** — launch `apex-gui`
 - **Provider switching** — jump to any enabled provider
 - **Lock toggle** — same behavior as `Ctrl+Shift+Numpad -`
+
+The tray re-reads the daemon every few seconds, so the provider list and the
+lock checkmark stay in step with hotkeys and GUI changes without a restart.
+Note that the daemon only re-reads `settings.toml` when it starts: enabling a
+provider in the GUI needs `ss-oled restart` before it appears in the tray.
 - **Restart service** — apply config changes without killing the GUI
 - **Quit suite** — shuts down daemon + tray + GUI cleanly
 
@@ -321,15 +385,19 @@ Carried over from upstream, plus this fork\'s own roadmap:
 - [ ] Switch the USB crate to something async instead *(upstream tracks hidapi-rs#51; `nusb` is the likely successor)*
 - [x] ~~Add documentation on how to add custom providers~~ — [docs/PROVIDERS.md](docs/PROVIDERS.md)
 - [ ] Switch from GATs to async traits once they\'re stable
-- [ ] Add support for more notifications
+- [ ] Render app icons on notifications
 
 **ss-oled roadmap:**
 - [x] **GUI + Tray suite** ✅ — config editor, drag-rearrange providers,
   live API Test button, embedded city geocoding search, Hotkeys tab,
   spawn-on-demand lifecycle, IPC-over-Unix-socket daemon control
 - [x] **Custom JSON-API provider engine** ✅ — generic HTTP poll, JSON-path
-  resolution, per-field layout (alignment, size, row, bold), word-wrap,
-  live 128×40 GUI preview, NO DATA placeholders
+  resolution, per-field layout (alignment, size, row, bold, vertical nudge),
+  word-wrap, live 128×40 GUI preview, NO DATA placeholders; any number of
+  independent API screens
+- [x] **Desktop notifications** ✅ — any app's notifications rendered on the
+  panel with the sender's requested duration, per-line layout (size, alignment,
+  row, nudge, wrap), override-or-queue toggle, edge-frame countdown
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
 - [x] **Rebindable hotkeys** — GUI Hotkeys tab records settings-backed mappings
