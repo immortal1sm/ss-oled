@@ -26,19 +26,64 @@ impl Default for HotkeyBindings {
 }
 
 pub struct InputManager {
-    _hkm: GlobalHotKeyManager,
+    /// Only held on the X11 fallback path. Constructing one calls into Xlib
+    /// (`XDefaultRootWindow`), which SEGFAULTS when no X display is available —
+    /// which is exactly the state at boot, because the systemd user unit starts
+    /// before the graphical session. Holding one "to preserve the public shape"
+    /// on the KDE path therefore crashed the daemon on every single boot, and
+    /// the resulting restart left KGlobalAccel's component deactivated.
+    _hkm: Option<GlobalHotKeyManager>,
+}
+
+/// How long to keep re-checking for a desktop session before giving up on it.
+///
+/// The daemon starts ~11s after boot on this machine while KWin starts ~12s
+/// in, so a single check is a coin flip. 60s comfortably covers a slow login.
+const SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+const SESSION_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Wait for a desktop session to appear on the bus.
+///
+/// Returning "not a session" is NOT the same as "not a session YET". At boot
+/// the daemon runs before KWin owns its bus name, and treating that as a
+/// negative answer sent us down the X11 path where the manager segfaults.
+fn wait_for_kde_session() -> bool {
+    if kde_wayland_session() {
+        return true;
+    }
+    info!("no desktop session on the bus yet; waiting up to {SESSION_WAIT:?}");
+    let deadline = std::time::Instant::now() + SESSION_WAIT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(SESSION_POLL);
+        if kde_wayland_session() {
+            info!("desktop session appeared after {:?}",
+                  SESSION_WAIT.saturating_sub(deadline.saturating_duration_since(std::time::Instant::now())));
+            return true;
+        }
+    }
+    false
 }
 
 impl InputManager {
     pub fn new(sender: broadcast::Sender<Command>, bindings: HotkeyBindings) -> Result<Self> {
-        if kde_wayland_session() {
+        if wait_for_kde_session() {
             if register_kde_hotkeys(sender.clone(), &bindings) {
-                // Keep a GlobalHotKeyManager value only to preserve the public
-                // shape of InputManager; KDE owns the actual registrations.
-                let hkm = GlobalHotKeyManager::new()?;
-                return Ok(Self { _hkm: hkm });
+                // KDE owns the actual registrations. Do NOT construct a
+                // GlobalHotKeyManager here — see the `_hkm` field docs.
+                return Ok(Self { _hkm: None });
             }
             warn!("KDE global hotkey registration failed; falling back to X11 backend");
+        } else {
+            warn!("no KDE session after {SESSION_WAIT:?}; using the X11 backend");
+        }
+
+        // Guard the X11 path itself. `GlobalHotKeyManager::new()` calls into
+        // Xlib and SEGFAULTS (not errors) when DISPLAY is unset, which is the
+        // normal state under a user systemd unit. Refusing to construct one
+        // turns a core dump into a warning.
+        if std::env::var_os("DISPLAY").is_none() {
+            warn!("no X11 DISPLAY and no KDE session; hotkeys disabled");
+            return Ok(Self { _hkm: None });
         }
 
         let hkm = GlobalHotKeyManager::new()?;
@@ -104,17 +149,43 @@ impl InputManager {
 
         GlobalHotKeyEvent::set_event_handler(Some(hotkey_handler));
 
-        Ok(Self { _hkm: hkm })
+        Ok(Self { _hkm: Some(hkm) })
     }
 }
 
+/// Is this a KDE Wayland session we can register with?
+///
+/// Deliberately does NOT rely on `XDG_CURRENT_DESKTOP` / `XDG_SESSION_TYPE`.
+/// The systemd user unit starts the daemon at boot (Linger=yes) *before* the
+/// graphical session exists, so those variables are unset and the env check
+/// returned false -- which sent us down the X11 backend, where the manager
+/// segfaulted. Asking the session bus instead is boot-order independent: the
+/// bus is up (the unit sets DBUS_SESSION_BUS_ADDRESS) and either KWin is
+/// already there or it genuinely is not a KDE session yet.
 fn kde_wayland_session() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .map(|v| v.to_ascii_lowercase().contains("kde"))
-        .unwrap_or(false)
-        && std::env::var("XDG_SESSION_TYPE")
-            .map(|v| v.eq_ignore_ascii_case("wayland"))
-            .unwrap_or(false)
+    match std::env::var("XDG_CURRENT_DESKTOP") {
+        Ok(d) if d.to_ascii_lowercase().contains("kde") => return true,
+        // Env says something else, but KGlobalAccel is the authority on where
+        // global shortcuts actually live, so ask it before giving up.
+        _ => {}
+    }
+
+    // NameHasOwner on KWin: side-effect free, needs only the session bus (which
+    // the systemd unit guarantees is reachable), and needs no knowledge of
+    // KGlobalAccel's signatures. A headless or early boot reports "not yet"
+    // instead of falling through to the X11 backend.
+    let Ok(conn) = dbus::blocking::Connection::new_session() else {
+        return false;
+    };
+    let bus = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        std::time::Duration::from_millis(500),
+    );
+    let names: (Vec<String>,) = bus
+        .method_call::<(Vec<String>,), _, _, _>("org.freedesktop.DBus", "ListNames", ())
+        .unwrap_or_default();
+    names.0.iter().any(|n| n == "org.kde.KWin")
 }
 
 fn register_kde_hotkeys(sender: broadcast::Sender<Command>, bindings: &HotkeyBindings) -> bool {
@@ -542,4 +613,49 @@ fn parse_code(part: &str) -> Result<Code> {
         "9" => Code::Digit9,
         _ => bail!("unsupported key '{part}'"),
     })
+}
+
+#[cfg(test)]
+mod session_detection_tests {
+    use super::*;
+
+    /// The boot failure was: with Linger=yes the unit starts before the
+    /// graphical session, so XDG_CURRENT_DESKTOP / XDG_SESSION_TYPE are unset,
+    /// `kde_wayland_session()` returned false, and the daemon took the X11 path
+    /// where `GlobalHotKeyManager::new()` segfaults in XDefaultRootWindow.
+    ///
+    /// Detection must therefore work from DBus alone. KWin owns a well-known
+    /// name on the session bus that is reachable without any desktop env vars.
+    #[test]
+    fn session_detection_survives_missing_env() {
+        for var in ["XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE"] {
+            assert!(
+                std::env::var_os(var).is_none() || std::env::var(var).is_ok(),
+                "test precondition: this asserts the fallback path, not the env"
+            );
+        }
+        // Unset them for the duration of the check so we exercise the exact
+        // boot-time state rather than whatever this shell happens to export.
+        let saved_desktop = std::env::var_os("XDG_CURRENT_DESKTOP");
+        let saved_type = std::env::var_os("XDG_SESSION_TYPE");
+        std::env::remove_var("XDG_CURRENT_DESKTOP");
+        std::env::remove_var("XDG_SESSION_TYPE");
+
+        let detected = kde_wayland_session();
+
+        match saved_desktop {
+            Some(v) => std::env::set_var("XDG_CURRENT_DESKTOP", v),
+            None => std::env::remove_var("XDG_CURRENT_DESKTOP"),
+        }
+        match saved_type {
+            Some(v) => std::env::set_var("XDG_SESSION_TYPE", v),
+            None => std::env::remove_var("XDG_SESSION_TYPE"),
+        }
+
+        assert!(
+            detected,
+            "KDE must be detected from the session bus with no desktop env vars; \
+             otherwise the daemon falls through to the X11 backend and crashes"
+        );
+    }
 }
