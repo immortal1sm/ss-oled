@@ -34,6 +34,11 @@ struct App {
     providers: Vec<String>,
     /// Currently selected provider (drives the right-hand settings panel).
     selected: Option<String>,
+    /// Working text for the custom-provider rename field. Kept out of the TOML
+    /// doc so typing never rewrites the file on its own.
+    rename_buffer: Option<String>,
+    /// Custom provider awaiting confirmation before deletion, if any.
+    pending_remove: Option<String>,
     /// Row being dragged (index), persists across frames while held.
     drag_from: Option<usize>,
     /// Row currently hovered as drop target during drag.
@@ -102,6 +107,8 @@ impl App {
             doc,
             providers: Vec::new(),
             selected: None,
+            rename_buffer: None,
+            pending_remove: None,
             drag_from: None,
             drag_over: None,
             city_query: String::new(),
@@ -233,6 +240,24 @@ impl App {
         }
 
         list.sort_by_key(|(_, prio)| *prio);
+        // A provider can match more than one scan: `[providers.lyrics]` is
+        // found by the sibling scan, and a stray top-level `[lyrics]` (written
+        // by an older build's sync_priorities) is found by the top-level scan.
+        // That produced two identical sidebar rows that both resolved to the
+        // same `selected` name, so neither could be clicked distinctly. Keep the
+        // first (lowest priority) entry per name.
+        let mut seen: Vec<String> = Vec::new();
+        list.retain(|(name, _)| {
+            if seen.iter().any(|n| n == name) {
+                // apex-gui has no logging backend; stderr matches its
+                // existing "apex-gui: loaded ..." startup line.
+                eprintln!("apex-gui: duplicate provider '{name}' ignored (check config for a stray section)");
+                false
+            } else {
+                seen.push(name.clone());
+                true
+            }
+        });
         // 'forecast' merged into 'weather' - hide obsolete section from GUI.
         self.providers = list
             .into_iter()
@@ -397,7 +422,108 @@ impl App {
         self.status = "Testing API…".into();
     }
 
-    /// Collect finished API test results (non-blocking).
+    /// Buffered text for the custom-provider rename field. Kept out of the
+    /// TOML doc so typing never rewrites the file.
+    fn doc_has_custom(&self, name: &str) -> bool {
+        self.doc
+            .get("providers")
+            .and_then(|p| p.get("custom"))
+            .and_then(|c| c.get(name))
+            .is_some()
+    }
+
+    /// Rename `[providers.custom.<from>]` to `[providers.custom.<to>]`.
+    ///
+    /// TOML has no rename, so the table is moved and its `interval.<from>`
+    /// dwell entry follows it — otherwise the renamed provider silently falls
+    /// back to the global refresh interval.
+    fn rename_custom(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        if self.doc_has_custom(to) {
+            return Err(anyhow::anyhow!("'{to}' already exists"));
+        }
+        if let Some(custom) = self
+            .doc
+            .get_mut("providers")
+            .and_then(|p| p.get_mut("custom"))
+            .and_then(|c| c.as_table_mut())
+        {
+            if let Some(tbl) = custom.remove(from) {
+                custom.insert(to.to_string(), tbl);
+            }
+        }
+        if let Some(iv) = self
+            .doc
+            .get_mut("interval")
+            .and_then(|i| i.as_table_mut())
+        {
+            if let Some(v) = iv.remove(from) {
+                iv.insert(to.to_string(), v);
+            }
+        }
+        self.save()
+    }
+
+    /// Delete `[providers.custom.<name>]` and its dwell entry.
+    fn remove_custom(&mut self, name: &str) -> anyhow::Result<()> {
+        if let Some(custom) = self
+            .doc
+            .get_mut("providers")
+            .and_then(|p| p.get_mut("custom"))
+            .and_then(|c| c.as_table_mut())
+        {
+            custom.remove(name);
+        }
+        if let Some(iv) = self
+            .doc
+            .get_mut("interval")
+            .and_then(|i| i.as_table_mut())
+        {
+            iv.remove(name);
+        }
+        self.save()
+    }
+
+    /// Append a new `[providers.custom.<name>]` section with sane defaults,
+    /// so a new JSON-API screen only needs its URL and field paths.
+    fn add_custom(&mut self, name: &str) -> anyhow::Result<()> {
+        if name.trim().is_empty() || self.doc_has_custom(name) {
+            return Err(anyhow::anyhow!("empty or duplicate name"));
+        }
+        let mut tbl = toml::Table::new();
+        tbl.insert("enabled".into(), toml::Value::Boolean(true));
+        tbl.insert("fields".into(), toml::Value::Array(vec![toml::Value::String(
+            "[0].value".into(),
+        )]));
+        tbl.insert("interval".into(), toml::Value::Integer(30));
+        tbl.insert("poll".into(), toml::Value::Integer(300));
+        tbl.insert("priority".into(), toml::Value::Integer(5));
+        tbl.insert("show_header".into(), toml::Value::Boolean(true));
+        tbl.insert(
+            "source".into(),
+            toml::Value::String("https://example.com/api/data.json".into()),
+        );
+        if let Some(custom) = self
+            .doc
+            .get_mut("providers")
+            .and_then(|p| p.get_mut("custom"))
+            .and_then(|c| c.as_table_mut())
+        {
+            custom.insert(name.to_string(), toml::Value::Table(tbl));
+        }
+        self.save()
+    }
+
+    /// Add a custom JSON-API provider. Returns the new section name.
+    fn add_custom_unique(&mut self, base: &str) -> anyhow::Result<String> {
+        let mut candidate = base.to_string();
+        let mut n = 1;
+        while self.doc_has_custom(&candidate) {
+            candidate = format!("{base}{n}");
+            n += 1;
+        }
+        self.add_custom(&candidate)?;
+        Ok(candidate)
+    }
     fn take_api_result(&mut self) -> Option<Result<String, String>> {
         let rx = self.api_test.as_mut()?;
         match rx.try_recv() {
@@ -455,6 +581,26 @@ impl eframe::App for App {
                 ui.label("Drag up/down to reorder");
                 ui.add_space(6.0);
 
+                // Add a custom JSON-API provider. The section is created with
+                // defaults and selected immediately, so the user only has to
+                // fill in the URL and field paths on the right.
+                if ui
+                    .button("+ Add custom (API)")
+                    .on_hover_text("Create a new custom JSON-API provider section")
+                    .clicked()
+                {
+                    match self.add_custom_unique("custom") {
+                        Ok(new_name) => {
+                            self.selected = Some(new_name.clone());
+                            self.rename_buffer = None;
+                            self.refresh_provider_list();
+                            self.status = format!("Added custom provider '{new_name}'");
+                        }
+                        Err(e) => self.status = format!("Add failed: {e}"),
+                    }
+                }
+
+
                 egui::ScrollArea::vertical()
                     .id_source("provider_list")
                     .max_height(panel_h)
@@ -467,15 +613,24 @@ impl eframe::App for App {
                                 || self.drag_from == Some(idx);
 
                             let row = ui.horizontal(|ui| {
-                                // Custom providers nest under providers.custom.<name>.
-                                let is_custom = self
-                                    .doc
-                                    .get("providers")
+                                // A provider's config path depends on where its
+                                // section lives: top-level (`[sysinfo]`),
+                                // custom (`[providers.custom.<name>]`), or a
+                                // nested provider (`[providers.<name>]`, e.g.
+                                // lyrics). Guessing "custom or top-level"
+                                // wrote `lyrics.enabled` at the top level,
+                                // creating a stray section that then showed up
+                                // as a second, unclickable sidebar row.
+                                let providers = self.doc.get("providers");
+                                let is_custom = providers
                                     .and_then(|p| p.get("custom"))
                                     .and_then(|c| c.get(&name))
                                     .is_some();
+                                let is_nested = providers.and_then(|p| p.get(&name)).is_some();
                                 let enabled_key = if is_custom {
                                     format!("providers.custom.{name}.enabled")
+                                } else if is_nested {
+                                    format!("providers.{name}.enabled")
                                 } else {
                                     format!("{name}.enabled")
                                 };
@@ -498,6 +653,7 @@ impl eframe::App for App {
                                 let hitbox = ui.interact(hb, row_id, egui::Sense::click_and_drag());
                                 if hitbox.clicked() {
                                     self.selected = Some(name.clone());
+                    self.pending_remove = None;
                                 }
                                 if hitbox.drag_started() {
                                     self.drag_from = Some(idx);
@@ -554,16 +710,26 @@ impl eframe::App for App {
                 {
                     self.selected = Some("__hotkeys".to_string());
                 }
+
+                // Desktop-notification behaviour. Not a provider, so it gets a
+                // synthetic sidebar entry like Hotkeys — there is no
+                // `[notifications]` provider section to hang it off.
+                if ui
+                    .selectable_label(self.selected.as_deref() == Some("__notifications"), "Notifications")
+                    .clicked()
+                {
+                    self.selected = Some("__notifications".to_string());
+                }
             });
 
         // ---------- CENTER: selected provider settings ----------
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.selected.clone() {
                 Some(name) => {
-                    let title = if name == "__hotkeys" {
-                        "Hotkeys"
-                    } else {
-                        name.as_str()
+                    let title = match name.as_str() {
+                        "__hotkeys" => "Hotkeys",
+                        "__notifications" => "Notifications",
+                        _ => name.as_str(),
                     };
                     ui.heading(title);
                     ui.separator();
@@ -646,7 +812,9 @@ impl eframe::App for App {
 }
 
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
-    if name == "__hotkeys" {
+    if name == "__notifications" {
+        notifications_editor(ui, app);
+    } else if name == "__hotkeys" {
         hotkeys_editor(ui, app);
         return;
     }
@@ -922,6 +1090,142 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             ui.label("(no extra options)");
         }
     }
+}
+
+/// Settings for desktop notifications.
+///
+/// Lives in a `[notifications]` table, read by the scheduler and the
+/// notification renderer rather than by a provider.
+fn notifications_editor(ui: &mut egui::Ui, app: &mut App) {
+    toggle(
+        ui,
+        app,
+        "notifications.override",
+        "Show immediately (override rotation)",
+    );
+
+    ui.horizontal(|ui| {
+        ui.label("Duration (s):");
+        let mut d = app.get_int("notifications.default_duration").max(1);
+        if ui
+            .add(egui::DragValue::new(&mut d).clamp_range(1..=60))
+            .changed()
+        {
+            app.set_int("notifications.default_duration", d);
+        }
+        ui.label("fallback when the app doesn't ask for a duration");
+    });
+
+    ui.separator();
+    ui.label("Layout");
+    notif_line_editor(ui, app, "app", "App:");
+    notif_line_editor(ui, app, "title", "Title:");
+    notif_line_editor(ui, app, "content", "Body:");
+    ui.horizontal(|ui| {
+        toggle(ui, app, "notifications.show_timer", "Countdown ring");
+        toggle(
+            ui,
+            app,
+            "notifications.timer_border",
+            "Edge frame (else corner ring)",
+        );
+    });
+    ui.label("row 0 = auto (packs below the previous line).");
+    ui.label("dy nudges a line up or down. The edge frame leaves the whole panel free; the corner ring reserves space.");
+
+    ui.label("Restart the daemon for changes to take effect.");
+}
+
+/// Per-line editor for one notification text part.
+fn notif_line_editor(ui: &mut egui::Ui, app: &mut App, part: &str, label: &str) {
+    let base = format!("notifications.lines.{part}");
+
+    ui.horizontal(|ui| {
+        ui.label(label);
+        // The app line is opt-in, so its fallback is off; title/body are on.
+        let fallback = part == "title" || part == "content";
+        let mut shown = app
+            .get_value(&format!("{base}.shown"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(fallback);
+        if ui.checkbox(&mut shown, "").changed() {
+            app.set_bool(&format!("{base}.shown"), shown);
+        }
+
+        let default_size = match part {
+            "title" => "l",
+            _ => "m",
+        };
+        let mut size = app.get_str(&format!("{base}.size"));
+        if size.is_empty() {
+            size = default_size.into();
+        }
+        egui::ComboBox::from_label(format!("{label} size"))
+            .selected_text(size.to_uppercase())
+            .show_ui(ui, |ui| {
+                for (val, name) in [("s", "S"), ("m", "M"), ("l", "L"), ("xl", "XL")] {
+                    ui.selectable_value(&mut size, val.to_string(), name);
+                }
+            });
+        if size != default_size {
+            app.set_value(&format!("{base}.size"), toml::Value::String(size));
+        }
+
+        let mut align = app.get_str(&format!("{base}.align"));
+        if align.is_empty() {
+            align = "left".into();
+        }
+        egui::ComboBox::from_label(format!("{label} align"))
+            .selected_text(align.clone())
+            .show_ui(ui, |ui| {
+                for opt in ["left", "center", "right"] {
+                    ui.selectable_value(&mut align, opt.to_string(), opt);
+                }
+            });
+        if align != "left" {
+            app.set_value(&format!("{base}.align"), toml::Value::String(align));
+        }
+
+        ui.label("row:");
+        let mut row = app.get_int(&format!("{base}.row"));
+        if ui
+            .add(egui::DragValue::new(&mut row).clamp_range(0..=38))
+            .changed()
+        {
+            app.set_int(&format!("{base}.row"), row);
+        }
+
+        ui.label("dy:");
+        let mut dy = app.get_int(&format!("{base}.dy"));
+        if ui
+            .add(egui::DragValue::new(&mut dy).clamp_range(-10..=10))
+            .on_hover_text("Nudge this line up or down, in pixels")
+            .changed()
+        {
+            app.set_int(&format!("{base}.dy"), dy);
+        }
+
+        // Only the body wraps; the title scrolls horizontally instead.
+        if part == "content" {
+            let mut wrap = app.get_bool(&format!("{base}.wrap"));
+            if ui
+                .checkbox(&mut wrap, "wrap")
+                .on_hover_text("Wrap onto more lines using the space below")
+                .changed()
+            {
+                app.set_bool(&format!("{base}.wrap"), wrap);
+            }
+        }
+
+        let mut bold = app.get_bool(&format!("{base}.bold"));
+        if ui
+            .checkbox(&mut bold, "bold")
+            .on_hover_text("Bold")
+            .changed()
+        {
+            app.set_bool(&format!("{base}.bold"), bold);
+        }
+    });
 }
 
 fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
@@ -1308,6 +1612,73 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     });
     ui.add_space(4.0);
 
+    // Rename / remove. Both rewrite the `[providers.custom.<name>]` table
+    // itself, so they need the whole TOML document rather than a single key —
+    // set_bool/set_value can only touch one leaf at a time.
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        app.rename_buffer.get_or_insert_with(|| name.to_string());
+        ui.text_edit_singleline(app.rename_buffer.as_mut().unwrap())
+            .on_hover_text("Rename this custom provider");
+
+        // Read the candidate out of the buffer before calling &self methods:
+        // the buffer borrow would otherwise conflict with them.
+        let candidate = app.rename_buffer.clone().unwrap_or_default();
+        let target = candidate.trim().to_string();
+        let clashes = app.doc_has_custom(&target);
+        let can_rename = !target.is_empty() && target != name && !clashes;
+
+        if ui
+            .add_enabled(can_rename, egui::Button::new("Rename"))
+            .on_hover_text(if clashes {
+                "A custom provider with that name already exists"
+            } else {
+                "Rename the section in settings.toml"
+            })
+            .clicked()
+        {
+            match app.rename_custom(name, &target) {
+                Ok(()) => {
+                    app.refresh_provider_list();
+                    app.status = format!("Renamed '{name}' to '{target}'");
+                    app.rename_buffer = None;
+                    app.selected = Some(target);
+                }
+                Err(e) => app.status = format!("Rename failed: {e}"),
+            }
+        }
+
+        // Deleting drops a whole config section, so it is two-step: the first
+        // click arms a confirm, the second deletes. Any other selection or a
+        // rename cancels it.
+        if app.pending_remove.as_deref() == Some(name) {
+            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), "Delete?");
+            if ui.button("Confirm delete").clicked() {
+                match app.remove_custom(name) {
+                    Ok(()) => {
+                        // The sidebar list is derived from the TOML doc;
+                        // without this the row survives until restart.
+                        app.refresh_provider_list();
+                        app.selected = None;
+                        app.rename_buffer = None;
+                        app.pending_remove = None;
+                        app.status = format!("Removed custom provider '{name}'");
+                    }
+                    Err(e) => app.status = format!("Remove failed: {e}"),
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                app.pending_remove = None;
+            }
+        } else if ui
+            .add(egui::Button::new("Remove"))
+            .on_hover_text("Delete this custom provider from settings.toml")
+            .clicked()
+        {
+            app.pending_remove = Some(name.to_string());
+        }
+    });
+
     // Enabled state lives in the sidebar checkbox; no duplicate here.
     ui.horizontal(|ui| {
         let mut hdr = app
@@ -1409,7 +1780,7 @@ fn text_field_multiline_ok(app: &mut App, ui: &mut egui::Ui, path: &str) {
     });
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Align {
     Left,
     Center,
@@ -1442,7 +1813,7 @@ impl Align {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SizeCls {
     Small,
     Medium,
@@ -1491,6 +1862,9 @@ struct FieldRow {
     row: Option<usize>,
     /// Render with a faux-bold double-strike.
     bold: bool,
+    /// Vertical nudge in pixels; negative moves up. Mirrors
+    /// `notifications.lines.*.dy`.
+    dy: i32,
 }
 
 impl FieldRow {
@@ -1510,6 +1884,7 @@ impl FieldRow {
         let mut size = SizeCls::Medium;
         let mut row: Option<usize> = None;
         let mut bold = false;
+        let mut dy: i32 = 0;
         let (head, layout) = match s.split_once('|') {
             Some((h, l)) => (h, l),
             None => (s, ""),
@@ -1521,12 +1896,18 @@ impl FieldRow {
                     "s" => size = SizeCls::parse(v).unwrap_or(SizeCls::Medium),
                     "r" => row = v.parse::<usize>().ok(),
                     "b" => bold = matches!(v, "1" | "true" | "yes" | "on"),
+                    // Signed: `d=-2` nudges up, `d=2` nudges down.
+                    "d" => dy = v.parse::<i32>().unwrap_or(0),
                     _ => {}
                 }
             }
         }
-        // Strip trailing `!` for value visibility.
-        let (head, value_visible) = if let Some(stripped) = head.strip_suffix('!') {
+        // Strip trailing `!` for value visibility. The TRIM matters: splitting
+        // on `|` leaves `"path: Label "` with a trailing space, so without it
+        // `strip_suffix('!')` never matches and a hidden value silently
+        // reappears on any field that also carries layout metadata.
+        let head_trimmed = head.trim_end();
+        let (head, value_visible) = if let Some(stripped) = head_trimmed.strip_suffix('!') {
             (stripped, false)
         } else {
             (head, true)
@@ -1561,6 +1942,7 @@ impl FieldRow {
             size,
             row,
             bold,
+            dy,
         }
     }
 
@@ -1613,7 +1995,7 @@ impl FieldRow {
         }
     }
 
-    /// Build the trailing "a=… s=… r=…" string for non-default layout
+    /// Build the trailing "a=… s=… r=… b=… d=…" string for non-default layout
     /// values. Empty string means "all defaults; don't write metadata".
     fn layout_suffix(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
@@ -1628,6 +2010,9 @@ impl FieldRow {
         }
         if self.bold {
             parts.push("b=1".to_string());
+        }
+        if self.dy != 0 {
+            parts.push(format!("d={}", self.dy));
         }
         parts.join(" ")
     }
@@ -1743,6 +2128,24 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     };
                     changed = true;
                 }
+
+                // Vertical nudge: negative moves up, positive down. A
+                // DragValue keeps this consistent with the notification
+                // panel's `dy` and stops the free-text box silently discarding
+                // anything that isn't a plain integer.
+                let mut dy = row.dy;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut dy)
+                            .clamp_range(-10..=10)
+                            .speed(0.25),
+                    )
+                    .on_hover_text("Nudge this field up (negative) or down (positive), in pixels")
+                    .changed()
+                {
+                    row.dy = dy;
+                    changed = true;
+                }
             });
 
             // Column 5: drag handle — sole drag initiator.
@@ -1801,6 +2204,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                 size: SizeCls::Medium,
                 row: None,
                 bold: false,
+                dy: 0,
             });
             changed = true;
         }
@@ -1816,6 +2220,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     size: SizeCls::Medium,
                     row: None,
                     bold: false,
+                    dy: 0,
                 }));
                 changed = true;
             }
@@ -2327,11 +2732,80 @@ fn main() -> Result<()> {
     let app = App::load(path)?;
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 620.0])
-            .with_min_inner_size([820.0, 540.0])
+            .with_inner_size([1020.0, 660.0])
+            .with_min_inner_size([1000.0, 560.0])
             .with_title("ss-oled settings"),
         ..Default::default()
     };
     eframe::run_native("ss-oled settings", native, Box::new(|_cc| Box::new(app)))
         .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}
+
+#[cfg(test)]
+mod field_spec_tests {
+    use super::*;
+
+    /// The fields entry is a serialized format that the GUI re-parses every
+    /// frame, so parse -> serialize must be lossless. A round-trip that flips a
+    /// bool or drops `dy` makes a control look non-functional the moment the
+    /// user types in it.
+    #[test]
+    fn field_spec_roundtrip_preserves_dy() {
+        for dy in [-10, -2, -1, 0, 1, 2, 10] {
+            let base = "[0].temperature_2m";
+            let mut row = FieldRow::parse(&format!("{base} | d={dy}"));
+            assert_eq!(row.dy, dy, "parse lost dy={dy}");
+            let mut row = row;
+            let out = row.to_toml_string();
+            let again = FieldRow::parse(&out);
+            assert_eq!(again.dy, dy, "round-trip changed dy={dy} (spec={out})");
+            assert_eq!(again.path, base, "round-trip changed path");
+        }
+    }
+
+    #[test]
+    fn field_spec_roundtrip_preserves_all_layout() {
+        // NB: the size token is `X` for XL, not `XL` — that is the format.
+        let spec = "[0].value: Label | a=C s=X r=2 b=1 d=-3";
+        let mut row = FieldRow::parse(spec);
+        assert_eq!(row.align, Align::Center);
+        assert_eq!(row.size, SizeCls::XLarge);
+        assert_eq!(row.row, Some(2));
+        assert!(row.bold);
+        assert_eq!(row.dy, -3);
+        let mut row = row;
+        let again = FieldRow::parse(&row.to_toml_string());
+        assert_eq!(again.align, row.align);
+        assert_eq!(again.size, row.size);
+        assert_eq!(again.row, row.row);
+        assert_eq!(again.bold, row.bold);
+        assert_eq!(again.dy, row.dy);
+        assert_eq!(again.label, row.label);
+        assert_eq!(again.label_visible, row.label_visible);
+        assert_eq!(again.value_visible, row.value_visible);
+    }
+
+    /// A default field must serialize with NO layout suffix, so legacy entries
+    /// stay byte-identical and untouched configs are not rewritten.
+    #[test]
+    fn field_spec_default_has_no_layout_suffix() {
+        let mut row = FieldRow::parse("[0].title: My Label");
+        assert_eq!(row.dy, 0);
+        assert_eq!(row.to_toml_string(), "[0].title: My Label");
+    }
+
+    /// `dy` must survive alongside the visibility encodings, which are the
+    /// part of this format that historically corrupted on round-trip.
+    #[test]
+    fn field_spec_roundtrip_with_hidden_value() {
+        let spec = "[0].v: Lbl! | d=2";
+        let row = FieldRow::parse(spec);
+        assert!(!row.value_visible);
+        assert_eq!(row.dy, 2);
+        let mut row = row;
+        let mut row = row;
+        let again = FieldRow::parse(&row.to_toml_string());
+        assert!(!again.value_visible, "value_visible flipped");
+        assert_eq!(again.dy, 2);
+    }
 }
