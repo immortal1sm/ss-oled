@@ -234,9 +234,22 @@ impl Scrollable {
             let max = (min + self.projection.width).min((n + 1) * self.canvas.width);
             // First draw until we would overflow in the current line
             for i in min..max {
+                // Two independent bounds must hold, and the CANVAS read is the
+                // one that panics first: `i` is derived from the projection and
+                // can run past `canvas.len()` when the projection is wider than
+                // the rendered text (or positioned near the panel edge).
+                // `BitSlice` indexing panics rather than clipping, so guard the
+                // read before indexing and the write before pushing.
+                if i as usize >= self.canvas.canvas.len() {
+                    continue;
+                }
                 let coord = Point::new((i - min) as i32, n as i32);
                 let color = self.canvas.canvas[i as usize];
-                pixels.push(Pixel(self.position + coord, BinaryColor::from(color)));
+                let pt = self.position + coord;
+                if pt.x < 0 || pt.y < 0 || pt.x >= 128 || pt.y >= 40 {
+                    continue;
+                }
+                pixels.push(Pixel(pt, BinaryColor::from(color)));
             }
 
             // We've reached the end and need to render something from the start
@@ -256,7 +269,11 @@ impl Scrollable {
                     );
                     if (i as usize) < self.canvas.canvas.len() {
                         let color = self.canvas.canvas[i as usize];
-                        pixels.push(Pixel(self.position + coord, BinaryColor::from(color)));
+                        let pt = self.position + coord;
+                        if pt.x < 0 || pt.y < 0 || pt.x >= 128 || pt.y >= 40 {
+                            continue;
+                        }
+                        pixels.push(Pixel(pt, BinaryColor::from(color)));
                     }
                 }
             }
