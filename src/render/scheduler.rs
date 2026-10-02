@@ -81,6 +81,37 @@ impl<T: ContentProvider> ContentWrapper for T {
     }
 }
 
+/// Resolve a per-provider setting from wherever that provider's section lives.
+///
+/// A provider's config path depends on its layout, and the GUI writes to the
+/// matching location:
+///
+/// - `[sysinfo]`            → `sysinfo.<key>`
+/// - `[providers.lyrics]`   → `providers.<name>.<key>`
+/// - `[providers.custom.x]` → `providers.custom.<name>.<key>`
+///
+/// Looking only at the top level made every nested provider invisible: the GUI
+/// would show lyrics first while the daemon, finding no `lyrics.priority`,
+/// defaulted it to 99 and sorted it last.
+///
+/// Most specific section wins, so a custom provider's own settings are never
+/// shadowed by a same-named top-level section.
+fn provider_setting(config: &Config, name: &str, key: &str) -> Option<config::Value> {
+    for section in [
+        format!("providers.custom.{name}"),
+        format!("providers.{name}"),
+        name.to_string(),
+    ] {
+        if let Ok(tbl) = config.get_table(&section) {
+            if let Some(v) = tbl.get(key) {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Scheduler for provider rotation and notifications.
 pub struct Scheduler<'a, T: AsyncDevice + 'a> {
     device: T,
     _marker: PhantomData<&'a T>,
@@ -180,12 +211,14 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             .iter_mut()
             .map(|i| (i.provider_name(), i.proxy_stream()))
             .filter(|(name, _)| {
-                let key = format!("{name}.enabled");
-                config.get_bool(&key).unwrap_or(true)
+                provider_setting(&config, name, "enabled")
+                    .and_then(|v| v.clone().into_bool().ok())
+                    .unwrap_or(true)
             })
             .map(|(name, i)| {
-                let key = format!("{name}.priority");
-                let prio = config.get_int(&key).unwrap_or(99i64);
+                let prio = provider_setting(&config, name, "priority")
+                    .and_then(|v| v.clone().into_int().ok())
+                    .unwrap_or(99i64);
                 (name.to_string(), i, prio)
             })
             .sorted_by_key(|(_, _, prio)| *prio)
@@ -265,6 +298,15 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         // Set when a focus jump just happened: skip the immediately following
         // rotation tick so the jump isn't undone by an already-elapsed dwell.
         let mut suppress_next_rotation = false;
+        // `notifications.override` decides whether an incoming notification
+        // interrupts the rotation (true, default) or waits for the current
+        // provider's dwell to expire (false).
+        let notif_override = config
+            .get_bool("notifications.override")
+            .unwrap_or(true);
+        log::info!("notifications.override = {notif_override}");
+        // One-slot queue for the non-override path; newest wins.
+        let mut pending_notification: Option<Notification> = None;
         loop {
             provider_locked = ipc_locked.load(Ordering::SeqCst);
             tokio::select! {
@@ -339,10 +381,30 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                     }
                 },
                 notification = notifications.next(), if !notifications.is_empty() => {
-                    if let Some(Ok(mut notification)) = notification {
-                        let mut stream = Box::pin(notification.stream()?);
-                        while let Some(display) = stream.next().await {
-                            self.device.draw(&display?).await?;
+                    if let Some(notification) = notification {
+                        match notification {
+                            Ok(mut notification) => {
+                                if notif_override {
+                                    // Interrupt the rotation and show it now.
+                                    // A lock suspends auto-rotation, not this:
+                                    // with `override = true` a notification has
+                                    // the highest priority and is shown even
+                                    // while the provider list is locked.
+                                    log::info!("Notification received — displaying (override)");
+                                    let mut stream = Box::pin(notification.stream()?);
+                                    while let Some(display) = stream.next().await {
+                                        self.device.draw(&display?).await?;
+                                    }
+                                    log::info!("Notification display finished; resuming rotation");
+                                } else {
+                                    // Queued: hold it until the current
+                                    // provider's dwell expires, then show it
+                                    // without advancing the rotation.
+                                    log::info!("Notification received — queued for next rotation");
+                                    pending_notification = Some(notification);
+                                }
+                            }
+                            Err(e) => log::warn!("Notification stream error: {e}"),
                         }
                     }
                 }
@@ -458,14 +520,26 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                         if interval_secs > 0
                             && elapsed_time > Duration::from_secs(interval_secs)
                         {
-                            log::info!(
-                                "Rotation timer: rotating from {} (idx {}) after {}s (limit {}s)",
-                                active_name,
-                                active_idx,
-                                elapsed_time.as_secs(),
-                                interval_secs
-                            );
-                            let _ = tx.send(Command::NextSource);
+                            // A queued notification takes this slot instead of
+                            // a rotation, so it is shown without advancing the
+                            // provider list.
+                            if let Some(mut queued) = pending_notification.take() {
+                                log::info!("Showing queued notification before rotation");
+                                let mut stream = Box::pin(queued.stream()?);
+                                while let Some(display) = stream.next().await {
+                                    self.device.draw(&display?).await?;
+                                }
+                                log::info!("Queued notification finished");
+                            } else {
+                                log::info!(
+                                    "Rotation timer: rotating from {} (idx {}) after {}s (limit {}s)",
+                                    active_name,
+                                    active_idx,
+                                    elapsed_time.as_secs(),
+                                    interval_secs
+                                );
+                                let _ = tx.send(Command::NextSource);
+                            }
                         }
                     }
                 }
