@@ -210,18 +210,32 @@ fn draw_block(
 
         // Take the next chunk, preferring a word boundary.
         let remaining = chars.len() - offset;
+        // `broke_on_space` records that `take` landed ON a delimiter. That
+        // space has already been used as the split point, so the next line
+        // must start AFTER it — otherwise the continuation begins with a
+        // leading space and sits one column right of the line above it.
+        let mut broke_on_space = false;
         let take = if remaining <= max_chars {
             remaining
         } else {
             let window: String = chars[offset..offset + max_chars].iter().collect();
             match window.rfind(' ') {
-                Some(pos) if pos > 0 => pos,
+                Some(pos) if pos > 0 => {
+                    broke_on_space = true;
+                    pos
+                }
                 // No space: hard split so we never loop forever.
                 _ => max_chars,
             }
         };
         let mut chunk: String = chars[offset..offset + take].iter().collect();
         offset += take;
+        if broke_on_space {
+            // Consume exactly one delimiter, and never run past the end.
+            while offset < chars.len() && chars[offset] == ' ' {
+                offset += 1;
+            }
+        }
         let had_more = offset < chars.len();
 
         if had_more && line_idx + 1 == max_lines {
@@ -542,17 +556,35 @@ impl LyricsProvider {
                 // Fall back to the track title so the panel isn't blank.
                 title
             };
-            let size = Size::Large;
-            let style = size.style();
-            // draw_line clips + marks overflow, so no manual truncation here.
-            draw_line(
+            // Use draw_block, NOT draw_line: draw_line clips a single line and
+            // marks the overflow, so a long track title lost everything past
+            // the first line ("He Got Banned From C..."). draw_block wraps at
+            // word boundaries and paints the following lines, which is what a
+            // long title needs.
+            const FALLBACK_LINES: usize = 3;
+            // Same ladder as the lyric path: take the largest size the whole
+            // title fits in within the available lines. A short title lands on
+            // XLarge, a long one steps down to Large, rather than being pinned
+            // to Large regardless of how well it would fit.
+            let size = pick_size(&label, 0, FALLBACK_LINES);
+            // Centre on the lines the text actually needs, not the budget,
+            // so a one-line title doesn't sit high in a three-line block.
+            let max_chars = (PANEL_W / size.char_w()).max(1) as usize;
+            let lines = label
+                .chars()
+                .count()
+                .div_ceil(max_chars)
+                .clamp(1, FALLBACK_LINES);
+            let block_h = size.line_h() * lines as i32;
+            let y = ((PANEL_H - block_h) / 2).max(0);
+            draw_block(
                 &mut buffer,
                 &label,
-                (PANEL_H - size.char_w() * 2) / 2,
+                y,
                 size,
                 self.align,
                 self.bold,
-                style,
+                lines,
             );
             return Ok(buffer);
         };
@@ -774,6 +806,82 @@ pub fn from_config(config: &Config) -> Result<Option<LyricsProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The no-lyrics fallback must use the same auto ladder as the lyric path:
+    /// a short title should reach XLarge, a long one step down to Large.
+    #[test]
+    fn fallback_ladder_scales_with_title_length() {
+        for (title, want) in [
+            ("Never Gonna Give You Up", Size::XLarge),
+            ("Bohemian Rhapsody", Size::XLarge),
+            ("He Got Banned From ChatGPT... - YouTube", Size::Large),
+        ] {
+            assert_eq!(pick_size(title, 0, 3), want, "unexpected size for {title:?}");
+        }
+    }
+
+    /// The fallback must show the WHOLE title. Regression: it used to call
+    /// draw_line (a single-line clip) and rendered only "He Got Banned From C".
+    #[test]
+    fn fallback_wraps_rather_than_clips() {
+        let title = "He Got Banned From ChatGPT... - YouTube";
+        let size = pick_size(title, 0, 3);
+        let max_chars = (PANEL_W / size.char_w()).max(1) as usize;
+        let lines = title.chars().count().div_ceil(max_chars).clamp(1, 3);
+        assert!(
+            title.chars().count() <= max_chars * lines,
+            "{title:?} does not fit in {lines} line(s) at {:?}",
+            size
+        );
+        assert!(size.line_h() * lines as i32 <= PANEL_H, "block runs off the panel");
+    }
+
+    /// Wrapping at a word boundary must not leave the delimiter at the start of
+    /// the continuation. Observed on the panel as:
+    ///   "He Got Banned From"
+    ///   " ChatGPT... - YouTube"      <- leading space, misaligned
+    #[test]
+    fn wrap_does_not_lead_with_a_space() {
+        let text = "He Got Banned From ChatGPT... - YouTube";
+        let size = pick_size(text, 0, 3);
+        let max_chars = (PANEL_W / size.char_w()).max(1) as usize;
+
+        // Mirror draw_block's chunking.
+        let chars: Vec<char> = text.chars().collect();
+        let mut offset = 0usize;
+        let mut lines: Vec<String> = Vec::new();
+        while offset < chars.len() && lines.len() < 3 {
+            let remaining = chars.len() - offset;
+            let mut broke_on_space = false;
+            let take = if remaining <= max_chars {
+                remaining
+            } else {
+                let window: String = chars[offset..offset + max_chars].iter().collect();
+                match window.rfind(' ') {
+                    Some(pos) if pos > 0 => { broke_on_space = true; pos }
+                    _ => max_chars,
+                }
+            };
+            lines.push(chars[offset..offset + take].iter().collect::<String>());
+            offset += take;
+            if broke_on_space {
+                while offset < chars.len() && chars[offset] == ' ' {
+                    offset += 1;
+                }
+            }
+        }
+
+        assert_eq!(lines[0], "He Got Banned From", "first line changed");
+        assert!(
+            !lines[1].starts_with(' '),
+            "continuation leads with a space: {:?}",
+            lines[1]
+        );
+        assert_eq!(lines[1], "ChatGPT... - YouTube");
+        // Nothing lost: every break replaced exactly one space, so joining the
+        // lines back with a single space must reproduce the original.
+        assert_eq!(lines.join(" "), text, "characters lost or duplicated in wrapping");
+    }
 
     #[test]
     fn truncation_marker_has_a_real_glyph() {
