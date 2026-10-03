@@ -5,6 +5,7 @@ use embedded_graphics::{
     geometry::{OriginDimensions, Point, Size},
     image::Image,
     pixelcolor::BinaryColor,
+    prelude::{DrawTarget, Pixel},
     Drawable,
 };
 use num_traits::AsPrimitive;
@@ -31,7 +32,119 @@ use tokio::{
 const PANEL_W: u32 = 128;
 /// Panel height in pixels. Any band that would extend past this writes out of
 /// bounds and panics the framebuffer, so every y is clamped against it.
-const PANEL_H: i32 = 40;
+pub const PANEL_H: i32 = 40;
+
+/// How long a scroll may hold a notification open beyond its configured
+/// duration.
+///
+/// Module scope rather than a local in `stream` because the scheduler needs the
+/// same number: it treats this as extra allowance on top of the stream's own
+/// countdown. Two definitions would silently disagree, and the symptom is
+/// subtle -- a notification that dies mid-scroll rather than an error.
+pub const SCROLL_HOLD_CAP: Duration = Duration::from_secs(30);
+
+/// Whether the reader has pinned the on-screen notification.
+///
+/// Distinct from the scroll offset on purpose: pinning must freeze the timer
+/// whether or not the reader scrolls, and scrolling must hold the frame open
+/// whether or not it is pinned. Two independent inputs, so two independent
+/// flags rather than overloading one counter.
+static NOTIF_LOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Longest a pinned notification may stay before it is released anyway.
+///
+/// A pin with no ceiling is a display that can never go back to rotation, and
+/// the usual way that happens is forgetting it was pinned. Three minutes is
+/// long enough to type a 2FA code and read it back, and short enough that an
+/// abandoned pin is noticed within one coffee.
+pub const NOTIF_LOCK_CAP: Duration = Duration::from_secs(180);
+
+/// Toggle the pin. Returns the new state so the caller can log it.
+pub fn toggle_notification_lock() -> bool {
+    let next = !NOTIF_LOCKED.load(std::sync::atomic::Ordering::SeqCst);
+    NOTIF_LOCKED.store(next, std::sync::atomic::Ordering::SeqCst);
+    next
+}
+
+/// True while a notification is pinned.
+pub fn notification_locked() -> bool {
+    NOTIF_LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A small sprite drawn in a corner of every frame of one notification.
+///
+/// Notifications only ever had a 24x24 app icon, which is a third of a 128x40
+/// panel. This is the opposite case: a corner badge that must not eat the
+/// content area, so its size is bounded by the caller and its frames can be
+/// swapped over time -- that is what lets an on-demand fetch show a spinner
+/// and then swap in the finished result without two different notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgePos {
+    /// Upper-right corner, which is where a progress indicator belongs.
+    TopRight,
+    LowerRight,
+    UpperLeft,
+    /// Bottom-left. Used when the text should read beside the badge rather
+    /// than above it, which is why it also carries a reserve box.
+    LowerLeft,
+}
+
+impl BadgePos {
+    /// Parse the config spelling. Unknown values fall back rather than error:
+    /// a typo in a corner should cost a badge position, not the feature.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bottomright" | "bottom-right" | "br" | "lower-right" => Self::LowerRight,
+            "topleft" | "top-left" | "tl" | "upper-left" => Self::UpperLeft,
+            "bottomleft" | "bottom-left" | "bl" | "lower-left" => Self::LowerLeft,
+            // Top-right is the default: the reading text is the point, so the
+            // badge goes wherever it is least likely to overlap.
+            _ => Self::TopRight,
+        }
+    }
+}
+
+/// Line offset of the notification body currently on screen.
+///
+/// The notification stream is owned by the scheduler, so the scroll hotkey
+/// cannot borrow it. This registry is the seam: the stream reads the offset
+/// fresh on every tick, so a hotkey pressed mid-notification takes effect on
+/// the next frame. There is only ever one notification on screen, because
+/// `override = true` replaces the previous one.
+static NOTIF_SCROLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Bumped on every scroll request.
+///
+/// The stream compares it against what it last saw to decide the reader just
+/// scrolled, which is what extends the hold. A separate counter from the
+/// offset so scrolling back to the top still counts as an interaction -- the
+/// offset alone cannot distinguish "scrolled to the top" from "never moved".
+static NOTIF_SCROLL_HOLD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reset the offset. Called when a new notification starts, so a previous
+/// one's position never carries over.
+pub fn reset_notification_scroll() {
+    NOTIF_SCROLL.store(0, std::sync::atomic::Ordering::SeqCst);
+    NOTIF_SCROLL_HOLD.store(0, std::sync::atomic::Ordering::SeqCst);
+    // A pin belongs to the notification that was on screen, so it does not
+    // carry over: the next notification starts unlocked.
+    NOTIF_LOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Scroll the on-screen notification body by `delta` lines.
+///
+/// Every accepted request bumps the hold counter, including one that clamps
+/// at an end: the reader pressing the key is itself the signal that they are
+/// reading, which is what should keep the frame up.
+pub fn scroll_notification(delta: isize) -> bool {
+    let cur = NOTIF_SCROLL.load(std::sync::atomic::Ordering::SeqCst) as isize;
+    let next = (cur + delta).max(0) as usize;
+    NOTIF_SCROLL.store(next, std::sync::atomic::Ordering::SeqCst);
+    NOTIF_SCROLL_HOLD.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    true
+}
 
 /// Bounding box the LEGACY corner ring occupies, as (left, top, right, bottom).
 /// Only used when `timer_border = false`; the default edge frame reserves
@@ -56,6 +169,152 @@ pub struct Notification {
     content_bold: bool,
     show_timer: bool,
     timer_border: bool,
+    /// Corner sprite drawn on top of every frame. `None` for the common case.
+    ///
+    /// Held as frames rather than a single image so an animation can be
+    /// driven from the stream loop, which already ticks per frame.
+    badge: Option<Badge>,
+}
+
+/// One frame of a corner sprite: a plain row-major pixel matrix.
+///
+/// Deliberately NOT a `FrameBuffer`: that type carries an 8-bit header so the
+/// USB write can go out verbatim, which means pixel (0,0) lives at bit 8, not
+/// bit 0. Compositing one into another by bit index would have to account for
+/// that offset and the panel stride, and a badge is small enough that a
+/// `Vec<bool>` is clearer and cannot get the offset wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeFrame {
+    pub w: u32,
+    pub h: u32,
+    /// `w * h` values, row-major.
+    pub bits: Vec<bool>,
+}
+
+impl BadgeFrame {
+    /// A blank `w` x `h` frame.
+    pub fn blank(w: u32, h: u32) -> Self {
+        Self {
+            w,
+            h,
+            bits: vec![false; (w * h) as usize],
+        }
+    }
+
+    /// Set one pixel, ignoring out-of-range coordinates.
+    pub fn set(&mut self, x: u32, y: u32, on: bool) {
+        if x < self.w && y < self.h {
+            self.bits[(y * self.w + x) as usize] = on;
+        }
+    }
+
+    /// Build from ASCII art, one string per row. Any character that is not
+    /// `.`, ` ` or `0` counts as ink, so `#`/`X`/`*` all work.
+    pub fn from_ascii(rows: &[&str]) -> Self {
+        let h = rows.len() as u32;
+        let w = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0) as u32;
+        let mut f = Self::blank(w, h);
+        for (y, row) in rows.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                let ink = !matches!(c, '.' | ' ' | '0');
+                f.set(x as u32, y as u32, ink);
+            }
+        }
+        f
+    }
+
+    /// Draw the frame's inked pixels into the panel at (x, y).
+    pub fn blit(&self, x: i32, y: i32, fb: &mut FrameBuffer) {
+        for sy in 0..self.h {
+            for sx in 0..self.w {
+                if !self.bits[(sy * self.w + sx) as usize] {
+                    continue;
+                }
+                let px = x + sx as i32;
+                let py = y + sy as i32;
+                if px < 0 || py < 0 || px >= PANEL_W as i32 || py >= PANEL_H {
+                    continue;
+                }
+                // Go through DrawTarget so the header offset and stride are
+                // handled by the type that owns that layout, not here.
+                fb.draw_iter([Pixel(Point::new(px, py), BinaryColor::On)])
+                    .expect("panel pixel in range");
+            }
+        }
+    }
+}
+
+/// Pixels of clearance kept between a corner badge and the panel edge.
+///
+/// The timer border is drawn on the OUTERMOST pixel ring, so a badge placed
+/// flush against an edge would overwrite the countdown and make it look broken.
+/// One pixel is enough to keep them separate without visibly shrinking the art.
+pub const BADGE_EDGE_INSET: i32 = 1;
+
+/// A multi-frame corner sprite.
+#[derive(Debug, Clone)]
+pub struct Badge {
+    /// One entry per animation frame; a single entry is a static badge.
+    pub frames: Vec<BadgeFrame>,
+    pos: BadgePos,
+    /// Shift the artwork off its corner, in pixels. Negative moves it UP.
+    ///
+    /// Lives on the badge rather than being baked into the artwork so the
+    /// caller can centre it vertically while `badge_box` reserves the same
+    /// offset. The two must agree or the text is laid out clear of a ball that
+    /// is drawn somewhere else.
+    pub dy: i32,
+}
+
+impl Badge {
+    /// Build a badge from its frames and corner. Panics on an empty list: a
+    /// badge with no frames has no size, so there is nothing sensible to do
+    /// with it and failing loudly beats a silent no-op.
+    pub fn new(frames: Vec<BadgeFrame>, pos: BadgePos) -> Self {
+        assert!(!frames.is_empty(), "a badge needs at least one frame");
+        Self { frames, pos, dy: 0 }
+    }
+
+    /// Shift the badge vertically, in pixels. Negative moves it up.
+    pub fn with_dy(mut self, dy: i32) -> Self {
+        self.dy = dy;
+        self
+    }
+
+    pub fn pos(&self) -> BadgePos {
+        self.pos
+    }
+
+    /// Width and height of the widest/tallest frame.
+    pub fn size(&self) -> (i32, i32) {
+        let w = self.frames.iter().map(|f| f.w).max().unwrap_or(0) as i32;
+        let h = self.frames.iter().map(|f| f.h).max().unwrap_or(0) as i32;
+        (w, h)
+    }
+
+    /// Paint the frame for stream tick `i`.
+    pub fn draw_at(&self, i: u32, fb: &mut FrameBuffer) {
+        let frame = &self.frames[(i as usize) % self.frames.len()];
+        let (w, h) = self.size();
+        // Inset by BADGE_EDGE_INSET on any edge it touches, so a badge never
+        // lands on the pixel ring the timer border is drawn along.
+        let origin = match self.pos {
+            BadgePos::TopRight => (
+                PANEL_W as i32 - w - BADGE_EDGE_INSET,
+                BADGE_EDGE_INSET + self.dy,
+            ),
+            BadgePos::LowerRight => (
+                PANEL_W as i32 - w - BADGE_EDGE_INSET,
+                PANEL_H - h - BADGE_EDGE_INSET + self.dy,
+            ),
+            BadgePos::UpperLeft => (BADGE_EDGE_INSET, BADGE_EDGE_INSET + self.dy),
+            BadgePos::LowerLeft => (
+                BADGE_EDGE_INSET,
+                PANEL_H - h - BADGE_EDGE_INSET + self.dy,
+            ),
+        };
+        frame.blit(origin.0, origin.1, fb);
+    }
 }
 
 impl Notification {
@@ -98,6 +357,15 @@ pub struct NotificationBuilder<'a> {
     /// Where each piece of text goes on the panel.
     layout: Layout,
     app_name: Option<String>,
+    /// Optional corner sprite drawn on every frame of this notification.
+    badge: Option<Badge>,
+    /// Draw the title at its measured size but never scroll it.
+    ///
+    /// The title normally scrolls horizontally when it is wider than the
+    /// projection, which is right for an app name or a headline but wrong for
+    /// a short single-line value: the reading would drift sideways for its
+    /// whole dwell instead of just being a little smaller.
+    no_title_scroll: bool,
 }
 
 /// Horizontal placement of a text line.
@@ -160,6 +428,31 @@ impl SizeClass {
             SizeClass::Large => 9,
             SizeClass::XLarge => 11,
         }
+    }
+
+    /// Largest class whose entire text fits `avail_w` on a SINGLE line.
+    ///
+    /// Height is deliberately ignored: the caller has already decided the text
+    /// is one line (that is the premise of an auto-sized single-line value), so
+    /// budgeting height here would shrink the type for no reason. Falls back to
+    /// `Small` when even that is too wide, because something has to be drawn.
+    pub fn fit_width(self, text: &str, avail_w: i32) -> Self {
+        if self != SizeClass::Auto {
+            return self;
+        }
+        let chars = text.chars().count() as i32;
+        let avail_w = avail_w.max(1);
+        for c in [
+            SizeClass::XLarge,
+            SizeClass::Large,
+            SizeClass::Medium,
+            SizeClass::Small,
+        ] {
+            if chars * c.char_width() as i32 <= avail_w {
+                return c;
+            }
+        }
+        SizeClass::Small
     }
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -341,9 +634,27 @@ pub struct Layout {
     /// interior space); `false` = the original 10px ring in the bottom-right
     /// corner, which content must be kept clear of.
     pub timer_border: bool,
+    /// Interior box a badge occupies, as (left, top, right, bottom). `None`
+    /// when no badge is attached, so the common case reserves nothing.
+    ///
+    /// Kept on `Layout` rather than derived from the badge because layout is
+    /// resolved while building, before a badge may be attached at all.
+    pub badge_box: Option<(i32, i32, i32, i32)>,
 }
 
 impl Layout {
+    /// Pixels reserved on the LEFT for a badge, or 0 when there is none.
+    ///
+    /// Only corner badges that touch the left edge reserve anything. A
+    /// right-hand badge constrains the far end instead, which `usable_right`
+    /// already handles, so this returns 0 for it.
+    pub fn left_reserve(&self) -> i32 {
+        match self.badge_box {
+            Some((left, _, right, _)) if left <= BADGE_EDGE_INSET => right + 3,
+            _ => 0,
+        }
+    }
+
     /// The rightmost x a line may occupy.
     ///
     /// With the edge-frame indicator (the default) this is always the full
@@ -352,6 +663,18 @@ impl Layout {
     /// that overlap its box.
     pub fn usable_right(&self, top: i32, height: i32) -> i32 {
         let panel_edge = PANEL_W as i32;
+        // A badge narrows the text area for any band that overlaps it
+        // vertically, regardless of the timer style. A badge on the RIGHT caps
+        // the line's far end at its left edge; a badge on the LEFT is already
+        // handled by `left_reserve`, which moves where lines START, so it must
+        // NOT cap the far end here. Returning the left edge here would hand
+        // every caller a right bound smaller than its own left bound, and the
+        // wrap width goes negative -- which silently rendered nothing at all.
+        if let Some((l, t, r, b)) = self.badge_box {
+            if top < b && top + height > t && l > BADGE_EDGE_INSET {
+                return l.min(panel_edge);
+            }
+        }
         if !self.show_timer || self.timer_border {
             return panel_edge;
         }
@@ -384,6 +707,7 @@ impl Default for Layout {
             ],
             show_timer: true,
             timer_border: true,
+            badge_box: None,
         }
     }
 }
@@ -426,6 +750,7 @@ impl ContentProvider for Notification {
         let show_timer = self.show_timer;
         let content = self.content.clone();
         let content_line_h = self.content_line_h;
+        let badge = self.badge.clone();
 
         // The body is centred/right-aligned against the space right of any
         // icon AND left of the countdown ring, matching how the title is
@@ -444,18 +769,99 @@ impl ContentProvider for Notification {
         content_origin.x = content_align.offset(content_w, right, content_origin.x);
 
         Ok(try_stream! {
-            for i in 0..self.ticks {
+            // Scrolling holds the frame open instead of letting the countdown
+            // run out under the reader -- but only for so long. With
+            // `override = true` a notification outranks every provider, so an
+            // unbounded pause would freeze the whole rotation until someone
+            // pressed a key. Each accepted scroll RESTARTS the allowance, so
+            // an actively-reading user gets 30s of quiet per keypress, and an
+            // idle one gets 30s and then the countdown resumes regardless.
+            let mut held = Duration::ZERO;
+            let mut last_tick = std::time::Instant::now();
+            let mut seen_scroll = 0u64;
+            // Time spent pinned, tracked separately from `held` so the two
+            // caps cannot consume each other's allowance.
+            let mut pinned = Duration::ZERO;
+            let mut pin_started = std::time::Instant::now();
+            // The base duration plus the maximum hold, since ticks cannot
+            // express "30s of extra only if needed".
+            let max_ticks = self.ticks
+                + (SCROLL_HOLD_CAP.as_millis() / TICK_LENGTH as u128) as u32
+                + (NOTIF_LOCK_CAP.as_millis() / TICK_LENGTH as u128) as u32;
+            for i in 0..max_ticks {
+                let gen = NOTIF_SCROLL_HOLD.load(std::sync::atomic::Ordering::SeqCst);
+                let scrolled = gen != seen_scroll;
+                if scrolled {
+                    seen_scroll = gen;
+                    // Only accumulate the hold while the reader is actually
+                    // interacting. Without this guard `held` grew from the moment
+                    // the base duration elapsed, so EVERY notification ran the
+                    // full 30s hold whether or not anyone touched it.
+                    held = Duration::ZERO;
+                    last_tick = std::time::Instant::now();
+                }
+                let is_locked = NOTIF_LOCKED.load(std::sync::atomic::Ordering::SeqCst);
+                // Past the configured duration only a hold or a pin may keep
+                // this up. Without either, end here -- this is the normal path.
+                if i >= self.ticks && !is_locked && !scrolled {
+                    break;
+                }
+                if i >= self.ticks {
+                    let now = std::time::Instant::now();
+                    // A pin outranks the scroll hold entirely -- including its
+                    // cap, which is the whole point of pinning: the reader is
+                    // looking at something they need, not browsing.
+                    if is_locked {
+                        pinned += now.duration_since(pin_started);
+                        pin_started = now;
+                        if pinned >= NOTIF_LOCK_CAP {
+                            // Safety valve: release rather than sit forever.
+                            NOTIF_LOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
+                            log::warn!(
+                                "notification pin hit its {:?} cap; releasing",
+                                NOTIF_LOCK_CAP
+                            );
+                            break;
+                        }
+                    } else if scrolled {
+                        held += now.duration_since(last_tick);
+                        last_tick = now;
+                        if held >= SCROLL_HOLD_CAP {
+                            break;
+                        }
+                    }
+                }
                 let mut image = self.frame;
                 self.title.at_tick(&mut image, if self.scroll {
                     i
                 } else {
                     0
                 })?;
-                for (i, line_text) in content.iter().enumerate() {
+                // Show a window of the wrapped body over the scroll offset.
+                // Clamped HERE rather than at the hotkey site because only this
+                // frame knows how many lines the panel can actually hold.
+                let visible = {
+                    let room = (PANEL_H - content_origin.y).max(0) as i32;
+                    (room / content_line_h.max(1)).max(1) as usize
+                };
+                let total = content.len();
+                let offset = NOTIF_SCROLL
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .min(total.saturating_sub(visible));
+
+                for (i, line_text) in content
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(visible)
+                {
                     if line_text.is_empty() {
                         continue;
                     }
-                    let ly = content_origin.y + i as i32 * content_line_h;
+                    // `i` is an absolute index, so rebase it to the window or
+                    // the text would drift up the panel as you scroll.
+                    let ly = content_origin.y
+                        + (i - offset) as i32 * content_line_h;
                     Text::with_baseline(
                         line_text,
                         Point::new(content_origin.x, ly),
@@ -473,12 +879,20 @@ impl ContentProvider for Notification {
                         .draw(&mut image)?;
                     }
                 }
+
                 if show_timer {
                     if timer_border {
                         edge.draw_at(i as f32, &mut image)?;
                     } else {
                         progress.draw_at(i as f32, &mut image)?;
                     }
+                }
+                // Badge last, so it composites OVER the text and the timer
+                // ring. Drawn from the frame index rather than wall-clock so
+                // it advances in lockstep with the countdown and stops dead if
+                // the frame is held.
+                if let Some(badge) = &badge {
+                    badge.draw_at(i, &mut image);
                 }
                 // Frame progress. A stall used to be completely silent, which
                 // made it impossible to tell whether the stream hung before
@@ -533,6 +947,22 @@ impl<'a> NotificationBuilder<'a> {
     }
 
     /// Override the text placement.
+    /// Stop the title from scrolling when it overflows. Combined with a
+    /// `SizeClass::Auto` title this picks the largest font whose whole text
+    /// fits the available width, rather than fixing a size and then animating
+    /// sideways.
+    pub fn without_title_scroll(mut self) -> Self {
+        self.no_title_scroll = true;
+        self
+    }
+
+    /// Attach a corner badge. Mutually independent of `with_icon`: a badge is
+    /// small artwork in a corner, an icon is the sender's 24x24 bitmap.
+    pub fn with_badge(mut self, badge: Badge) -> Self {
+        self.badge = Some(badge);
+        self
+    }
+
     pub fn with_layout(mut self, layout: Layout) -> Self {
         self.layout = layout;
         self
@@ -628,7 +1058,11 @@ impl<'a> NotificationBuilder<'a> {
         // Everything derived from `&self` is resolved up front, because the
         // moves below consume the fields.
         let size = self.offset();
-        let icon_w = size.width as i32;
+        // `icon_w` is the panel's left text bound. A left-hand badge reserves
+        // its width plus a gutter on top of any app icon, so widening this one
+        // value moves every placement below it (app, title, content origin and
+        // the width budgets passed to Auto resolution) in a single edit.
+        let icon_w = size.width as i32 + layout.left_reserve();
         let title_text = self.title();
         let app_name = self
             .app_name
@@ -637,7 +1071,9 @@ impl<'a> NotificationBuilder<'a> {
 
         // These borrow `self`, so compute them before any field is moved.
         let ticks = self.required_ticks();
-        let scroll = self.needs_scroll();
+        // `no_title_scroll` wins over the measured need: the reading is sized
+        // to fit its band instead of animating sideways.
+        let scroll = self.needs_scroll() && !self.no_title_scroll;
 
         // ---- App line ----
         // Each part is placed independently. Explicit rows win; otherwise a
@@ -682,6 +1118,11 @@ impl<'a> NotificationBuilder<'a> {
             title_spec.row.unwrap_or(if app_bottom > 1 { app_bottom } else { 3 }) + title_spec.dy;
         // Size first: the resolved height is what the row clamp needs, and for
         // a scrolling title the width budget is the panel minus the icon.
+        // `no_title_scroll` needs the width budget BEFORE the size is known,
+        // because the badge's reserve box depends on the band's height, which
+        // depends on the size. Resolving it against the full panel here would
+        // pick a class that then does not fit next to the ball, so the width is
+        // re-checked once the band position is settled below.
         let title_size = title_spec.size.resolve(
             &title_text,
             (PANEL_W as u32).saturating_sub(icon_w as u32),
@@ -697,6 +1138,25 @@ impl<'a> NotificationBuilder<'a> {
         // overlap it, so a title near the bottom scrolls within the free space
         // instead of running under the ring.
         let title_right = layout.usable_right(title_y, title_h);
+        // Second pass: with the real band width known (badge reserve applied),
+        // shrink an Auto title to fit that width on one line instead of
+        // scrolling it. A fixed-size spec is left alone -- the user asked for
+        // that size, and shrinking it would silently override their choice.
+        let title_size = if self.no_title_scroll {
+            title_size.fit_width(
+                &title_text,
+                (title_right - icon_w).max(0),
+            )
+        } else {
+            title_size
+        };
+        let title_h = title_size.line_height() as i32;
+        let mut title_y = title_base;
+        // The clamp and `title_right` were computed with the pre-shrink height;
+        // recompute the clamp for the new one.
+        if title_y + title_h > PANEL_H {
+            title_y = (PANEL_H - title_h).max(0);
+        }
         let title_meas = (title_text.chars().count() as u32) * title_size.char_width();
         let title_w = title_meas.min((title_right - icon_w).max(0) as u32);
         let title_x = title_spec.align.offset(title_w, title_right, icon_w);
@@ -727,7 +1187,18 @@ impl<'a> NotificationBuilder<'a> {
         let has_content = !content.is_empty();
         let content_spec = layout.line(Part::Content);
 
-        let title_bottom = title_y + title_h;
+        // A hidden title must not reserve its band. The title's height is
+        // still resolved above (the Scrollable is built unconditionally, it just
+        // draws nothing for empty text), but reserving those rows here pushed a
+        // body's `content_y` down by a full title height: with an XL title and a
+        // body at row 3, `content_y` landed at 14 instead of 3, `avail_h` fell
+        // 37 -> 26, and the line budget dropped from 3 lines to 2. Anything that
+        // hides a line to gain room lost that room twice.
+        let title_bottom = if title_spec.shown {
+            title_y + title_h
+        } else {
+            0
+        };
         let mut content_y = match content_spec.row {
             Some(y) => y + content_spec.dy,
             // Original layout used y=20 with an icon present, 10 without.
@@ -762,8 +1233,12 @@ impl<'a> NotificationBuilder<'a> {
         // the countdown ring.
         let content_h = content_size.line_height() as i32;
         let body_lines = if has_content && content_spec.wrap {
-            let avail_h = PANEL_H - content_y;
-            let max_lines = (avail_h / content_h).max(1) as usize;
+            // Wrap the WHOLE body, not just what fits. Capping the wrap at the
+            // visible height truncated the tail with an ellipsis here, at build
+            // time -- so the scroll window had nothing to scroll to and the
+            // offset clamped to a single hidden line. The stream windows these
+            // lines per frame; the height budget is enforced there.
+            let max_lines = 200usize;
             crate::providers::custom::wrap_text(
                 &content,
                 content_right - icon_w,
@@ -803,6 +1278,7 @@ impl<'a> NotificationBuilder<'a> {
         );
 
         Ok(Notification {
+            badge: self.badge.clone(),
             frame: base_image,
             ticks,
             title,
@@ -830,18 +1306,10 @@ mod layout_tests {
     use super::*;
 
     /// Auto must scale with available room, not be a fixed size in disguise.
-    /// `duration` must be authoritative: the ring sweep and title scroll are
-    /// paid for INSIDE it. Regression: a 5s setting produced 138 ticks (6.85s)
-    /// because both were added on top of the base, so a long title outlasted
-    /// its configured time by nearly 40%.
-    ///
-    /// Built through the real builder, not arithmetic: the previous version of
-    /// this test only asserted `x.min(budget) == budget`, which is tautological.
     /// The body must line up with the title on its left edge. It used to start
     /// at `icon_w + 3` while the title started at `icon_w`, so the body sat 3px
-    /// -- one character cell at Small -- to the right of the title it is
-    /// supposed to read under.
-    #[test]    #[test]
+    /// -- one character cell at Small -- to the right of the title it reads under.
+    #[test]
     fn content_left_edge_matches_title_left_edge() {
         let layout = Layout {
             lines: vec![
@@ -857,6 +1325,7 @@ mod layout_tests {
             ],
             show_timer: false,
             timer_border: true,
+            badge_box: None,
         };
         // "I" is the narrowest inked glyph in the 6x8 face so the measured
         // extent is the glyph box, not padding from a wider letter.
@@ -874,6 +1343,13 @@ mod layout_tests {
         assert_eq!(app_x, title_x, "app and title also disagree");
     }
 
+    /// `duration` must be authoritative: the ring sweep and title scroll are
+    /// paid for INSIDE it. Regression: a 5s setting produced 138 ticks (6.85s)
+    /// because both were added on top of the base, so a long title outlasted
+    /// its configured time by nearly 40%.
+    ///
+    /// Built through the real builder, not arithmetic: the previous version of
+    /// this test only asserted `x.min(budget) == budget`, which is tautological.
     #[test]
     fn duration_is_the_same_for_scrolling_and_non_scrolling_titles() {
         let layout = Layout::default();
@@ -1114,6 +1590,7 @@ mod layout_tests {
             ],
             show_timer: false,
             timer_border: true,
+            badge_box: None,
         };
         let rows = render_ascii(&layout, "Centered XL title", "small centered body", "Firefox");
         let b = bands(&rows);
@@ -1141,6 +1618,7 @@ mod layout_tests {
             ],
             show_timer: false,
             timer_border: true,
+            badge_box: None,
         };
         // Wide enough that centring is measurable: "TITLE" at XL is only 5
         // chars = 40px, which starts near x=44 either way and proves nothing.
@@ -1179,6 +1657,7 @@ mod layout_tests {
                     ],
                     show_timer: true,
                     timer_border: true,
+                    badge_box: None,
                 };
                 // The assertion is implicit: build() + draw must not panic.
                 let rows = render_ascii(&layout, "Title that is long", "Body", "App");
@@ -1204,6 +1683,7 @@ mod layout_tests {
             ],
             show_timer: false,
             timer_border: true,
+            badge_box: None,
         };
         let rows = render_ascii(&layout, "TITLE", "body", "Firefox");
         // With the app line hidden, nothing may be drawn above the title row.
@@ -1250,6 +1730,7 @@ mod layout_tests {
                 ],
                 show_timer: false,
                 timer_border: true,
+                badge_box: None,
             };
             let rows = render_ascii(&layout, "8W8W8W", "", "");
             let inked = inked_rows(&rows);
@@ -1287,6 +1768,7 @@ mod layout_tests {
             // The legacy corner ring is the only thing that reserves space;
             // the default edge frame reserves nothing.
             timer_border: false,
+            badge_box: None,
         };
 
         // Sanity: this band really does overlap the ring.
@@ -1372,6 +1854,7 @@ mod layout_tests {
                 ],
                 show_timer: false,
                 timer_border: true,
+                badge_box: None,
             };
             let rows = render_ascii(&layout, "T", "Some body text that is fairly long and should wrap", "");
             let inked = inked_rows(&rows);
@@ -1404,6 +1887,7 @@ mod layout_tests {
             ],
             show_timer,
             timer_border: !legacy_ring,
+            badge_box: None,
         };
 
         // The legacy corner ring caps a band that overlaps it, at x = 116.
@@ -1451,6 +1935,7 @@ mod layout_tests {
             ],
             show_timer: false,
             timer_border: true,
+            badge_box: None,
         };
         let rows = render_ascii(&wrapped, "T", body, "");
         let inked = inked_rows(&rows);
@@ -1470,6 +1955,7 @@ mod layout_tests {
             ],
             show_timer: false,
             timer_border: true,
+            badge_box: None,
         };
         let flat_rows = render_ascii(&flat, "T", body, "");
         let flat_last = *inked_rows(&flat_rows).last().unwrap();
@@ -1492,6 +1978,7 @@ mod layout_tests {
                 ],
                 show_timer: false,
                 timer_border: true,
+                badge_box: None,
             };
             let r = render_ascii(&l, "T", body, "");
             let last = r.len();
@@ -1541,6 +2028,7 @@ mod layout_tests {
                 ],
                 show_timer: false,
                 timer_border: true,
+                badge_box: None,
             };
             let rows = render_ascii(&layout, "QGMW", "", "");
             let inked = inked_rows(&rows);
@@ -1593,6 +2081,7 @@ mod layout_tests {
             timer_border: settings
                 .get_bool("notifications.timer_border")
                 .unwrap_or(true),
+            badge_box: None,
         };
         eprintln!("LIVE LAYOUT = {layout:?}");
         let rows = render_ascii(&layout, "Centered XL title", "small centered body", "Firefox");
@@ -1602,4 +2091,166 @@ mod layout_tests {
             }
         }
     }
+
+    /// A corner badge must never touch the pixel ring the timer border is
+    /// drawn along, and its real footprint must match what `badge_box`
+    /// promises the layout.
+    ///
+    /// These two disagreed by 1px on both axes at 20x20: `badge_box` reserved a
+    /// 1px inset that `draw_at` never applied, so the ball overwrote the
+    /// countdown ring while the text was laid out as though it had not. The bug
+    /// was invisible in a unit test because nothing asserted the contract.
+    #[test]
+    fn badge_stays_clear_of_the_panel_edge_and_matches_its_box() {
+        for (w, h) in [(8u32, 8u32), (20, 20), (26, 26)] {
+            // Draw a full-bleed badge and check the outermost ring stays clear.
+            let mut panel = FrameBuffer::new();
+            let solid = {
+                let mut f = BadgeFrame::blank(w, h);
+                for y in 0..h {
+                    for x in 0..w {
+                        f.set(x, y, true);
+                    }
+                }
+                Badge::new(vec![f], BadgePos::LowerRight)
+            };
+            solid.draw_at(0, &mut panel);
+
+            // The rightmost column and bottom row are the timer border's
+            // ring. Read the bit array directly: `FrameBuffer` keeps an 8-bit
+            // header so the USB write goes out verbatim, so pixel (x, y) lives
+            // at bit index `x + y * 128 + 8`.
+            let bit = |x: usize, y: usize| -> bool {
+                *panel
+                    .framebuffer
+                    .get(x + y * 128 + 8)
+                    .expect("panel pixel in range")
+            };
+            let bottom_edge_inked = (0..PANEL_W as usize).any(|x| bit(x, PANEL_H as usize - 1));
+            let right_edge_inked = (0..PANEL_H as usize).any(|y| bit(PANEL_W as usize - 1, y));
+            assert!(
+                !right_edge_inked,
+                "badge inked the right edge ring at {w}x{h}"
+            );
+            assert!(
+                !bottom_edge_inked,
+                "badge inked the bottom edge ring at {w}x{h}"
+            );
+        }
+    }
+
+    /// A left-hand badge must push every text line's start x past its right
+    /// edge, and must not reserve anything for a right-hand badge.
+    ///
+    /// `usable_right` alone cannot express this: it bounds the far end of a
+    /// line, while a left badge constrains where a line BEGINS. Both directions
+    /// have to be reserved or the text draws under the artwork.
+    #[test]
+    fn left_badge_reserves_the_start_of_every_line() {
+        let base = Layout::default();
+        // Nothing reserved with no badge.
+        assert_eq!(base.left_reserve(), 0);
+
+        let left = Layout {
+            badge_box: Some((1, 13, 27, 39)),
+            ..base.clone()
+        };
+        assert_eq!(left.left_reserve(), 30, "text must start right of the ball");
+
+        // A right-hand badge reserves no left space.
+        let right = Layout {
+            badge_box: Some((101, 13, 127, 39)),
+            ..base.clone()
+        };
+        assert_eq!(right.left_reserve(), 0);
+
+        // And the ball's box must actually start at the left edge for the
+        // reservation to trigger at all -- a box that did not touch the edge
+        // would silently reserve nothing.
+        assert!(left.left_reserve() > 0);
+    }
+
+
+
+    /// A hidden title must not reserve its band, or a body below it silently
+    /// loses a line's worth of room.
+    ///
+    /// This is the 8 ball bug: the reading was the body, the title was hidden
+    /// and always empty, yet the title's XL band was still reserved. That put
+    /// the reading's `content_y` at 14 instead of its configured row 3, cut
+    /// `avail_h` from 37 to 26, and halved the line budget -- two lines where
+    /// three fit. Nothing overflowed, so it read as "the font is too small"
+
+
+
+
+    /// A hidden title must not reserve its band, or the body below it is pushed
+    /// down until its last line falls off the panel.
+    ///
+    /// This is the 8 ball bug. The reading is the body and the title is hidden
+    /// and always empty, yet the title's XL band was still added to
+    /// `title_bottom`. That put the body's `content_y` at 14 instead of its
+    /// configured row, cut `avail_h` from 37 to 26, and dropped the line budget
+    /// from three to two -- so a three-line answer had its third line pushed
+    /// past the bottom edge and simply not drawn.
+    ///
+    /// The observable is not the wrapped line COUNT, which is width-driven and
+    /// identical either way. It is whether the last line's band fits on the
+
+
+    /// A hidden line must not reserve its band, or the body below it is pushed
+    /// down until its last line falls off the panel.
+    ///
+    /// This is the 8 ball bug. The reading is the body and the title is hidden
+    /// and always empty, yet the title's XL band was still added to
+    /// `title_bottom`. That put the body's origin at row 14 instead of its
+    /// configured row 3, cut `avail_h` from 37 to 26 and the budget from three
+    /// lines to two -- so a three-line answer had its last line pushed past the
+    /// bottom edge and never drawn.
+    ///
+    /// Asserted on `content_origin` / `content_line_h`, the values the renderer
+    /// actually draws with. The wrapped line COUNT is a useless observable here:
+    /// it is width-driven and comes out identical either way.
+    #[test]
+    fn hidden_title_does_not_push_the_body_off_panel() {
+        let layout = |title_shown: bool| Layout {
+            lines: vec![
+                LineSpec { part: Part::Title, shown: title_shown, size: SizeClass::XLarge, row: Some(3), ..Part::Title.default_spec() },
+                LineSpec { part: Part::Content, shown: true, size: SizeClass::XLarge, row: Some(3), wrap: true, ..Part::Content.default_spec() },
+            ],
+            ..Layout::default()
+        };
+        // Longest realistic reading: three lines at XLarge.
+        let build = |title_shown: bool| {
+            NotificationBuilder::new()
+                .with_title("")
+                .with_content("Reply hazy, try again later ok")
+                .with_hold_seconds(3)
+                .with_layout(layout(title_shown))
+                .build()
+                .expect("build")
+        };
+        let n_hidden = build(false);
+        let n_visible = build(true);
+
+        assert_eq!(n_hidden.content.len(), 3, "this reading needs three lines");
+        let pitch = n_hidden.content_line_h;
+        // Last line's band, as drawn.
+        let last_line_bottom =
+            n_hidden.content_origin.y + (n_hidden.content.len() as i32 - 1) * pitch + pitch;
+        assert!(
+            last_line_bottom <= PANEL_H as i32,
+            "three XL body lines must fit on the panel: bottom={last_line_bottom} > {PANEL_H} (origin y={})",
+            n_hidden.content_origin.y
+        );
+        // The visible-title layout is the one that overflowed; keep it pinned so
+        // the difference stays intentional.
+        let visible_bottom =
+            n_visible.content_origin.y + (n_visible.content.len() as i32 - 1) * pitch + pitch;
+        assert!(
+            visible_bottom > PANEL_H as i32,
+            "sanity: reserving a visible XL title is expected to overflow ({visible_bottom})"
+        );
+    }
+
 }

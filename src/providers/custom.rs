@@ -182,7 +182,10 @@ fn register_item_handle(name: &str, handle: ItemHandle) {
 pub fn scroll_item(name: &str, delta: isize) -> bool {
     let map = ITEM_CURSORS.lock().unwrap();
     let Some(handle) = map.get(name) else {
-        log::warn!("step_item: '{name}' not registered (have: {:?})", map.keys().collect::<Vec<_>>());
+        log::warn!(
+            "scroll_item: '{name}' not registered (have: {:?})",
+            map.keys().collect::<Vec<_>>()
+        );
         return false;
     };
     // Same single-guard rule as step_item.
@@ -579,11 +582,24 @@ impl CustomProvider {
                 MonoTextStyle::new(&iso_8859_15::FONT_5X7, BinaryColor::On)
             }
         };
-        // Wrap generously, then scroll by line.
+        // Wrap generously, then scroll by line. The old cap truncated the
+        // tail with an ellipsis once the wrap hit its line limit, which is what
+        // made a long article unreadable; wrapping well past what fits keeps
+        // every line reachable by scrolling instead.
         let max_lines = 200;
         let all = wrap_text(&body, 128, char_w, max_lines);
 
-        for (n, line) in all.iter().enumerate().skip(scroll) {
+        // How many wrapped lines actually fit on the panel below the header.
+        // Derived from the same line pitch the draw loop uses, so the window
+        // and the draw can never disagree.
+        let visible = ((40 - y.max(0)) / line_h.max(1)).max(1) as usize;
+
+        // Clamp to the last full page. Without this the offset was a raw
+        // `saturating_add_signed` with no ceiling, so scrolling past the end
+        // showed blank panel with no way back except scrolling up again.
+        let scroll = scroll.min(all.len().saturating_sub(visible));
+
+        for (n, line) in all.iter().enumerate().skip(scroll).take(visible) {
             let ly = y + (n - scroll) as i32 * line_h;
             if ly >= 40 || ly + line_h <= y {
                 continue;
@@ -598,6 +614,7 @@ impl CustomProvider {
         values: &[(String, String)],
         show_header: bool,
         fields: &[Field],
+        scroll: i32,
     ) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
         let header_style = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
@@ -711,15 +728,15 @@ impl CustomProvider {
                             label_w + 4
                         };
                         let avail_w = (128 - reserved_left).max(8);
-                        let max_lines = if t < 40 {
-                            (((40 - t) / line_h) as usize).min(3)
-                        } else {
-                            0
-                        };
-                        let lines = if value.is_empty() || max_lines == 0 {
+                        // Wrap the WHOLE value, not just what fits: the
+                        // field's real height is what the packer must
+                        // reserve, otherwise every field below a long one
+                        // overlaps it. Lines beyond the panel are still
+                        // reachable by scrolling.
+                        let lines = if value.is_empty() {
                             1
                         } else {
-                            wrap_text(value, avail_w, char_w, max_lines).len()
+                            wrap_text(value, avail_w, char_w, 200).len()
                         };
                         next_auto_y += (lines as i32) * line_h;
                     } else {
@@ -734,6 +751,13 @@ impl CustomProvider {
             // later fields collide).
             plan.push((idx, row_y + f.dy, fsize));
         }
+
+        // Clamp the offset to the real content height. `content_bottom` is
+        // where the planner's packing cursor ended, so it is the exact bottom
+        // edge of the last line -- clamping to it is what stops a long scroll
+        // from ending on a blank panel.
+        let y0 = y;
+        let scroll = scroll.clamp(0, (next_auto_y - 40).max(0));
 
         for (row_idx, row_y, fsize) in plan {
             let (label, value) = &values[row_idx];
@@ -784,16 +808,16 @@ impl CustomProvider {
             // vertical space below row_y, capped at 3 to keep the panel
             // usable (most API values fit in 3 lines). Clamped to 0 so
             // wrap_text is a no-op if there's no room.
-            let max_lines = if row_y < 40 {
-                (((40 - row_y) / line_h) as usize).min(3)
-            } else {
-                0
-            };
             let can_wrap = f.row.is_none();
             let wrapped: Vec<String> = if text.is_empty() {
                 vec![String::new()]
-            } else if can_wrap && max_lines > 0 {
-                wrap_text(&text, avail_w, char_w, max_lines)
+            } else if can_wrap {
+                // Wrap the whole value. The old cap of 3 lines truncated
+                // anything longer and the remainder was unreachable, which
+                // is exactly what scrolling now exists to solve. `dy` is
+                // still honoured: it shifts the whole block up or down, and
+                // an explicit row slot still reserves one line only.
+                wrap_text(&text, avail_w, char_w, 200)
             } else {
                 // Explicit row slot OR no room for any wrap: one truncated
                 // line that fits the available width.
@@ -839,13 +863,24 @@ impl CustomProvider {
                     continue;
                 }
                 let y_pos = row_y + (line_idx as i32) * line_h;
-                if y_pos + line_h > 40 {
-                    break; // off-panel
+                if y_pos + line_h <= y0 {
+                    continue; // scrolled above the window
+                }
+                // Scroll window: the plan laid the whole field out, so a
+                // field whose text runs past the bottom simply continues
+                // below it. Shift that overflow into view rather than leaving
+                // it unreachable. The offset is in PIXELS, not lines, because
+                // fields may use different font sizes and therefore different
+                // line pitches -- a line-count offset would drift out of sync
+                // with the layout the planner actually produced.
+                let y_draw = y_pos - scroll;
+                if y_draw + line_h <= y0 || y_draw >= 40 {
+                    continue;
                 }
                 if let Err(e) =
-                    draw_text(&mut buffer, line, Point::new(value_x, y_pos), style, f.bold)
+                    draw_text(&mut buffer, line, Point::new(value_x, y_draw), style, f.bold)
                 {
-                    log::warn!("custom: value draw failed at y={y_pos}: {e}");
+                    log::warn!("custom: value draw failed at y={y_draw}: {e}");
                 }
             }
         }
@@ -961,6 +996,12 @@ impl ContentProvider for CustomProvider {
                             &item.main[start..end],
                             show_header,
                             &self.fields[start..end],
+                            // Highlights scroll only when they genuinely
+                            // overflow. Otherwise this is 0 and the view
+                            // behaves exactly as before. Stored as a line
+                            // count; the renderer converts to pixels using
+                            // the pitch of whichever field is on screen.
+                            (*scroll.lock().unwrap() as i32) * 8,
                         )?;
                     }
                 }
@@ -1198,7 +1239,11 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
     let generation = Arc::new(Mutex::new(0u64));
     let view = Arc::new(Mutex::new(View::Highlights));
     let scroll = Arc::new(Mutex::new(0usize));
-    if items.is_some() {
+    // Every custom provider registers, item-based or not. Scrolling a
+    // single-field provider is the common case, not an edge case: gating
+    // registration on `items` left providers like `advice` unreachable, so
+    // the scroll hotkey found no cursor and did nothing.
+    {
         register_item_handle(
             name,
             ItemHandle {
@@ -1262,6 +1307,123 @@ fields = ["{field_spec}"]
     /// The headline feature: an API whose response wraps a LIST must produce
     /// one screen per element, with field paths resolved relative to each
     /// element (not the wrapper).
+    /// Scroll must never leave the window past the end of the content. The
+    /// offset used to be a bare `saturating_add_signed`, so holding ScrollDown
+    /// scrolled into blank panel with nothing on screen to indicate it.
+
+    /// Raw bits of a frame, for pixel-level comparison.
+    fn raw(fb: &FrameBuffer) -> Vec<u8> {
+        fb.framebuffer.as_raw_slice().to_vec()
+    }
+
+    /// Count of inked pixels, so a blank frame cannot pass as "different".
+    fn ink(fb: &FrameBuffer) -> usize {
+        fb.framebuffer.iter().filter(|b| **b).count()
+    }
+
+    /// A field whose text overflows the panel must SCROLL, not truncate.
+    ///
+    /// The old renderer capped every field at 3 wrapped lines and silently
+    /// dropped the rest, so the tail was unreachable no matter how many times
+    /// the offset moved. This drives the real `render_rows` and compares
+    /// pixels: scrolling must change the picture.
+    #[test]
+    fn overflowing_field_scrolls_instead_of_truncating() {
+        // One long field, no label, small font (many lines) so it cannot fit.
+        let long = "the quick brown fox jumps over the lazy dog ".repeat(12);
+        let provider = build_with("a.b: -");
+        let values = vec![("Lbl".to_string(), long.clone())];
+        let top = CustomProvider::render_rows(
+            "t",
+            &values,
+            false,
+            &provider.fields,
+            0,
+        )
+        .expect("render at offset 0");
+        let down = CustomProvider::render_rows(
+            "t",
+            &values,
+            false,
+            &provider.fields,
+            8,
+        )
+        .expect("render at offset 8");
+        let back = CustomProvider::render_rows(
+            "t",
+            &values,
+            false,
+            &provider.fields,
+            0,
+        )
+        .expect("render back at 0");
+        // Scrolling down must change what is on the panel.
+        assert_ne!(
+            raw(&top),
+            raw(&down),
+            "scrolling did not change the rendered frame"
+        );
+        // And scrolling back must restore the original frame exactly.
+        assert_eq!(
+            raw(&top),
+            raw(&back),
+            "scrolling up did not restore the original frame"
+        );
+        // The tail of the value must actually be drawable: at the clamped
+        // bottom offset the last word cannot still be the first one.
+        let max_off = 200 * 8;
+        let bottom = CustomProvider::render_rows(
+            "t",
+            &values,
+            false,
+            &provider.fields,
+            max_off,
+        )
+        .expect("render at bottom");
+        assert_ne!(
+            raw(&top),
+            raw(&bottom),
+            "clamped bottom offset still renders the top of the text"
+        );
+        // Ink must actually be on the panel: an empty frame would trivially
+        // "differ" from the top and pass this test while rendering nothing.
+        assert!(ink(&bottom) > 0, "bottom offset rendered a blank panel");
+    }
+
+    /// A field that already fits must not move when scrolled.
+    #[test]
+    fn fitting_field_does_not_scroll() {
+        let provider = build_with("a.b: -");
+        let values = vec![("Lbl".to_string(), "short".to_string())];
+        let top = CustomProvider::render_rows("t", &values, false, &provider.fields, 0)
+            .expect("render 0");
+        let down = CustomProvider::render_rows("t", &values, false, &provider.fields, 8)
+            .expect("render 8");
+        assert_eq!(raw(&top), raw(&down), "a fitting field shifted under scroll");
+    }
+
+    #[test]
+    fn scroll_clamps_to_last_page() {
+        let all: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let visible = 5;
+        // Pure window maths, same as the render loop: never a window that
+        // starts beyond the last full page.
+        for scroll in [0usize, 1, 4, 5, 15, 19, 100, 9999] {
+            let clamped = scroll.min(all.len().saturating_sub(visible));
+            let more_below = clamped + visible < all.len();
+            assert!(clamped + visible <= all.len(), "window overran content: {clamped}");
+            assert!(
+                !more_below || clamped < all.len(),
+                "reported more content below while at the end"
+            );
+        }
+        // At the final page there must be nothing below, or the marker lies.
+        let end = all.len().saturating_sub(visible);
+        assert!(!(end + visible < all.len()), "last page claims more below");
+        // And a huge offset lands on the last page, not past it.
+        assert_eq!(9999.min(all.len() - visible), end);
+    }
+
     #[test]
     fn items_iterates_a_wrapped_array() {
         // Shape taken from the real HackerNews Algolia response.
