@@ -205,11 +205,19 @@ pub fn scroll_item(name: &str, delta: isize) -> bool {
     // survives the clamp and has to be scrolled back out one press at a time.
     // Clamping the stored value means pressing down at the bottom is a no-op,
     // and the next press up moves immediately.
-    {
+    let (before, after, max) = {
         let max = *handle.max_scroll.lock().unwrap();
         let mut s = handle.scroll.lock().unwrap();
+        let before = *s;
         *s = s.saturating_add_signed(delta).min(max);
-    }
+        (before, *s, max)
+    };
+    // Log the real numbers. The old line claimed only "an offset was requested",
+    // which is indistinguishable from a working scroll in the journal -- so a
+    // scroll that moved nothing looked identical to one that moved.
+    log::info!(
+        "scroll '{name}' delta={delta}: offset {before} -> {after} (ceiling {max})"
+    );
     true
 }
 
@@ -476,6 +484,14 @@ fn draw_text(
     Ok(())
 }
 
+/// Pixels one scroll hotkey press moves the highlights view.
+///
+/// The shared offset counter counts in these steps, so the publisher
+/// (`render_rows`) and the consumer (the stream's `* PX_PER_SCROLL_STEP`) must
+/// use the same constant. A field's own `line_h` is deliberately NOT used here:
+/// it varies per size class, and mixing units silently truncated travel.
+const PX_PER_SCROLL_STEP: i32 = 8;
+
 impl CustomProvider {
     /// Scrolling article view: wraps the detail field's value to the panel
     /// width and shows a window of lines starting at `scroll`.
@@ -600,14 +616,13 @@ impl CustomProvider {
             y += 12;
         }
 
-        // A short/no-data view has nothing to scroll, and must clear any
-        // ceiling left by the previous, taller item.
-        *max_scroll.lock().unwrap() = 0;
-
         // No data retrieved yet — explicit placeholder centered in the
         // available vertical space. FONT_9X15 is 15px tall, so a 40px
         // panel centers at top_y = 12 (no header) or 14 (with header).
         if values.is_empty() {
+            // This return skips the ceiling computation below, so clear it here
+            // or a stale bound from the previous, taller item would persist.
+            *max_scroll.lock().unwrap() = 0;
             let placeholder = MonoTextStyle::new(&iso_8859_15::FONT_9X15, BinaryColor::On);
             let text = "NO DATA";
             let m = placeholder.measure_string(
@@ -733,8 +748,17 @@ impl CustomProvider {
         // in the registry's LINE units (the hotkey steps by one line = 8px at
         // the smallest pitch), so `scroll_item` can clamp against real
         // content instead of accumulating.
-        let scroll = scroll.clamp(0, (next_auto_y - 40).max(0));
-        *max_scroll.lock().unwrap() = (scroll / 8).max(0) as usize;
+        // Publish the CEILING, not the clamped offset. Publishing `scroll` here
+        // reported 0 on every frame (the clamp had already folded it down),
+        // which pinned the hotkey at the top and killed scrolling entirely.
+        let ceiling_px = (next_auto_y - 40).max(0);
+        let scroll = scroll.clamp(0, ceiling_px);
+        // Convert to the SAME line unit the hotkey counts in. The step is a
+        // fixed `PX_PER_SCROLL_STEP`, so dividing by that (not by the field's
+        // own line_h) is what makes publish and consume agree. An XLarge field
+        // has line_h 14, so dividing by its pitch would hand the hotkey a
+        // ceiling in the wrong unit and cap the real travel short.
+        *max_scroll.lock().unwrap() = (ceiling_px / PX_PER_SCROLL_STEP).max(0) as usize;
 
         for (row_idx, row_y, fsize) in plan {
             let (label, value) = &values[row_idx];
@@ -1742,5 +1766,62 @@ fields = ["title: x |s=A", "author: y |s=XL"]
         .expect("render article");
         assert_eq!(*max_scroll.lock().unwrap(), 0, "nothing to scroll");
     }
+
+
+    /// `render_rows` must publish a POSITIVE ceiling for overflowing content.
+    ///
+    /// Regression: the publish originally wrote the CLAMPED offset rather than
+    /// the ceiling, so it reported 0 on every frame and the scroll hotkey was
+    /// pinned at the top -- scrolling stopped working at all. The unit-level
+    /// clamp tests passed regardless, because they drive the hotkey against a
+    /// hand-set bound instead of the renderer's.
+    #[test]
+    fn render_rows_publishes_a_ceiling_for_overflowing_content() {
+        use std::sync::{Arc, Mutex};
+        let max_scroll = Arc::new(Mutex::new(usize::MAX));
+        let provider = build_with("a.b: -");
+        let long = "the quick brown fox jumps over the lazy dog ".repeat(12);
+        let values = vec![("Lbl".to_string(), long)];
+        CustomProvider::render_rows(
+            "t",
+            &values,
+            false,
+            &provider.fields,
+            0,
+            &max_scroll,
+        )
+        .expect("render");
+        let published = *max_scroll.lock().unwrap();
+        assert_ne!(published, usize::MAX, "must overwrite the sentinel");
+        assert!(
+            published > 0,
+            "overflowing content must publish a positive ceiling, got {published}"
+        );
+    }
+
+    /// A short item that fits the panel has nothing to scroll, so the ceiling
+    /// must be zero -- and must NOT be left over from a taller previous item.
+    #[test]
+    fn render_rows_clears_a_stale_ceiling_when_empty() {
+        use std::sync::{Arc, Mutex};
+        let max_scroll = Arc::new(Mutex::new(99usize));
+        let provider = build_with("a.b: -");
+        CustomProvider::render_rows(
+            "t",
+            &[], // no data -> early return that skips the bound
+            false,
+            &provider.fields,
+            0,
+            &max_scroll,
+        )
+        .expect("render");
+        assert_eq!(
+            *max_scroll.lock().unwrap(),
+            0,
+            "an empty view must clear the previous ceiling"
+        );
+    }
+
+
 
 }
