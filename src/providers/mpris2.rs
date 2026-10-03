@@ -1,3 +1,12 @@
+//! MPRIS2 media provider: now-playing metadata, progress and playback state.
+//!
+//! Named `mpris2` because that is the name it registers under and the
+//! config table it reads (`mpris2.*`). It was called `music.rs`, which made
+//! the knowledge graph read it as dead code -- searching the graph for
+//! `mpris2` landed on the `apex-mpris2` crate instead of on this file.
+//!
+//! The MPRIS protocol layer itself lives in the `apex-mpris2` crate; the
+//! Windows implementation in `apex-windows`.
 use crate::render::{
     display::ContentProvider,
     scheduler::{ContentWrapper, FocusChannel, CONTENT_PROVIDERS},
