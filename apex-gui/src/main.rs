@@ -76,6 +76,8 @@ struct App {
     hotkey_numpad_scroll_up: bool,
     hotkey_numpad_scroll_down: bool,
     hotkey_numpad_detail_toggle: bool,
+    hotkey_numpad_notification_lock: bool,
+    hotkey_numpad_eightball: bool,
     /// Field-editor drag state (persists across frames while dragging).
     field_drag_from: Option<usize>,
     /// Set when the debug checkbox is ticked. The daemon fixes its log level
@@ -120,6 +122,8 @@ impl App {
         let scroll_up_hk = hotkey_str("scroll_up");
         let scroll_down_hk = hotkey_str("scroll_down");
         let detail_hk = hotkey_str("detail_toggle");
+        let notif_lock_hk = hotkey_str("notification_lock");
+        let eightball_hk = hotkey_str("eightball");
 
         let mut app = Self {
             config_path: path,
@@ -146,6 +150,8 @@ impl App {
             hotkey_numpad_scroll_up: hotkey_is_numpad(&scroll_up_hk),
             hotkey_numpad_scroll_down: hotkey_is_numpad(&scroll_down_hk),
             hotkey_numpad_detail_toggle: hotkey_is_numpad(&detail_hk),
+            hotkey_numpad_notification_lock: hotkey_is_numpad(&notif_lock_hk),
+            hotkey_numpad_eightball: hotkey_is_numpad(&eightball_hk),
             field_drag_from: None,
             debug_restart_prompt: false,
             field_drag_over: None,
@@ -199,6 +205,9 @@ impl App {
                     "hotkeys.scroll_up" => self.hotkey_numpad_scroll_up,
                     "hotkeys.scroll_down" => self.hotkey_numpad_scroll_down,
                     "hotkeys.detail_toggle" => self.hotkey_numpad_detail_toggle,
+                    "hotkeys.notification_lock" => self.hotkey_numpad_notification_lock,
+                    "hotkeys.eightball" => self.hotkey_numpad_eightball,
+                    "hotkeys.eightball" => self.hotkey_numpad_eightball,
                     _ => false,
                 };
                 let combo = if use_numpad {
@@ -774,6 +783,16 @@ impl eframe::App for App {
                 {
                     self.selected = Some("__notifications".to_string());
                 }
+                if ui
+                    .add(
+                        egui::Button::new("8 Ball")
+                            .selected(self.selected.as_deref() == Some("__eightball")),
+                    )
+                    .on_hover_text("Ask the 8 ball on demand — not part of the rotation")
+                    .clicked()
+                {
+                    self.selected = Some("__eightball".to_string());
+                }
 
                 ui.separator();
                 ui.label(egui::RichText::new("SETTINGS").small().weak());
@@ -795,6 +814,7 @@ impl eframe::App for App {
                     let title = match name.as_str() {
                         "__hotkeys" => "Hotkeys",
                         "__notifications" => "Notifications",
+                        "__eightball" => "8 Ball",
                         _ => name.as_str(),
                     };
                     ui.heading(title);
@@ -937,6 +957,8 @@ const PROVIDER_ROW_BUTTON_W: f32 = 165.0;
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
     if name == "__notifications" {
         notifications_editor(ui, app);
+    } else if name == "__eightball" {
+        eightball_editor(ui, app);
     } else if name == "__hotkeys" {
         hotkeys_editor(ui, app);
         return;
@@ -1216,6 +1238,71 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
     }
 }
 
+/// Settings for the on-demand 8 ball.
+///
+/// Lives in an `[eightball]` table. Deliberately NOT a provider: it has no
+/// priority, no dwell and never enters the rotation — it only produces frames
+/// when the hotkey is pressed, as an overlay.
+fn eightball_editor(ui: &mut egui::Ui, app: &mut App) {
+    ui.label(
+        "Shown on demand when you press its hotkey. It is an overlay, not a \
+         provider: it never enters the rotation and has no dwell or priority.",
+    );
+    ui.label(
+        "The ball animates while the answer is fetched, then shows the reading \
+         beside it. Requests are made only when the key is pressed.",
+    );
+
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        ui.label("Reading duration (s):")
+            .on_hover_text("How long the answer stays on screen after it arrives");
+        let mut d = app.get_int("eightball.duration").max(1);
+        if ui
+            .add(egui::DragValue::new(&mut d).clamp_range(1..=300))
+            .changed()
+        {
+            app.set_int("eightball.duration", d);
+        }
+    });
+
+    ui.horizontal(|ui| {
+        toggle(ui, app, "eightball.show_timer", "Countdown");
+        toggle(ui, app, "eightball.timer_border", "Edge frame");
+    });
+
+    ui.separator();
+    ui.label("Layout");
+    ui.label(
+        "The ball occupies the lower-left, so the reading starts to its right. \
+         The app line is off by default: the ball already identifies the source.",
+    );
+    notif_line_editor_for(ui, app, "eightball", "app", "App:");
+    notif_line_editor_for(ui, app, "eightball", "title", "Title:");
+    notif_line_editor_for(ui, app, "eightball", "content", "Reading:");
+
+    ui.separator();
+    ui.label("Source");
+    let mut url = app.get_str("eightball.url");
+    if url.is_empty() {
+        url = "https://eightballapi.com/api?locale=en".into();
+    }
+    ui.horizontal(|ui| {
+        ui.label("URL:");
+        ui.text_edit_singleline(&mut url);
+        if ui.button("Reset").clicked() {
+            url = "https://eightballapi.com/api?locale=en".into();
+            app.set_str("eightball.url", &url);
+        }
+    });
+    ui.label(
+        "The API returns 403 without a User-Agent header; the daemon always \
+         sends one, so no key or token is needed.",
+    );
+    ui.label("Restart the daemon for changes to take effect.");
+}
+
 /// Settings for desktop notifications.
 ///
 /// Lives in a `[notifications]` table, read by the scheduler and the
@@ -1263,7 +1350,21 @@ fn notifications_editor(ui: &mut egui::Ui, app: &mut App) {
 
 /// Per-line editor for one notification text part.
 fn notif_line_editor(ui: &mut egui::Ui, app: &mut App, part: &str, label: &str) {
-    let base = format!("notifications.lines.{part}");
+    notif_line_editor_for(ui, app, "notifications", part, label)
+}
+
+/// Row editor for one text part of any overlay, under `<table>.lines.<part>`.
+///
+/// Shared by notifications and the 8 ball so a layout tweak applies to both.
+/// `table` is the config root: "notifications" or "eightball".
+fn notif_line_editor_for(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    table: &str,
+    part: &str,
+    label: &str,
+) {
+    let base = format!("{table}.lines.{part}");
 
     ui.horizontal(|ui| {
         ui.label(label);
@@ -1379,6 +1480,8 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
     let mut numpad_scroll_up = app.hotkey_numpad_scroll_up;
     let mut numpad_scroll_down = app.hotkey_numpad_scroll_down;
     let mut numpad_detail = app.hotkey_numpad_detail_toggle;
+    let mut numpad_notif_lock = app.hotkey_numpad_notification_lock;
+    let mut numpad_eightball = app.hotkey_numpad_eightball;
 
     hotkey_text_field(
         ui,
@@ -1454,11 +1557,29 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
         "Ctrl+Alt+Numpad0",
         &mut numpad_detail,
     );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.notification_lock",
+        "Lock / unlock notification",
+        "Ctrl+Alt+Numpad.",
+        &mut numpad_notif_lock,
+    );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.eightball",
+        "Ask the 8 ball",
+        "Ctrl+Alt+Numpad8",
+        &mut numpad_eightball,
+    );
     app.hotkey_numpad_item_next = numpad_item_next;
     app.hotkey_numpad_item_previous = numpad_item_prev;
     app.hotkey_numpad_scroll_up = numpad_scroll_up;
     app.hotkey_numpad_scroll_down = numpad_scroll_down;
     app.hotkey_numpad_detail_toggle = numpad_detail;
+    app.hotkey_numpad_notification_lock = numpad_notif_lock;
+    app.hotkey_numpad_eightball = numpad_eightball;
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1471,6 +1592,8 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
             app.set_str("hotkeys.scroll_up", "Ctrl+Alt+Up");
             app.set_str("hotkeys.scroll_down", "Ctrl+Alt+Down");
             app.set_str("hotkeys.detail_toggle", "Ctrl+Alt+Numpad0");
+            app.set_str("hotkeys.notification_lock", "Ctrl+Alt+Numpad.");
+            app.set_str("hotkeys.eightball", "Ctrl+Alt+Numpad8");
             app.recording_hotkey = None;
             app.status = "Hotkeys reset to defaults".to_string();
         }
@@ -1659,6 +1782,10 @@ fn recorded_key_name(key: egui::Key) -> Option<&'static str> {
         egui::Key::Space => "Space",
         egui::Key::Slash => "/",
         egui::Key::Minus => "-",
+        // The numpad decimal is the one key the daemon needs spelled out
+        // rather than as bare ".": its parser matches the bare period as a
+        // TOP-ROW key, so a recorded "Ctrl+Alt+." would bind the wrong one.
+        egui::Key::Period => ".",
         egui::Key::Plus => "+",
         egui::Key::Num0 => "0",
         egui::Key::Num1 => "1",

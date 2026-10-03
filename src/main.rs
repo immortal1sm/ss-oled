@@ -137,6 +137,12 @@ pub async fn main() -> Result<()> {
             detail_toggle: settings
                 .get_str("hotkeys.detail_toggle")
                 .unwrap_or(defaults.detail_toggle),
+            notification_lock: settings
+                .get_str("hotkeys.notification_lock")
+                .unwrap_or(defaults.notification_lock),
+            eightball: settings
+                .get_str("hotkeys.eightball")
+                .unwrap_or(defaults.eightball),
         };
         match apex_input::InputManager::new(tx.clone(), bindings) {
             Ok(manager) => Some(manager),

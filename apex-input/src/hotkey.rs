@@ -21,6 +21,10 @@ pub struct HotkeyBindings {
     pub scroll_down: String,
     /// Enter / leave the article view.
     pub detail_toggle: String,
+    /// Freeze / release the on-screen notification's timer.
+    pub notification_lock: String,
+    /// Ask for an 8ball reading.
+    pub eightball: String,
 }
 
 impl Default for HotkeyBindings {
@@ -34,6 +38,8 @@ impl Default for HotkeyBindings {
             scroll_down: "Ctrl+Alt+Down".to_string(),
             scroll_up: "Ctrl+Alt+Up".to_string(),
             detail_toggle: "Ctrl+Alt+Numpad0".to_string(),
+            notification_lock: "Ctrl+Alt+Numpad.".to_string(),
+            eightball: "Ctrl+Alt+Numpad8".to_string(),
         }
     }
 }
@@ -142,6 +148,16 @@ impl InputManager {
                 "detail_toggle",
                 bindings.detail_toggle.as_str(),
                 Command::ToggleDetail,
+            ),
+            (
+                "notification_lock",
+                bindings.notification_lock.as_str(),
+                Command::ToggleNotificationLock,
+            ),
+            (
+                "eightball",
+                bindings.eightball.as_str(),
+                Command::EightBall,
             ),
         ];
 
@@ -280,6 +296,18 @@ fn register_kde_hotkeys(sender: broadcast::Sender<Command>, bindings: &HotkeyBin
             "Enter / leave article",
             bindings.detail_toggle.as_str(),
             Command::ToggleDetail,
+        ),
+        (
+            "notification_lock",
+            "Lock / unlock notification",
+            bindings.notification_lock.as_str(),
+            Command::ToggleNotificationLock,
+        ),
+        (
+            "eightball",
+            "Ask the 8ball",
+            bindings.eightball.as_str(),
+            Command::EightBall,
         ),
     ];
 
@@ -537,6 +565,13 @@ fn qt_key_code(part: &str) -> Result<(i32, bool)> {
         "f10" => (0x0100_0039, false),
         "f11" => (0x0100_003a, false),
         "f12" => (0x0100_003b, false),
+        // Numpad decimal. Qt spells this Key_Period (0x2e) and flags it with
+        // Qt::KeypadModifier rather than having its own key code -- so the code
+        // is the top-row period's code, not a distinct numpad one. Listed before
+        // the generic "numpad + one char" arms below, which only accept digits
+        // and would bail on a non-digit.
+        "numpad." | "numpaddecimal" | "numpaddot" => (0x2e, true),
+        "period" | "dot" => (0x2e, false),
         // Accept both "Numpad1" and "Numpad 1". egui cannot distinguish a
         // numpad key from its top-row twin (Key::Num1 is documented as
         // "Either from the main row or from the numpad"), so the GUI's own
