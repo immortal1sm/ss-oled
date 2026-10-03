@@ -27,9 +27,6 @@ use log::info;
 use tinybmp::Bmp;
 use tokio::time;
 
-use crate::mpris_shared;
-use crate::mpris_shared::NowPlaying;
-use tokio::sync::broadcast;
 use apex_music::{AsyncPlayer, Metadata, PlaybackStatus, Progress};
 use config::Config;
 use embedded_graphics::{
@@ -121,6 +118,7 @@ static IDLE_TEMPLATE: LazyLock<FrameBuffer> = LazyLock::new(|| {
 static UNKNOWN_TITLE: &str = "Unknown title";
 static UNKNOWN_ARTIST: &str = "Unknown artist";
 
+const RECONNECT_DELAY: u64 = 5;
 
 /// Format a microsecond count (as returned by MPRIS `Position` and
 /// `mpris:length`) as `M:SS`. Returns `"0:00"` for zero or negative values.
@@ -137,11 +135,6 @@ static PROVIDER_INIT: fn(&Config, FocusChannel) -> Result<Box<dyn ContentWrapper
 
 #[allow(clippy::unnecessary_wraps)]
 fn register_callback(config: &Config, focus_tx: FocusChannel) -> Result<Box<dyn ContentWrapper>> {
-    // From the process-wide owner, not a fresh connection: this is the whole
-    // point of sharing. The registry signature is fixed for all providers, so
-    // the handle is fetched here rather than passed in.
-    let mpris = mpris_shared::shared().clone();
-
     info!("Registering MPRIS2 display source.");
 
     let event_focus = config.get_bool("mpris2.event_focus").unwrap_or(true);
@@ -149,12 +142,12 @@ fn register_callback(config: &Config, focus_tx: FocusChannel) -> Result<Box<dyn 
     let show_source_label = config.get_bool("mpris2.show_source_label").unwrap_or(true);
 
     let player = match config.get_str("mpris2.preferred_player") {
-        Ok(name) => MediaPlayerBuilder::new(mpris.clone())
+        Ok(name) => MediaPlayerBuilder::new()
             .with_player_name(name)
             .with_event_focus(event_focus)
             .with_display_options(show_timer, show_source_label)
             .with_focus_tx(focus_tx),
-        Err(_) => MediaPlayerBuilder::new(mpris)
+        Err(_) => MediaPlayerBuilder::new()
             .with_event_focus(event_focus)
             .with_display_options(show_timer, show_source_label)
             .with_focus_tx(focus_tx),
@@ -168,10 +161,7 @@ fn register_callback(config: &Config, focus_tx: FocusChannel) -> Result<Box<dyn 
     Ok(Box::new(player))
 }
 
-// No `Default`: `MprisShared` deliberately has none, because a handle built by
-// hand would never receive a publish. The owner is the only constructor, which
-// is what guarantees every consumer sees the same connection.
-#[derive(Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MediaPlayerBuilder {
     /// If a preference for the player is wanted specify this field
     name: Option<Arc<String>>,
@@ -185,11 +175,6 @@ pub struct MediaPlayerBuilder {
     show_timer: bool,
     /// Show media source label (mpris2.show_source_label).
     show_source_label: bool,
-    /// Process-wide shared MPRIS state. This provider does not open its own
-    /// DBus connection; it reads snapshots published by the owner in
-    /// `mpris_shared`, so a player restart is recovered from exactly once for
-    /// both MPRIS consumers.
-    mpris: mpris_shared::MprisShared,
 }
 
 // Ok so the plan for the MPRIS2 module is to wait for two DBUS events
@@ -301,17 +286,13 @@ impl MediaPlayerRenderer {
         }
     }
 
-    /// Render from the shared MPRIS snapshot.
-    ///
-    /// Takes `&NowPlaying` rather than `&Progress<T>`: the renderer has no
-    /// business knowing the DBus shape. It reads five fields (title, artists,
-    /// length, position, status) and the shared module already flattened them,
-    /// so this drops the last MPRIS type out of the render path entirely.
-    pub fn update(&mut self, np: &NowPlaying) -> Result<FrameBuffer> {
-        let mut display = match np.status {
+    pub fn update<T: Metadata>(&mut self, progress: &Progress<T>) -> Result<FrameBuffer> {
+        let mut display = match progress.status {
             PlaybackStatus::Playing => *PLAY_TEMPLATE,
             PlaybackStatus::Paused | PlaybackStatus::Stopped => *PAUSE_TEMPLATE,
         };
+
+        let metadata = &progress.metadata;
 
         #[cfg(not(target_os = "windows"))]
         {
@@ -319,12 +300,12 @@ impl MediaPlayerRenderer {
             // Snapshot position when actively Playing. When Paused/Stopped,
             // freeze the bar at the last Playing position so Firefox's
             // stale monotonic position doesn't drift the elapsed display.
-            match np.status {
-                PlaybackStatus::Playing => self.last_playing_position = np.position_us,
+            match progress.status {
+                PlaybackStatus::Playing => self.last_playing_position = progress.position,
                 PlaybackStatus::Paused => {}
                 PlaybackStatus::Stopped => self.last_playing_position = 0,
             }
-            let length = np.length_us as f64;
+            let length = metadata.length().unwrap_or(0) as f64;
             let current = self.last_playing_position.max(0) as f64;
 
             let completion = if length > 0.0 {
@@ -348,11 +329,11 @@ impl MediaPlayerRenderer {
             // players (Firefox in particular) keep reporting the last-known
             // position even when the player is fully stopped, which would
             // otherwise show the timer advancing on a stopped track.
-            let elapsed_us = match np.status {
+            let elapsed_us = match progress.status {
                 PlaybackStatus::Stopped => 0,
                 _ => self.last_playing_position.max(0) as u64,
             };
-            let total_us = np.length_us.max(0) as u64;
+            let total_us = metadata.length().unwrap_or(0);
             let timer_text = if total_us > 0 {
                 format!("{} / {}", format_mmss(elapsed_us), format_mmss(total_us))
             } else {
@@ -390,8 +371,8 @@ impl MediaPlayerRenderer {
             }
         }
 
-        let artists = np.artist.clone();
-        let title = np.title.clone();
+        let artists = metadata.artists()?;
+        let title = metadata.title()?;
 
         // Some sources (YouTube via plasma-browser-integration, monochrome.tf,
         // and many other web players) publish the full "title - artist" or
@@ -493,15 +474,8 @@ impl MediaPlayerBuilder {
         self
     }
 
-    pub fn new(mpris: mpris_shared::MprisShared) -> Self {
-        Self {
-            name: None,
-            focus_tx: None,
-            event_focus: true,
-            show_timer: true,
-            show_source_label: true,
-            mpris,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -523,101 +497,65 @@ impl ContentProvider for MediaPlayerBuilder {
             .expect("focus_tx must be set in register_callback");
 
         Ok(try_stream! {
-            // Shared MPRIS state, one connection for the whole process. The
-            // Linux path no longer opens its own DBus handle, so this provider
-            // cannot hold a second, independently-dropping view of the same
-            // player.
-            #[cfg(all(feature = "dbus-support", target_os = "linux"))]
-            let mpris = self.mpris.clone();
+            #[cfg(target_os = "windows")]
+            let mpris = apex_windows::Player::new()?;
+            #[cfg(target_os = "linux")]
+            let mpris = apex_mpris2::MPRIS2::new().await?;
+            pin_mut!(mpris);
 
-            // Focus on a track change needs MPRIS *events*, which a `watch`
-            // cannot carry: they are not a value, and a late subscriber must
-            // not replay a stale one. Those ride the same owner as a broadcast.
-            #[cfg(all(feature = "dbus-support", target_os = "linux"))]
-            let mut events = mpris.subscribe_events();
+            let mut interval = time::interval(Duration::from_secs(RECONNECT_DELAY));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            'outer: loop {
+                info!(
+                    "Trying to connect to DBUS with player preference: {:?}",
+                    self.name
+                );
+                yield *IDLE_TEMPLATE;
+                #[cfg(target_os = "windows")]
+                let player = &mpris;
+                #[cfg(target_os = "linux")]
+                let player = mpris.wait_for_player(self.name.clone()).await?;
 
-            let mut renderer = MediaPlayerRenderer::new()?;
-            renderer.set_display_options(self.show_timer, self.show_source_label);
-            let event_focus = self.event_focus;
-            let focus_tx = self
-                .focus_tx
-                .clone()
-                .expect("focus_tx must be set in register_callback");
-
-            info!("Trying to connect to DBUS with player preference: {:?}", self.name);
-            yield *IDLE_TEMPLATE;
-
-            // Tick: re-read position periodically so the timer advances while
-            // Playing. Events from the shared owner still drive immediate
-            // refreshes (PropertiesChanged / Seeked). Tick rate: 1s when actively
-            // Playing, 5s otherwise (no need to poll a stopped player more often
-            // than reconnects).
-            let mut poll = time::interval(Duration::from_millis(1000));
-            poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
-                // Wait for either a real MPRIS event or the polling tick.
-                #[cfg(all(feature = "dbus-support", target_os = "linux"))]
-                let event = match events.as_mut() {
-                    Some(rx) => tokio::select! {
-                        e = rx.recv() => Some(e),
-                        _ = poll.tick() => None,
-                    },
-                    // Owner not up yet: poll alone rather than dropping the
-                    // provider.
-                    None => {
-                        poll.tick().await;
-                        None
-                    }
-                };
-                #[cfg(not(all(feature = "dbus-support", target_os = "linux")))]
-                {
-                    poll.tick().await;
-                }
-                #[cfg(not(all(feature = "dbus-support", target_os = "linux")))]
-                let event: Option<Result<apex_music::PlayerEvent, tokio::sync::broadcast::error::RecvError>> = None;
-
-                let event = match event {
-                    Some(Ok(e)) => Some(e),
-                    // `Lagged`: we fell behind. Not fatal -- the snapshot is
-                    // authoritative, so resync instead of replaying.
-                    Some(Err(broadcast::error::RecvError::Lagged(_))) => None,
-                    // `Closed`: the owner is gone. Keep drawing the idle frame.
-                    Some(Err(broadcast::error::RecvError::Closed)) => {
-                        yield *IDLE_TEMPLATE;
-                        continue;
-                    }
-                    None => None,
-                };
-                // Read before `event` is consumed below.
-                let got_event = event.is_some();
-
-                // One read of "what is playing", from whichever source this
-                // platform uses. Linux shares it; Windows still owns its own.
-                #[cfg(all(feature = "dbus-support", target_os = "linux"))]
-                let np = mpris.now();
-                #[cfg(not(all(feature = "dbus-support", target_os = "linux")))]
-                let np = {
-                    let player = apex_windows::Player::new()?;
-                    let np = flatten_windows_player(&player).await;
-                    Some(np)
-                };
-
-                let Some(np) = np else {
-                    // Shared connection down, or nothing playing. Draw idle and
-                    // wait; one reconnect restores this along with every other
-                    // MPRIS consumer.
-                    yield *IDLE_TEMPLATE;
-                    continue;
-                };
+                info!("Connected to music player: {:?}", player.name().await);
 
                 // Capture the media source so update() can render it
                 // bottom-right of the timer row.
-                if !np.player.is_empty() {
-                    renderer.set_source(&np.player);
-                }
+                renderer.set_source(&player.name().await);
 
-                if let Some(event) = event {
+                let tracker = mpris.stream().await?;
+                pin_mut!(tracker);
+
+                // Tick: re-poll position periodically so the timer advances
+                // while Playing. Events from `tracker` still drive immediate
+                // refreshes (PropertiesChanged / Seeked). Tick rate: 1s when
+                // actively Playing, 5s otherwise (no need to poll a stopped
+                // player more often than reconnects).
+                let mut poll = time::interval(Duration::from_millis(1000));
+                poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+                loop {
+                    let event = tokio::select! {
+                        e = tracker.next() => e,
+                        _ = poll.tick() => None,
+                    };
+                    let event = match event {
+                        Some(e) => e,
+                        None => {
+                            // Periodic tick — only re-render if the player is
+                            // actively playing, so paused/stopped stays frozen.
+                            if let Ok(progress) = player.progress().await {
+                                if matches!(
+                                    progress.status,
+                                    PlaybackStatus::Playing
+                                ) {
+                                    if let Ok(image) = renderer.update(&progress) {
+                                        yield image;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     log::debug!("MPRIS event: {:?}", event);
                     // React to MPRIS events. We fire focus on PropertiesChanged
                     // AND Seeked. The latter catches cases where Firefox
@@ -625,27 +563,29 @@ impl ContentProvider for MediaPlayerBuilder {
                     // (rare but happens). Timer events don't fire focus.
                     if matches!(
                         event,
-                        apex_music::PlayerEvent::Properties | apex_music::PlayerEvent::Seeked
+                        apex_music::PlayerEvent::Properties
+                            | apex_music::PlayerEvent::Seeked
                     ) {
                         // Honor mpris2.event_focus: when disabled, media state
-                        // changes still re-render this screen if it's shown, but
-                        // do NOT steal focus from another provider.
+                        // changes still re-render this screen if it's shown,
+                        // but do NOT steal focus from another provider.
                         if event_focus {
                             log::info!("MPRIS event fired: {:?}", event);
-                            let send_result =
-                                focus_tx.send(crate::render::scheduler::ProviderWantsFocus);
+                            let send_result = focus_tx.send(
+                                crate::render::scheduler::ProviderWantsFocus,
+                            );
                             log::info!("focus_tx.send result: {:?}", send_result);
                         } else {
                             log::debug!("MPRIS event (event_focus off): {:?}", event);
                         }
                     }
-                }
 
-                // On the polling path only repaint while actively playing, so a
-                // paused/stopped player stays frozen instead of churning pixels.
-                if got_event || matches!(np.status, PlaybackStatus::Playing) {
-                    if let Ok(image) = renderer.update(&np) {
-                        yield image;
+                    if let Ok(progress) = player.progress().await {
+                        if let Ok(image) = renderer.update(&progress) {
+                            yield image;
+                        }
+                    } else {
+                        continue 'outer;
                     }
                 }
             }
