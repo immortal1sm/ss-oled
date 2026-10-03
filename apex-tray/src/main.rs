@@ -160,13 +160,7 @@ impl Tray for SsOledTray {
             StandardItem {
                 label: "Open settings…".into(),
                 activate: Box::new(|_tray: &mut Self| {
-                    let already = std::process::Command::new("pgrep")
-                        .arg("-f")
-                        .arg("apex-gui")
-                        .output()
-                        .map(|o| !o.stdout.is_empty())
-                        .unwrap_or(false);
-                    if already {
+                    if gui_running() {
                         return;
                     }
                     // The GUI needs a display connection; if this tray was
@@ -327,4 +321,37 @@ async fn main() -> Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
+}
+
+/// Is an apex-gui actually running?
+///
+/// `pgrep -f apex-gui` alone is not enough: a process that already exited but
+/// has not been reaped by its parent still shows up as `[apex-gui] <defunct>`.
+/// Treating that as "already running" makes this menu item silently do nothing,
+/// with no window and no error -- it just looks like the GUI is broken.
+/// Only a process still in a running state counts.
+fn gui_running() -> bool {
+    let out = match std::process::Command::new("pgrep").args(["-f", "apex-gui"]).output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .any(|pid| {
+            // Field 3 of /proc/<pid>/stat is the single-letter state, and it
+            // sits after the comm field in parentheses -- which may itself
+            // contain spaces or ')'. Split on the LAST ')' to find it safely.
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false; // gone between pgrep and now
+            };
+            match stat.rfind(')') {
+                Some(i) => stat[i + 1..]
+                    .split_whitespace()
+                    .next()
+                    .map(|state| state != "Z")
+                    .unwrap_or(false),
+                None => false,
+            }
+        })
 }

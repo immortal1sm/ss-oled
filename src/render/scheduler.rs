@@ -139,10 +139,28 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         let (focus_tx, _) = broadcast::channel::<ProviderWantsFocus>(16);
 
         #[cfg(not(target_os = "macos"))]
-        let mut providers = CONTENT_PROVIDERS
-            .iter()
-            .map(|f| (f)(&mut config, focus_tx.clone()))
-            .collect::<Result<Vec<_>>>()?;
+        // A provider that is disabled in config reports that by returning an
+        // error from its register function. That must NOT be fatal: weather,
+        // lyrics, image and friends all bail with "disabled" when their
+        // `enabled` flag is off. Propagating the error killed the whole daemon,
+        // and systemd restarted it into the same crash ~3s later -- an endless
+        // restart loop from a deliberately disabled provider.
+        let mut providers = Vec::new();
+        for f in CONTENT_PROVIDERS.iter() {
+            match (f)(&mut config, focus_tx.clone()) {
+                Ok(p) => providers.push(p),
+                // Skip disabled/unconfigured providers; anything else is a
+                // genuine failure and should still surface.
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("disabled") {
+                        log::info!("skipping disabled provider: {msg}");
+                    } else {
+                        log::warn!("provider failed to register: {msg}");
+                    }
+                }
+            }
+        }
 
         // Dynamic custom providers from [providers.custom.*] sections.
         #[cfg(feature = "custom")]
