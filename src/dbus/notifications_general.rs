@@ -42,7 +42,7 @@ fn register_callback() -> Result<Box<dyn NotificationWrapper>> {
 
     // The distributed-slice constructor takes no arguments, so the settings
     // are read here rather than injected. `notifications.default_duration` is
-    // the fallback used when a sender passes expire_timeout 0/-1 ("you decide").
+    // How long every notification displays. Authoritative.
     let mut settings = config::Config::default();
     if let Some(dir) = dirs::config_dir() {
         let _ = settings.merge(
@@ -50,10 +50,13 @@ fn register_callback() -> Result<Box<dyn NotificationWrapper>> {
                 .required(false),
         );
     }
-    let default_seconds = settings
-        .get_int("notifications.default_duration")
+    // `duration` is canonical. `default_duration` is still read so existing
+    // configs keep working; remove that fallback once configs have migrated.
+    let duration_seconds = settings
+        .get_int("notifications.duration")
+        .or_else(|_| settings.get_int("notifications.default_duration"))
         .unwrap_or(5)
-        .clamp(1, 60) as u64;
+        .clamp(1, 300) as u64;
 
     // Layout comes from the same table, one entry per text part:
     //
@@ -115,15 +118,15 @@ fn register_callback() -> Result<Box<dyn NotificationWrapper>> {
     };
 
     Ok(Box::new(Dbus {
-        default_seconds,
+        duration_seconds,
         layout,
     }))
 }
 
 pub struct Dbus {
-    /// Display time used when the sender passes expire_timeout 0/-1.
-    /// Configured via `notifications.default_duration`.
-    default_seconds: u64,
+    /// How long every notification displays, from `notifications.duration`.
+    /// This is authoritative — the sender's request is informational only.
+    duration_seconds: u64,
     /// Text placement, configured under `[notifications]`.
     layout: Layout,
 }
@@ -135,9 +138,6 @@ struct Generic {
     body: String,
     /// Absolute path from `hints["image-path"]`, if the sender supplied one.
     image_path: Option<String>,
-    /// Display time the sender asked for, in seconds (`expire_timeout`).
-    /// `None` when it passed 0/-1, meaning "server decides".
-    expire_timeout: Option<u64>,
 }
 
 impl Generic {
@@ -165,7 +165,7 @@ impl Generic {
         }
     }
 
-    fn render(&self, default_seconds: u64, layout: Layout) -> Result<Notification> {
+    fn render(&self, duration_seconds: u64, layout: Layout) -> Result<Notification> {
         // `with_title` borrows, so the title must outlive the builder.
         let title = self.title();
         let mut builder = NotificationBuilder::new().with_title(&title);
@@ -178,9 +178,21 @@ impl Generic {
                 builder = builder.with_icon(icon);
             }
         }
-        // Honour the sender's requested time; fall back to the configured
-        // default when it asked us to decide (0 / -1).
-        builder = builder.with_hold_seconds(self.expire_timeout.unwrap_or(default_seconds));
+        log::info!(
+            "notification content: app={:?} title={:?} body_len={}",
+            self.app_name,
+            self.title(),
+            self.body.chars().count()
+        );
+
+        // The configured duration is authoritative and the sender's
+        // `expire_timeout` is deliberately ignored. One knob, one behaviour:
+        // what you set is what every notification shows. The sender's value is
+        // not even parsed -- it is milliseconds per the freedesktop spec but
+        // seconds for notify-send's -t, and honouring it either way is how a
+        // 2500ms request became a 41-minute notification that wedged the
+        // scheduler for good.
+        builder = builder.with_hold_seconds(duration_seconds);
         builder = builder.with_layout(layout).with_app_name(&self.app_name);
         builder.build()
     }
@@ -238,21 +250,11 @@ impl TryFrom<Message> for Generic {
             image_path = Some(app_icon.clone());
         }
 
-        // `expire_timeout` is argument index 7, in seconds. Senders use it as
-        // the requested display time (`notify-send -t 10` sends 10). 0 or -1
-        // means "server decides", so those fall back to the configured default
-        // rather than being treated as a real duration.
-        let expire_timeout = match value.get_items().get(7) {
-            Some(MessageItem::Int32(ms)) if *ms > 0 => Some(*ms as u64),
-            _ => None,
-        };
-
         Ok(Generic {
             app_name,
             summary,
             body,
             image_path,
-            expire_timeout,
         })
     }
 }
@@ -275,7 +277,7 @@ impl NotificationProvider for Dbus {
             panic!("Lost connection to D-Bus: {err}");
         });
 
-        let default_seconds = self.default_seconds;
+        let duration_seconds = self.duration_seconds;
         let layout = self.layout.clone();
 
         let (mut tx, mut rx) = mpsc::channel(16);
@@ -323,7 +325,7 @@ impl NotificationProvider for Dbus {
                 if generic.title().is_empty() {
                     continue;
                 }
-                match generic.render(default_seconds, layout.clone()) {
+                match generic.render(duration_seconds, layout.clone()) {
                     Ok(n) => yield n,
                     // A bad icon or an over-long title shouldn't kill the stream.
                     Err(e) => log::warn!("could not render notification: {e}"),

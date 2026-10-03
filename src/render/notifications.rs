@@ -58,6 +58,22 @@ pub struct Notification {
     timer_border: bool,
 }
 
+impl Notification {
+    /// How long this notification is *expected* to take to stream to completion.
+    ///
+    /// The scheduler uses this as its timeout budget. It is deliberately an
+    /// upper bound rather than the nominal figure: `TICK_LENGTH` is 50ms but
+    /// every frame also does a USB write, so real elapsed time exceeds
+    /// ticks x TICK_LENGTH. Budgeting to the theoretical minimum would cut off
+    /// a long, scrolling notification before its last frame.
+    pub fn expected_duration(&self) -> Duration {
+        let ticks = u64::from(self.ticks);
+        let nominal = Duration::from_millis(ticks * TICK_LENGTH as u64);
+        // x2 covers slow USB writes; +3s is slack for scheduling jitter.
+        nominal * 2 + Duration::from_secs(3)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Icon<'a>(Bmp<'a, BinaryColor>);
 
@@ -344,6 +360,12 @@ impl ContentProvider for Notification {
     fn stream(&mut self) -> Result<<Self as ContentProvider>::ContentStream<'_>> {
         let mut interval = time::interval(Duration::from_millis(TICK_LENGTH.as_()));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let t0 = std::time::Instant::now();
+        log::info!(
+            "notification: streaming {} ticks (~{}ms nominal)",
+            self.ticks,
+            u32::from(self.ticks) * TICK_LENGTH as u32
+        );
         // Two countdown styles: a 1px frame around the panel edge (default,
         // occupies no interior space) or the original corner ring.
         let timer_border = self.timer_border;
@@ -413,6 +435,15 @@ impl ContentProvider for Notification {
                     } else {
                         progress.draw_at(i as f32, &mut image)?;
                     }
+                }
+                // Frame progress. A stall used to be completely silent, which
+                // made it impossible to tell whether the stream hung before
+                // its first frame, partway through, or on the final tick.
+                // Log the first frame, then every 10th, plus the last.
+                if i == 0 {
+                    log::info!("notification: first frame after {:?}", t0.elapsed());
+                } else if i % 10 == 0 {
+                    log::info!("notification: frame {i}/{} at {:?}", self.ticks, t0.elapsed());
                 }
                 yield image;
                 interval.tick().await;
