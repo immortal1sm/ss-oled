@@ -153,15 +153,15 @@ sections as you like — each is an independent screen.
 
 ## Notifications
 
-Desktop notifications from any application are rendered on the panel and
-interrupt the rotation. The sending app's requested timeout is honoured
-(`notify-send -t 10` displays for about 10 seconds); when an app doesn't ask for
-one, `default_duration` applies.
+Desktop notifications from any application are drawn over whatever the
+rotation is currently showing. Notifications are **not** a provider: they are
+never rotated to, have no priority, dwell, or enabled flag, and cannot be added
+to the rotation list. They interrupt, display, then hand the screen back.
 
 ```toml
 [notifications]
 override = true          # show immediately, even while a provider is locked
-default_duration = 5     # fallback when the app doesn't request a duration
+duration = 5             # how long a notification is shown
 show_timer = true        # draw the countdown indicator
 
 [notifications.lines.app]
@@ -396,8 +396,9 @@ Carried over from upstream, plus this fork\'s own roadmap:
   word-wrap, live 128×40 GUI preview, NO DATA placeholders; any number of
   independent API screens
 - [x] **Desktop notifications** ✅ — any app's notifications rendered on the
-  panel with the sender's requested duration, per-line layout (size, alignment,
-  row, nudge, wrap), override-or-queue toggle, edge-frame countdown
+  overlay that interrupts the rotation, per-line layout (size, alignment, row,
+  nudge, wrap), fixed duration, override-or-queue toggle, edge-frame countdown,
+  and a timeout so it can never block the rotation
 - [ ] GPU telemetry provider (amdgpu hwmon: busy %, temps, power, VRAM)
 - [ ] Idle blanking / dimming — real OLED burn-in mitigation
 - [x] **Rebindable hotkeys** — GUI Hotkeys tab records settings-backed mappings

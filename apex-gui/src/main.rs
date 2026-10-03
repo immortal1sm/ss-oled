@@ -639,23 +639,22 @@ impl eframe::App for App {
                                     self.set_bool(&enabled_key, enabled);
                                 }
 
-                                let label = ui.selectable_label(is_selected, name.as_str());
-
-                                // Transparent interaction layer over the whole
-                                // row (checkbox excluded) handling select+drag.
-                                // Grow the hitbox only RIGHTWARD so it never
-                                // overlaps the checkbox to its left.
-                                let mut hb = label.rect;
-                                hb.max.x += 60.0;
-                                hb.min.y -= 4.0;
-                                hb.max.y += 4.0;
-                                let row_id = egui::Id::new(("provider_row", name));
-                                let hitbox = ui.interact(hb, row_id, egui::Sense::click_and_drag());
-                                if hitbox.clicked() {
+                                // The Button carries click AND drag sense
+                                // itself. A separate transparent `ui.interact`
+                                // layer on top of it stole the pointer, so the
+                                // row never got the hover highlight the
+                                // "Add custom" button has.
+                                let resp = ui.add(
+                                    egui::Button::new(name.as_str())
+                                        .selected(is_selected)
+                                        .sense(egui::Sense::click_and_drag())
+                                        .min_size(egui::vec2(PROVIDER_ROW_BUTTON_W, 0.0)),
+                                );
+                                if resp.clicked() {
                                     self.selected = Some(name.clone());
-                    self.pending_remove = None;
+                                    self.pending_remove = None;
                                 }
-                                if hitbox.drag_started() {
+                                if resp.drag_started() {
                                     self.drag_from = Some(idx);
                                 }
                             });
@@ -703,22 +702,34 @@ impl eframe::App for App {
                         }
                     });
 
+                // Everything below is NOT a provider. Notifications are an
+                // overlay: they interrupt whatever the rotation is showing,
+                // are never rotated to, and have no priority/dwell/enabled.
+                // Grouping them under their own heading keeps that distinction
+                // visible instead of implying they sit in the rotation.
                 ui.separator();
+                ui.label(egui::RichText::new("OVERLAYS").small().weak());
                 if ui
-                    .selectable_label(self.selected.as_deref() == Some("__hotkeys"), "Hotkeys")
-                    .clicked()
-                {
-                    self.selected = Some("__hotkeys".to_string());
-                }
-
-                // Desktop-notification behaviour. Not a provider, so it gets a
-                // synthetic sidebar entry like Hotkeys — there is no
-                // `[notifications]` provider section to hang it off.
-                if ui
-                    .selectable_label(self.selected.as_deref() == Some("__notifications"), "Notifications")
+                    .add(
+                        egui::Button::new("Notifications")
+                            .selected(self.selected.as_deref() == Some("__notifications")),
+                    )
+                    .on_hover_text("Interrupts the current screen when one arrives")
                     .clicked()
                 {
                     self.selected = Some("__notifications".to_string());
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("SETTINGS").small().weak());
+                if ui
+                    .add(
+                        egui::Button::new("Hotkeys")
+                            .selected(self.selected.as_deref() == Some("__hotkeys")),
+                    )
+                    .clicked()
+                {
+                    self.selected = Some("__hotkeys".to_string());
                 }
             });
 
@@ -811,6 +822,16 @@ impl eframe::App for App {
     }
 }
 
+/// Shared width for every button in the left sidebar.
+///
+/// The sidebar is `default_width(240.0)`; 216 leaves the usual egui frame
+/// margin so the buttons span the panel evenly instead of each one sizing to
+/// its own label.
+/// Shared width for the provider rows only, so they line up with each other.
+/// Sized to sit comfortably beside the enabled-checkbox in the 240px sidebar
+/// without the row reading as a full-width bar.
+const PROVIDER_ROW_BUTTON_W: f32 = 165.0;
+
 fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
     if name == "__notifications" {
         notifications_editor(ui, app);
@@ -836,7 +857,8 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
     if name != "weather" {
         let dwell_key = format!("interval.{name}");
         ui.horizontal(|ui| {
-            ui.label("Duration (s):");
+            ui.label("Show for (s):")
+                .on_hover_text("How long this screen stays before the rotation moves on");
             let mut d = app.get_int(&dwell_key);
             if d == 0 {
                 d = app.get_int("interval.refresh");
@@ -1105,15 +1127,17 @@ fn notifications_editor(ui: &mut egui::Ui, app: &mut App) {
     );
 
     ui.horizontal(|ui| {
-        ui.label("Duration (s):");
-        let mut d = app.get_int("notifications.default_duration").max(1);
+        ui.label("Notification duration (s):")
+            .on_hover_text("How long every notification is shown, whatever the app requests");
+        let mut d = app
+            .get_int("notifications.duration")
+            .max(1);
         if ui
-            .add(egui::DragValue::new(&mut d).clamp_range(1..=60))
+            .add(egui::DragValue::new(&mut d).clamp_range(1..=300))
             .changed()
         {
-            app.set_int("notifications.default_duration", d);
+            app.set_int("notifications.duration", d);
         }
-        ui.label("fallback when the app doesn't ask for a duration");
     });
 
     ui.separator();
@@ -1690,7 +1714,8 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
         }
     });
     ui.horizontal(|ui| {
-        ui.label("Duration (s):");
+        ui.label("Show for (s):")
+            .on_hover_text("How long this screen stays before the rotation moves on");
         let mut d = app.get_int(&format!("interval.{name}"));
         if d == 0 {
             d = app.get_int("interval.refresh");

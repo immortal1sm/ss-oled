@@ -23,6 +23,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
+use tokio::time::{error::Elapsed, timeout};
 use tokio::{
     sync::broadcast,
     time::{self, MissedTickBehavior},
@@ -391,11 +392,45 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                     // the highest priority and is shown even
                                     // while the provider list is locked.
                                     log::info!("Notification received — displaying (override)");
+                                    // Compute the budget BEFORE the mutable
+                                    // borrow that the stream needs.
+                                    let budget = notification.expected_duration();
                                     let mut stream = Box::pin(notification.stream()?);
-                                    while let Some(display) = stream.next().await {
-                                        self.device.draw(&display?).await?;
+
+                                    // Hard bound. The stream is tick-driven and
+                                    // should always finish, but a notification
+                                    // must never be able to block rotation
+                                    // indefinitely. The budget comes from the
+                                    // notification's own tick count (x2 + slack,
+                                    // see expected_duration), so it tracks the
+                                    // configured duration automatically and
+                                    // never cuts off a legitimate long one.
+                                    let shown_at = Instant::now();
+                                    let mut frames = 0u32;
+                                    let outcome: Result<Result<(), anyhow::Error>, Elapsed> =
+                                        timeout(budget, async {
+                                        while let Some(display) = stream.next().await {
+                                            self.device.draw(&display?).await?;
+                                            frames += 1;
+                                        }
+                                        Ok(())
+                                    })
+                                    .await;
+                                    // Err = the budget expired with the stream
+                                    // still running; Ok(Err) = a draw failed.
+                                    let timed_out = matches!(outcome, Err(_));
+
+                                    if timed_out {
+                                        log::warn!(
+                                            "notification stream exceeded {:?} after {} frames; resuming rotation",
+                                            budget, frames
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "Notification display finished after {:?} ({} frames); resuming rotation",
+                                            shown_at.elapsed(), frames
+                                        );
                                     }
-                                    log::info!("Notification display finished; resuming rotation");
                                 } else {
                                     // Queued: hold it until the current
                                     // provider's dwell expires, then show it
