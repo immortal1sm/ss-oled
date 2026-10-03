@@ -29,8 +29,9 @@ use dbus::{
 use dbus_tokio::connection;
 
 use futures::{channel::mpsc, StreamExt};
-use log::info;
+use log::{info, warn};
 use std::time::Duration;
+use super::notifications::unescape_entities;
 
 /// Registered into the scheduler's notification slot at startup.
 #[linkme::distributed_slice(NOTIFICATION_PROVIDERS)]
@@ -145,22 +146,22 @@ impl Generic {
     /// appended when the summary leaves room. Fall back to the body, then the
     /// app name, so the panel is never blank.
     fn title(&self) -> String {
-        let summary = self.summary.trim();
+        let summary = unescape_entities(self.summary.trim());
         if !summary.is_empty() {
             return summary.to_string();
         }
-        let body = self.body.trim();
+        let body = unescape_entities(self.body.trim());
         if !body.is_empty() {
-            return body.to_string();
+            return body;
         }
         self.app_name.clone()
     }
 
     fn content(&self) -> String {
-        let summary = self.summary.trim();
-        let body = self.body.trim();
+        let summary = unescape_entities(self.summary.trim());
+        let body = unescape_entities(self.body.trim());
         match (summary.is_empty(), body.is_empty()) {
-            (false, false) => body.to_string(),
+            (false, false) => body,
             _ => String::new(),
         }
     }
@@ -259,6 +260,51 @@ impl TryFrom<Message> for Generic {
     }
 }
 
+/// Open a bus connection, become a `Notify` monitor, and resolve when that
+/// connection is lost. The caller re-runs this to recover. Shared with
+/// `notifications.rs`; see the comment there about polling `resource`.
+async fn connect_and_monitor(
+    rule: MatchRule<'static>,
+    mut tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    let (resource, conn) = connection::new_session_sync()?;
+    let conn2 = conn.clone();
+
+    let proxy = nonblock::Proxy::new(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        Duration::from_millis(5000),
+        conn,
+    );
+
+    // BecomeMonitor lets us watch every Notify on the session bus. The flag
+    // argument is 0 (not eavesdropping) per the DBus spec.
+    let setup = proxy.method_call::<(), _, _, _>(
+        "org.freedesktop.DBus.Monitoring",
+        "BecomeMonitor",
+        (vec![rule.match_str()], 0_u32),
+    );
+    let resource = resource;
+    tokio::pin!(setup);
+    tokio::pin!(resource);
+
+    tokio::select! {
+        r = &mut setup => r?,
+        err = &mut resource => {
+            return Err(anyhow::anyhow!("connection lost during setup: {err}"))
+        }
+    }
+
+    conn2.start_receive(
+        rule,
+        Box::new(move |msg, _| { tx.try_send(msg).is_ok() }),
+    );
+
+    let err = resource.await;
+    warn!("DBus general-notify connection lost ({err}); will re-establish");
+    Ok(())
+}
+
 impl NotificationProvider for Dbus {
     type NotificationStream<'a>
         = impl futures::Stream<Item = Result<Notification>> + 'a;
@@ -270,46 +316,27 @@ impl NotificationProvider for Dbus {
         rule.interface = Some(Interface::from("org.freedesktop.Notifications"));
         rule.member = Some(Member::from("Notify"));
 
-        let (resource, conn) = connection::new_session_sync()?;
-
-        tokio::spawn(async {
-            let err = resource.await;
-            panic!("Lost connection to D-Bus: {err}");
-        });
-
         let duration_seconds = self.duration_seconds;
         let layout = self.layout.clone();
 
-        let (mut tx, mut rx) = mpsc::channel(16);
+        let (tx, mut rx) = mpsc::channel(16);
 
+        // Same supervisor as notifications.rs: re-establish the monitor when
+        // the connection drops, and never panic on it. See that file for why
+        // `resource` has to be raced against `BecomeMonitor` with `select!`
+        // rather than awaited afterwards.
         tokio::spawn(async move {
-            let conn2 = conn.clone();
-
-            let proxy = nonblock::Proxy::new(
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                Duration::from_millis(5000),
-                conn,
-            );
-
-            // BecomeMonitor lets us watch every Notify on the session bus. The
-            // flag argument is 0 (not eavesdropping) per the DBus spec.
-            proxy
-                .method_call::<(), _, _, _>(
-                    "org.freedesktop.DBus.Monitoring",
-                    "BecomeMonitor",
-                    (vec![rule.match_str()], 0_u32),
-                )
-                .await?;
-
-            conn2.start_receive(
-                rule,
-                Box::new(move |msg, _| {
-                    tx.try_send(msg).is_ok()
-                }),
-            );
-
-            Ok::<(), anyhow::Error>(())
+            let mut backoff = Duration::from_millis(500);
+            loop {
+                match connect_and_monitor(rule.clone(), tx.clone()).await {
+                    Ok(()) => backoff = Duration::from_millis(500),
+                    Err(e) => {
+                        warn!("DBus general-notify monitor unavailable: {e}; retrying");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(10));
+                    }
+                }
+            }
         });
 
         Ok(try_stream! {
