@@ -747,7 +747,7 @@ impl<'a> NotificationBuilder<'a> {
             (content_avail_h / content_spec.size.line_height().max(1)).max(1);
         let content_size = content_spec.size.resolve(
             &content,
-            (PANEL_W as u32).saturating_sub((icon_w + 3) as u32),
+            (PANEL_W as u32).saturating_sub(icon_w as u32),
             content_avail_h,
             content_budget_lines,
         );
@@ -766,7 +766,7 @@ impl<'a> NotificationBuilder<'a> {
             let max_lines = (avail_h / content_h).max(1) as usize;
             crate::providers::custom::wrap_text(
                 &content,
-                content_right - (icon_w + 3),
+                content_right - icon_w,
                 content_size.char_width() as i32,
                 max_lines,
             )
@@ -783,7 +783,7 @@ impl<'a> NotificationBuilder<'a> {
             .map(|(i, l)| {
                 let ly = content_y + i as i32 * content_h;
                 let right = layout.usable_right(ly, content_h);
-                let avail = (right - (icon_w + 3)).max(0) as u32;
+                let avail = (right - icon_w).max(0) as u32;
                 let max_chars = (avail / content_size.char_width()) as usize;
                 if l.chars().count() <= max_chars {
                     l
@@ -808,7 +808,11 @@ impl<'a> NotificationBuilder<'a> {
             title,
             scroll,
             content: body_lines,
-            content_origin: Point::new(icon_w + 3, content_y),
+            // `icon_w` is already icon.width + the 3px gutter (see `offset`),
+            // so adding the gutter again shifted the body one character cell
+            // right of the title it reads under. Use it bare so both lines
+            // share a left edge.
+            content_origin: Point::new(icon_w, content_y),
             content_right,
             content_line_h: content_h,
             content_size,
@@ -833,6 +837,43 @@ mod layout_tests {
     ///
     /// Built through the real builder, not arithmetic: the previous version of
     /// this test only asserted `x.min(budget) == budget`, which is tautological.
+    /// The body must line up with the title on its left edge. It used to start
+    /// at `icon_w + 3` while the title started at `icon_w`, so the body sat 3px
+    /// -- one character cell at Small -- to the right of the title it is
+    /// supposed to read under.
+    #[test]    #[test]
+    fn content_left_edge_matches_title_left_edge() {
+        let layout = Layout {
+            lines: vec![
+                line(Part::App, |s| s.shown = true),
+                line(Part::Title, |s| {
+                    s.size = SizeClass::XLarge;
+                    s.align = Align::Left;
+                }),
+                line(Part::Content, |s| {
+                    s.size = SizeClass::XLarge;
+                    s.align = Align::Left;
+                }),
+            ],
+            show_timer: false,
+            timer_border: true,
+        };
+        // "I" is the narrowest inked glyph in the 6x8 face so the measured
+        // extent is the glyph box, not padding from a wider letter.
+        let rows = render_ascii(&layout, "I", "I", "I");
+
+        let b = bands(&rows);
+        let app_x = ink_extent(&rows[b[0].0..=b[0].1].to_vec()).0;
+        let title_x = ink_extent(&rows[b[1].0..=b[1].1].to_vec()).0;
+        let body_x = ink_extent(&rows[b[b.len() - 1].0..=b[b.len() - 1].1].to_vec()).0;
+
+        assert_eq!(
+            title_x, body_x,
+            "body starts at x={body_x} but title starts at x={title_x}"
+        );
+        assert_eq!(app_x, title_x, "app and title also disagree");
+    }
+
     #[test]
     fn duration_is_the_same_for_scrolling_and_non_scrolling_titles() {
         let layout = Layout::default();
@@ -1113,8 +1154,8 @@ mod layout_tests {
         let title_x = ink_extent(&rows[title_a..=title_b].to_vec()).0;
         let body_x = ink_extent(&rows[body_a..=body_b].to_vec()).0;
         assert!(title_x > 10, "centred title should start past x=10, got {title_x}");
-        // The body starts at icon_w + 3 (the 3px gutter the original layout
-        // used), so "near the left edge" means single digits, not literally 0.
+        // The body starts at icon_w (icon width + gutter), so "near the left
+        // edge" means single digits, not literally 0.
         assert!(body_x < 10, "left-aligned body should hug the left, got {body_x}");
     }
 
