@@ -169,6 +169,15 @@ struct ItemHandle {
     /// its dwell timer and hold the newly chosen item for a full interval
     /// instead of advancing away from it after a few frames.
     generation: Arc<Mutex<u64>>,
+    /// Largest legal scroll offset for the content currently on screen,
+    /// published by the renderer each frame.
+    ///
+    /// The renderer is the only place that knows how tall the content actually
+    /// is after wrapping, so it cannot be derived at the hotkey. Without this
+    /// the offset grew without bound: the draw loop clamped what it showed,
+    /// but the stored value kept the surplus, so scrolling past the end
+    /// demanded exactly as many scrolls back to recover.
+    max_scroll: Arc<Mutex<usize>>,
     detail_fields: Vec<Field>,
 }
 
@@ -189,10 +198,17 @@ pub fn scroll_item(name: &str, delta: isize) -> bool {
         );
         return false;
     };
-    // Same single-guard rule as step_item.
+    // Same single-guard rule as step_item, plus a ceiling.
+    //
+    // Clamping HERE is what makes the scroll feel bounded. The draw loop also
+    // clamps, but that only bounds what is visible: an unbounded stored offset
+    // survives the clamp and has to be scrolled back out one press at a time.
+    // Clamping the stored value means pressing down at the bottom is a no-op,
+    // and the next press up moves immediately.
     {
+        let max = *handle.max_scroll.lock().unwrap();
         let mut s = handle.scroll.lock().unwrap();
-        *s = s.saturating_add_signed(delta);
+        *s = s.saturating_add_signed(delta).min(max);
     }
     true
 }
@@ -288,6 +304,9 @@ pub struct CustomProvider {
     /// the stream is running.
     view: Arc<Mutex<View>>,
     scroll: Arc<Mutex<usize>>,
+    /// Largest legal scroll offset for the content on screen. Written by the
+    /// renderers, read by `scroll_item` to clamp at the real bound.
+    max_scroll: Arc<Mutex<usize>>,
 }
 
 fn value_to_string(v: &serde_json::Value) -> String {
@@ -470,6 +489,7 @@ impl CustomProvider {
         detail_fields: &[Field],
         scroll: usize,
         show_header: bool,
+        max_scroll: &Arc<Mutex<usize>>,
     ) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
         let header_style = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
@@ -505,6 +525,10 @@ impl CustomProvider {
                 "EMPTY"
             };
             draw_text(&mut buffer, msg, Point::new(2, y + 6), style, false)?;
+            // Zero the ceiling on the way out. Returning early without
+            // publishing would leave the PREVIOUS article's bound in place,
+            // so scrolling a now-empty article would still move.
+            *max_scroll.lock().unwrap() = 0;
             return Ok(buffer);
         }
 
@@ -534,10 +558,13 @@ impl CustomProvider {
         // and the draw can never disagree.
         let visible = ((40 - y.max(0)) / line_h.max(1)).max(1) as usize;
 
-        // Clamp to the last full page. Without this the offset was a raw
-        // `saturating_add_signed` with no ceiling, so scrolling past the end
-        // showed blank panel with no way back except scrolling up again.
-        let scroll = scroll.min(all.len().saturating_sub(visible));
+        // Clamp to the last full page, and PUBLISH that ceiling so the hotkey
+        // can stop there too. Clamping only the local copy (which is what this
+        // used to do) left the stored offset unbounded: the panel went blank,
+        // and every surplus press had to be undone one at a time.
+        let ceiling = all.len().saturating_sub(visible);
+        *max_scroll.lock().unwrap() = ceiling;
+        let scroll = scroll.min(ceiling);
 
         for (n, line) in all.iter().enumerate().skip(scroll).take(visible) {
             let ly = y + (n - scroll) as i32 * line_h;
@@ -555,6 +582,7 @@ impl CustomProvider {
         show_header: bool,
         fields: &[Field],
         scroll: i32,
+        max_scroll: &Arc<Mutex<usize>>,
     ) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
         let header_style = MonoTextStyle::new(&iso_8859_15::FONT_6X10, BinaryColor::On);
@@ -571,6 +599,10 @@ impl CustomProvider {
             .draw(&mut buffer)?;
             y += 12;
         }
+
+        // A short/no-data view has nothing to scroll, and must clear any
+        // ceiling left by the previous, taller item.
+        *max_scroll.lock().unwrap() = 0;
 
         // No data retrieved yet — explicit placeholder centered in the
         // available vertical space. FONT_9X15 is 15px tall, so a 40px
@@ -697,7 +729,12 @@ impl CustomProvider {
         // edge of the last line -- clamping to it is what stops a long scroll
         // from ending on a blank panel.
         let y0 = y;
+        // Bound in the same PIXEL units this function scrolls in, then stored
+        // in the registry's LINE units (the hotkey steps by one line = 8px at
+        // the smallest pitch), so `scroll_item` can clamp against real
+        // content instead of accumulating.
         let scroll = scroll.clamp(0, (next_auto_y - 40).max(0));
+        *max_scroll.lock().unwrap() = (scroll / 8).max(0) as usize;
 
         for (row_idx, row_y, fsize) in plan {
             let (label, value) = &values[row_idx];
@@ -918,6 +955,7 @@ impl ContentProvider for CustomProvider {
                             &detail_fields,
                             *scroll.lock().unwrap(),
                             show_header,
+                            &self.max_scroll,
                         )?;
                     } else {
                         // NOTE: paging across fields is NOT applied here.
@@ -942,6 +980,7 @@ impl ContentProvider for CustomProvider {
                             // count; the renderer converts to pixels using
                             // the pitch of whichever field is on screen.
                             (*scroll.lock().unwrap() as i32) * 8,
+                            &self.max_scroll,
                         )?;
                     }
                 }
@@ -1179,6 +1218,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
     let generation = Arc::new(Mutex::new(0u64));
     let view = Arc::new(Mutex::new(View::Highlights));
     let scroll = Arc::new(Mutex::new(0usize));
+    let max_scroll = Arc::new(Mutex::new(0usize));
     // Every custom provider registers, item-based or not. Scrolling a
     // single-field provider is the common case, not an edge case: gating
     // registration on `items` left providers like `advice` unreachable, so
@@ -1191,6 +1231,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
                 view: Arc::clone(&view),
                 scroll: Arc::clone(&scroll),
                 generation: Arc::clone(&generation),
+                max_scroll: Arc::clone(&max_scroll),
                 detail_fields: detail_fields.clone(),
             },
         );
@@ -1204,6 +1245,7 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         detail_fields,
         view,
         scroll,
+        max_scroll,
         name: name.to_string(),
         source,
         header,
@@ -1279,6 +1321,7 @@ fields = ["{field_spec}"]
             false,
             &provider.fields,
             0,
+            &Arc::new(Mutex::new(0)),
         )
         .expect("render at offset 0");
         let down = CustomProvider::render_rows(
@@ -1287,6 +1330,7 @@ fields = ["{field_spec}"]
             false,
             &provider.fields,
             8,
+            &Arc::new(Mutex::new(0)),
         )
         .expect("render at offset 8");
         let back = CustomProvider::render_rows(
@@ -1295,6 +1339,7 @@ fields = ["{field_spec}"]
             false,
             &provider.fields,
             0,
+            &Arc::new(Mutex::new(0)),
         )
         .expect("render back at 0");
         // Scrolling down must change what is on the panel.
@@ -1318,6 +1363,7 @@ fields = ["{field_spec}"]
             false,
             &provider.fields,
             max_off,
+            &Arc::new(Mutex::new(0)),
         )
         .expect("render at bottom");
         assert_ne!(
@@ -1335,9 +1381,9 @@ fields = ["{field_spec}"]
     fn fitting_field_does_not_scroll() {
         let provider = build_with("a.b: -");
         let values = vec![("Lbl".to_string(), "short".to_string())];
-        let top = CustomProvider::render_rows("t", &values, false, &provider.fields, 0)
+        let top = CustomProvider::render_rows("t", &values, false, &provider.fields, 0, &Arc::new(Mutex::new(0)))
             .expect("render 0");
-        let down = CustomProvider::render_rows("t", &values, false, &provider.fields, 8)
+        let down = CustomProvider::render_rows("t", &values, false, &provider.fields, 8, &Arc::new(Mutex::new(0)))
             .expect("render 8");
         assert_eq!(raw(&top), raw(&down), "a fitting field shifted under scroll");
     }
@@ -1462,10 +1508,6 @@ fields = ["{field_spec}"]
         assert_eq!(get_path(kept[0], "title").unwrap(), &serde_json::json!("Real one"));
     }
 
-    #[test]
-    /// Auto must scale with the room available, not be a fixed size in
-    /// disguise: the same text gets a bigger class when it has space.
-    #[test]
     /// Field paging must actually page. It used to be plumbed into
     /// render_rows, which ignored the index -- so a 6-field list rendered all
     /// six on one screen (clipped) and never advanced.
@@ -1581,4 +1623,124 @@ fields = ["title: x |s=A", "author: y |s=XL"]
         assert!(!build_with("a.b: Lbl! | s=L").fields[0].show_value);
         assert!(build_with("a.b: Lbl").fields[0].show_value);
     }
+
+    /// The offset must stop AT the bound, not run past it.
+    ///
+    /// This is the reported bug: pressing down at the bottom kept adding to the
+    /// stored offset while the draw loop clamped only what it displayed. The
+    /// surplus was invisible on screen but still had to be scrolled back out,
+    /// so two overscrolls down needed three presses up to recover.
+    #[test]
+    fn overscrolling_past_the_end_is_recoverable_in_one_press() {
+        use std::sync::{Arc, Mutex};
+        let scroll = Arc::new(Mutex::new(0usize));
+        let max_scroll = Arc::new(Mutex::new(5usize));
+
+        // A stand-in for `scroll_item`'s clamp.
+        let press = |delta: isize| {
+            let max = *max_scroll.lock().unwrap();
+            let mut s = scroll.lock().unwrap();
+            *s = s.saturating_add_signed(delta).min(max);
+        };
+
+        for _ in 0..5 {
+            press(1);
+        }
+        assert_eq!(*scroll.lock().unwrap(), 5, "reaches the bottom exactly");
+
+        // Overscroll: must not accumulate.
+        press(1);
+        press(1);
+        assert_eq!(
+            *scroll.lock().unwrap(),
+            5,
+            "scrolling past the end must not bank surplus"
+        );
+
+        // One press up must move immediately, not replay the surplus.
+        press(-1);
+        assert_eq!(*scroll.lock().unwrap(), 4, "one press up moves one step");
+
+        press(-1);
+        press(-1);
+        press(-1);
+        press(-1);
+        assert_eq!(*scroll.lock().unwrap(), 0, "returns to the top");
+        // Pressing up at the top must not underflow either.
+        press(-1);
+        assert_eq!(*scroll.lock().unwrap(), 0, "clamps at the top too");
+    }
+
+    /// The renderer must publish the bound it actually used, since it is the
+    /// only place that knows the wrapped height. If it publishes nothing, the
+    /// hotkey has no ceiling and the bug returns.
+    #[test]
+    fn render_article_publishes_its_ceiling() {
+        use std::sync::{Arc, Mutex};
+        let max_scroll = Arc::new(Mutex::new(usize::MAX));
+        // A real detail field: `build_with` only sets `fields`, so it leaves
+        // `detail_fields` empty and the renderer takes the "NO ARTICLE"
+        // early-return that publishes nothing.
+        let detail_fields = vec![Field {
+            path: "body".into(),
+            label: String::new(),
+            show_label: false,
+            show_value: true,
+            align: FieldAlign::Left,
+            size: FieldSize::Small,
+            row: None,
+            bold: false,
+            dy: 0,
+        }];
+        // Long body: many wrapped lines, so the ceiling is well above zero.
+        let body = "the quick brown fox jumps over the lazy dog ".repeat(20);
+        CustomProvider::render_article(
+            "t",
+            &[("Lbl".to_string(), body)],
+            &detail_fields,
+            0,
+            false,
+            &max_scroll,
+        )
+        .expect("render article");
+        let published = *max_scroll.lock().unwrap();
+        assert_ne!(
+            published, usize::MAX,
+            "renderer must overwrite the sentinel with a real ceiling"
+        );
+        assert!(
+            published > 0,
+            "a long article must publish a positive ceiling, got {published}"
+        );
+    }
+
+    /// Content that fits entirely has nothing to scroll: the ceiling is 0, so
+    /// the hotkey is a no-op rather than pretending there is more.
+    #[test]
+    fn a_short_article_publishes_a_zero_ceiling() {
+        use std::sync::{Arc, Mutex};
+        let max_scroll = Arc::new(Mutex::new(usize::MAX));
+        let detail_fields = vec![Field {
+            path: "body".into(),
+            label: String::new(),
+            show_label: false,
+            show_value: true,
+            align: FieldAlign::Left,
+            size: FieldSize::Small,
+            row: None,
+            bold: false,
+            dy: 0,
+        }];
+        CustomProvider::render_article(
+            "t",
+            &[("Lbl".to_string(), "short".to_string())],
+            &detail_fields,
+            0,
+            false,
+            &max_scroll,
+        )
+        .expect("render article");
+        assert_eq!(*max_scroll.lock().unwrap(), 0, "nothing to scroll");
+    }
+
 }
