@@ -3,6 +3,9 @@ pub(crate) mod clock;
 #[cfg(feature = "custom")]
 pub(crate) mod custom;
 
+#[cfg(feature = "custom")]
+pub(crate) mod eightball;
+
 #[cfg(all(feature = "weather", feature = "image"))]
 pub(crate) mod forecast;
 #[cfg(feature = "image")]
