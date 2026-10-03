@@ -53,6 +53,10 @@ struct App {
     api_preview: Option<String>,
     /// Suggested (path, label) pairs generated from the last API response.
     api_suggested: Option<Vec<(String, String)>>,
+    /// Whether the raw "Last API response" box is expanded. Opened by
+    /// clicking a field row, since that is when you want to see the JSON to
+    /// work out the right path.
+    show_api_response: bool,
     /// Receiver for the in-flight API test.
     api_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Hotkey field currently waiting for the next key press.
@@ -66,8 +70,18 @@ struct App {
     hotkey_numpad_next: bool,
     hotkey_numpad_previous: bool,
     hotkey_numpad_lock: bool,
+    /// Same egui top-row-vs-numpad caveat applies to the custom-API controls.
+    hotkey_numpad_item_next: bool,
+    hotkey_numpad_item_previous: bool,
+    hotkey_numpad_scroll_up: bool,
+    hotkey_numpad_scroll_down: bool,
+    hotkey_numpad_detail_toggle: bool,
     /// Field-editor drag state (persists across frames while dragging).
     field_drag_from: Option<usize>,
+    /// Set when the debug checkbox is ticked. The daemon fixes its log level
+    /// when the logger is initialised, so the change only lands on restart;
+    /// this drives the confirmation before doing it.
+    debug_restart_prompt: bool,
     field_drag_over: Option<usize>,
     /// Whether a drag is currently active (any handle being held).
     field_drag_active: bool,
@@ -101,6 +115,11 @@ impl App {
         let prev_hk = hotkey_str("previous");
         let next_hk = hotkey_str("next");
         let lock_hk = hotkey_str("lock_toggle");
+        let item_prev_hk = hotkey_str("item_previous");
+        let item_next_hk = hotkey_str("item_next");
+        let scroll_up_hk = hotkey_str("scroll_up");
+        let scroll_down_hk = hotkey_str("scroll_down");
+        let detail_hk = hotkey_str("detail_toggle");
 
         let mut app = Self {
             config_path: path,
@@ -116,12 +135,19 @@ impl App {
             show_secret: false,
             api_preview: None,
             api_suggested: None,
+            show_api_response: false,
             api_test: None,
             recording_hotkey: None,
             hotkey_numpad_previous: hotkey_is_numpad(&prev_hk),
             hotkey_numpad_next: hotkey_is_numpad(&next_hk),
             hotkey_numpad_lock: hotkey_is_numpad(&lock_hk),
+            hotkey_numpad_item_next: hotkey_is_numpad(&item_next_hk),
+            hotkey_numpad_item_previous: hotkey_is_numpad(&item_prev_hk),
+            hotkey_numpad_scroll_up: hotkey_is_numpad(&scroll_up_hk),
+            hotkey_numpad_scroll_down: hotkey_is_numpad(&scroll_down_hk),
+            hotkey_numpad_detail_toggle: hotkey_is_numpad(&detail_hk),
             field_drag_from: None,
+            debug_restart_prompt: false,
             field_drag_over: None,
             field_drag_active: false,
             field_drag_pending_commit: false,
@@ -168,6 +194,11 @@ impl App {
                     "hotkeys.next" => self.hotkey_numpad_next,
                     "hotkeys.previous" => self.hotkey_numpad_previous,
                     "hotkeys.lock_toggle" => self.hotkey_numpad_lock,
+                    "hotkeys.item_next" => self.hotkey_numpad_item_next,
+                    "hotkeys.item_previous" => self.hotkey_numpad_item_previous,
+                    "hotkeys.scroll_up" => self.hotkey_numpad_scroll_up,
+                    "hotkeys.scroll_down" => self.hotkey_numpad_scroll_down,
+                    "hotkeys.detail_toggle" => self.hotkey_numpad_detail_toggle,
                     _ => false,
                 };
                 let combo = if use_numpad {
@@ -502,14 +533,38 @@ impl App {
             "source".into(),
             toml::Value::String("https://example.com/api/data.json".into()),
         );
-        if let Some(custom) = self
-            .doc
-            .get_mut("providers")
-            .and_then(|p| p.get_mut("custom"))
-            .and_then(|c| c.as_table_mut())
-        {
-            custom.insert(name.to_string(), toml::Value::Table(tbl));
-        }
+        // Create `[providers]` and `[providers.custom]` if they are not there
+        // yet. The old code only inserted when `custom` already existed, so
+        // "Add custom" silently did NOTHING on a config that had no custom
+        // providers -- no row, no error, the section just vanished. It worked
+        // before only because an existing section happened to be present.
+        let mut root = match self.doc.as_table_mut() {
+            Some(t) => t,
+            None => return Err(anyhow::anyhow!("config document is not a table")),
+        };
+        let providers = root
+            .entry("providers".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let providers = match providers.as_table_mut() {
+            Some(t) => t,
+            None => return Err(anyhow::anyhow!("`providers` is not a table")),
+        };
+        // A stray non-table `custom` key would make this fail; replace it.
+        let custom = providers
+            .entry("custom".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let custom = match custom.as_table_mut() {
+            Some(t) => t,
+            None => {
+                let fresh = toml::Value::Table(toml::Table::new());
+                providers.insert("custom".to_string(), fresh);
+                providers
+                    .get_mut("custom")
+                    .and_then(|c| c.as_table_mut())
+                    .ok_or_else(|| anyhow::anyhow!("could not create `providers.custom`"))?
+            }
+        };
+        custom.insert(name.to_string(), toml::Value::Table(tbl));
         self.save()
     }
 
@@ -803,6 +858,31 @@ impl eframe::App for App {
                     }
                 }
             }
+            if self.debug_restart_prompt {
+                let mut open = true;
+                egui::Window::new("Restart required")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            "Debug logging applies after the daemon restarts.\n\nApply saves the setting and restarts the daemon now.",
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Restart daemon").clicked() {
+                                self.debug_restart_prompt = false;
+                                self.apply();
+                            }
+                            if ui.button("Later").clicked() {
+                                self.debug_restart_prompt = false;
+                                self.status = "Saved. Restart the daemon to apply".into();
+                            }
+                        });
+                    });
+            }
+
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -816,6 +896,28 @@ impl eframe::App for App {
                         self.apply();
                     }
                     ui.label(&self.status);
+
+                    // Pushed to the right edge of the action bar. The level is
+                    // fixed when the daemon's logger is initialised, so this
+                    // takes effect on Apply (which restarts the daemon) rather
+                    // than immediately.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut dbg =
+                            self.get_str("log.level").eq_ignore_ascii_case("debug");
+                        if ui
+                            .checkbox(&mut dbg, "Debug")
+                            .on_hover_text(
+                                "Verbose daemon logs. Adds a per-frame trace while a notification is on screen. Applies on Apply.",
+                            )
+                            .changed()
+                        {
+                            self.set_value(
+                                "log.level",
+                                toml::Value::String(if dbg { "debug".into() } else { "info".into() }),
+                            );
+                            self.debug_restart_prompt = true;
+                        }
+                    });
                 });
             });
         });
@@ -1157,7 +1259,6 @@ fn notifications_editor(ui: &mut egui::Ui, app: &mut App) {
     ui.label("row 0 = auto (packs below the previous line).");
     ui.label("dy nudges a line up or down. The edge frame leaves the whole panel free; the corner ring reserves space.");
 
-    ui.label("Restart the daemon for changes to take effect.");
 }
 
 /// Per-line editor for one notification text part.
@@ -1176,7 +1277,10 @@ fn notif_line_editor(ui: &mut egui::Ui, app: &mut App, part: &str, label: &str) 
             app.set_bool(&format!("{base}.shown"), shown);
         }
 
+        // Content defaults to auto (it varies most); title and app have a
+        // fixed default so an unset key keeps the original look.
         let default_size = match part {
+            "content" => "auto",
             "title" => "l",
             _ => "m",
         };
@@ -1187,7 +1291,13 @@ fn notif_line_editor(ui: &mut egui::Ui, app: &mut App, part: &str, label: &str) 
         egui::ComboBox::from_label(format!("{label} size"))
             .selected_text(size.to_uppercase())
             .show_ui(ui, |ui| {
-                for (val, name) in [("s", "S"), ("m", "M"), ("l", "L"), ("xl", "XL")] {
+                for (val, name) in [
+                    ("auto", "AUTO"),
+                    ("s", "S"),
+                    ("m", "M"),
+                    ("l", "L"),
+                    ("xl", "XL"),
+                ] {
                     ui.selectable_value(&mut size, val.to_string(), name);
                 }
             });
@@ -1264,6 +1374,11 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
     let mut numpad_previous = app.hotkey_numpad_previous;
     let mut numpad_next = app.hotkey_numpad_next;
     let mut numpad_lock = app.hotkey_numpad_lock;
+    let mut numpad_item_next = app.hotkey_numpad_item_next;
+    let mut numpad_item_prev = app.hotkey_numpad_item_previous;
+    let mut numpad_scroll_up = app.hotkey_numpad_scroll_up;
+    let mut numpad_scroll_down = app.hotkey_numpad_scroll_down;
+    let mut numpad_detail = app.hotkey_numpad_detail_toggle;
 
     hotkey_text_field(
         ui,
@@ -1293,12 +1408,69 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
     app.hotkey_numpad_next = numpad_next;
     app.hotkey_numpad_lock = numpad_lock;
 
+    // Custom-API list controls. Only meaningful while a custom provider with
+    // `items` is on screen; elsewhere the hotkeys are a no-op.
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label("Custom API list");
+    ui.label("Move between items, scroll a secondary screen, or open it.");
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.item_previous",
+        "Previous item",
+        "Ctrl+Alt+Left",
+        &mut numpad_item_prev,
+    );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.item_next",
+        "Next item",
+        "Ctrl+Alt+Right",
+        &mut numpad_item_next,
+    );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.scroll_up",
+        "Scroll up",
+        "Ctrl+Alt+Up",
+        &mut numpad_scroll_up,
+    );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.scroll_down",
+        "Scroll down",
+        "Ctrl+Alt+Down",
+        &mut numpad_scroll_down,
+    );
+    hotkey_text_field(
+        ui,
+        app,
+        "hotkeys.detail_toggle",
+        "Open / close secondary screen",
+        "Ctrl+Alt+Numpad0",
+        &mut numpad_detail,
+    );
+    app.hotkey_numpad_item_next = numpad_item_next;
+    app.hotkey_numpad_item_previous = numpad_item_prev;
+    app.hotkey_numpad_scroll_up = numpad_scroll_up;
+    app.hotkey_numpad_scroll_down = numpad_scroll_down;
+    app.hotkey_numpad_detail_toggle = numpad_detail;
+
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button("Reset to defaults").clicked() {
             app.set_str("hotkeys.next", "Ctrl+Shift+Numpad /");
             app.set_str("hotkeys.previous", "Ctrl+Shift+Numpad *");
             app.set_str("hotkeys.lock_toggle", "Ctrl+Shift+Numpad -");
+            app.set_str("hotkeys.item_previous", "Ctrl+Alt+Left");
+            app.set_str("hotkeys.item_next", "Ctrl+Alt+Right");
+            app.set_str("hotkeys.scroll_up", "Ctrl+Alt+Up");
+            app.set_str("hotkeys.scroll_down", "Ctrl+Alt+Down");
+            app.set_str("hotkeys.detail_toggle", "Ctrl+Alt+Numpad0");
             app.recording_hotkey = None;
             app.status = "Hotkeys reset to defaults".to_string();
         }
@@ -1761,6 +1933,8 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
         match result {
             Ok(body) => {
                 app.api_preview = Some(body.clone());
+                // A fresh response is exactly when the user wants to read it.
+                app.show_api_response = true;
                 // Auto-suggest field rows from the response structure.
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                     app.api_suggested = Some(suggest_fields(&v));
@@ -1792,7 +1966,123 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     ui.add_space(6.0);
     ui.separator();
     ui.label("Fields — JSON path : label");
-    edit_fields_table(ui, app, &base);
+    edit_fields_table(ui, app, &base, "fields");
+
+    // ---- List mode ----------------------------------------------------
+    // When the API returns an array, each element becomes its own screen and
+    // the Left/Right hotkeys step between them. `items` is the JSON path to
+    // that array; leave it blank for an API that returns a single object.
+    ui.add_space(6.0);
+    ui.separator();
+
+    // Explicit toggles rather than inferring behaviour from which keys are
+    // present: a spare field list should not silently turn on a second screen.
+    // The checkbox only reveals/hides the array controls -- it must NOT write
+    // a placeholder path. Writing the literal string "items" produced a config
+    // pointing at a key that does not exist, so the fetch found no array and
+    // the panel showed NO DATA with no error anywhere.
+    let mut list_on = !app.get_str(&format!("{base}.items")).is_empty();
+    if ui
+        .checkbox(&mut list_on, "This API returns multiple items (array)")
+        .on_hover_text("Reveals the array path, max items and the secondary screen below")
+        .changed()
+        && !list_on
+    {
+        // Turning it off clears the path so the provider falls back to
+        // single-object rendering rather than looking for a stale array.
+        app.set_str(&format!("{base}.items"), "");
+    }
+    if !list_on {
+        ui.label("   Single-object API — one screen, fields above only.");
+        ui.add_space(6.0);
+        ui.separator();
+    }
+
+    if list_on {
+    ui.horizontal(|ui| {
+        ui.label("Array path:");
+        let path = format!("{base}.items");
+        let mut v = app.get_str(&path);
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut v)
+                    .desired_width(160.0)
+                    .hint_text("e.g. hits — blank for a single object"),
+            )
+            .on_hover_text(
+                "JSON path to the array to iterate. Each element renders as its own screen.",
+            )
+            .changed()
+        {
+            app.set_str(&path, v.trim());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Max items:");
+        let path = format!("{base}.max_items");
+        let mut n = app.get_int(&path).max(1) as i32;
+        if ui
+            .add(egui::DragValue::new(&mut n).clamp_range(1..=200))
+            .on_hover_text("How many array elements to keep from the response")
+            .changed()
+        {
+            app.set_int(&path, n as i64);
+        }
+    });
+
+    }
+
+    // ---- Secondary screen ---------------------------------------------
+    // Only meaningful for an array API: the secondary screen renders the
+    // selected element's body instead of advancing to the next element.
+    if list_on {
+        ui.add_space(6.0);
+        ui.separator();
+        let mut article_on = app.get_bool(&format!("{base}.article"));
+        if ui
+            .checkbox(&mut article_on, "Add a secondary screen (article view)")
+            .on_hover_text(
+                "Ctrl+Alt+Numpad0 opens the selected item's body instead of the next item. Ctrl+Alt+Up/Down scrolls it.",
+            )
+            .changed()
+        {
+            app.set_bool(&format!("{base}.article"), article_on);
+        }
+        if article_on {
+            edit_fields_table(ui, app, &base, "article_fields");
+            ui.label("Shown after Ctrl+Alt+Numpad0, scrolled with Ctrl+Alt+Up/Down.");
+        } else {
+            ui.label("   Ctrl+Alt+Left / Right move between items.");
+        }
+    }
+
+    // One raw-response box for the whole provider, rendered once at the
+    // bottom. It used to live inside the field-table editor, which meant a
+    // copy appeared under every table as soon as the editor was shared.
+    ui.add_space(6.0);
+    ui.separator();
+    if app.api_preview.is_some() {
+        let pretty = serde_json::from_str::<serde_json::Value>(&app.api_preview.clone().unwrap())
+            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+            .unwrap_or_else(|_| app.api_preview.clone().unwrap());
+        // egui 0.27's CollapsingHeader has no `show_open`; toggling the header
+        // updates the flag, and the flag drives `default_open` next frame.
+        let resp = egui::CollapsingHeader::new("Last API response")
+            .id_source("last_api_response")
+            .default_open(app.show_api_response)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.monospace(pretty);
+                    });
+            });
+        if resp.header_response.clicked() {
+            app.show_api_response = !app.show_api_response;
+        }
+    } else {
+        ui.label("No API response yet — use Test API to fetch one.");
+    }
 }
 
 fn text_field_multiline_ok(app: &mut App, ui: &mut egui::Ui, path: &str) {
@@ -1844,6 +2134,9 @@ enum SizeCls {
     Medium,
     Large,
     XLarge,
+    /// Largest class the field's text fits in. The daemon resolves it per
+    /// render against the space available below the field.
+    Auto,
 }
 impl SizeCls {
     fn as_str(&self) -> &'static str {
@@ -1852,6 +2145,7 @@ impl SizeCls {
             SizeCls::Medium => "M",
             SizeCls::Large => "L",
             SizeCls::XLarge => "X",
+            SizeCls::Auto => "A",
         }
     }
 
@@ -1860,6 +2154,7 @@ impl SizeCls {
             "S" | "s" => Some(SizeCls::Small),
             "M" | "m" => Some(SizeCls::Medium),
             "L" | "l" => Some(SizeCls::Large),
+            "A" | "a" => Some(SizeCls::Auto),
             "X" | "x" => Some(SizeCls::XLarge),
             _ => None,
         }
@@ -1871,6 +2166,7 @@ impl SizeCls {
             SizeCls::Medium => "M",
             SizeCls::Large => "L",
             SizeCls::XLarge => "X",
+            SizeCls::Auto => "A",
         }
     }
 }
@@ -2043,8 +2339,14 @@ impl FieldRow {
     }
 }
 
-fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
-    let fields_path = format!("{base}.fields");
+/// Editor for one field list.
+///
+/// `key` names the config array to edit, relative to `base` — `fields` for
+/// the highlight list, `article_fields` for the secondary screen. Passing a
+/// key keeps both lists identical in behaviour without duplicating the whole
+/// table (drag rows, dy nudge, visibility flags, suggest-from-response).
+fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str, key: &str) {
+    let fields_path = format!("{base}.{key}");
     let mut rows: Vec<FieldRow> = Vec::new();
     if let Some(toml::Value::Array(arr)) = app.get_value_owned(&fields_path) {
         for v in arr {
@@ -2080,12 +2382,22 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             }
 
             // Column 3: JSON path / value.
-            let p_resp = ui.add(
-                egui::TextEdit::singleline(&mut row.path)
-                    .hint_text("json.path[0].key")
-                    .desired_width(150.0),
-            );
-            if p_resp.changed() || p_resp.lost_focus() {
+            // Clicking a path is the moment you want the raw JSON to work out
+            // what to put there, so reveal it. Done on the REAL row: an
+            // earlier version rendered a second copy of every path purely as
+            // a click target, which showed up as a stray duplicate list
+            // between the table and the preview once fields existed.
+            let path_resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut row.path)
+                        .hint_text("json.path[0].key")
+                        .desired_width(150.0),
+                )
+                .on_hover_text("Click to show the last API response");
+            if path_resp.clicked() {
+                app.show_api_response = true;
+            }
+            if path_resp.changed() || path_resp.lost_focus() {
                 changed = true;
             }
 
@@ -2100,7 +2412,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let prev = row.align.clone();
-                egui::ComboBox::from_id_source(("align", i))
+                egui::ComboBox::from_id_source(("align", key, i))
                     .selected_text(row.align.label())
                     .show_ui(ui, |ui| {
                         for a in [Align::Left, Align::Center, Align::Right] {
@@ -2114,10 +2426,11 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
                     changed = true;
                 }
                 let prev = row.size.clone();
-                egui::ComboBox::from_id_source(("size", i))
+                egui::ComboBox::from_id_source(("size", key, i))
                     .selected_text(row.size.label())
                     .show_ui(ui, |ui| {
                         for s in [
+                            SizeCls::Auto,
                             SizeCls::Small,
                             SizeCls::Medium,
                             SizeCls::Large,
@@ -2233,11 +2546,39 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
             });
             changed = true;
         }
-        if app.api_preview.is_some() && ui.button("Auto-fill from response").clicked() {
+        // Always rendered. Previously this only appeared once a response had
+        // been fetched, so on a freshly opened GUI the button simply was not
+        // there and it read as missing rather than as "nothing to fill from".
+        let have_response = app.api_preview.is_some();
+        let clicked = ui
+            .add_enabled(
+                have_response,
+                egui::Button::new("Auto-fill from response"),
+            )
+            .on_hover_text(if have_response {
+                "Replace this list with the fields found in the last API response"
+            } else {
+                "Run Test API first — there is no response to read fields from"
+            })
+            .clicked();
+        if clicked {
             if let Some(sugg) = &app.api_suggested {
+                // The article table's paths resolve INSIDE each array element,
+                // so suggestions rooted at the response (e.g. "hits.0.title")
+                // have to be re-rooted at the element ("title") or every row
+                // would resolve to nothing.
+                // In array mode BOTH field lists resolve inside one element, so
+                // suggestions rooted at the response ("hits.0.title") must be
+                // re-rooted for either table. Leaving the prefix on either one
+                // yields rows that resolve to nothing.
+                let items_path = app.get_str(&format!("{base}.items"));
+                let strip = (!items_path.is_empty()).then(|| items_path);
                 rows.clear();
                 rows.extend(sugg.iter().map(|(p, l)| FieldRow {
-                    path: p.clone(),
+                    path: match &strip {
+                        Some(root) => strip_root(p, root),
+                        None => p.clone(),
+                    },
                     label: l.clone(),
                     label_visible: true,
                     value_visible: true,
@@ -2298,28 +2639,7 @@ fn edit_fields_table(ui: &mut egui::Ui, app: &mut App, base: &str) {
     ui.add_space(8.0);
     custom_oled_preview(ui, app, base, &rows);
 
-    // Last API response — collapsible panel below the fields so users can
-    // see the raw JSON returned by their endpoint (and verify which paths
-    // to fill into the fields above).
-    if let Some(body) = &app.api_preview {
-        ui.add_space(4.0);
-        let pretty = serde_json::from_str::<serde_json::Value>(body)
-            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.clone()))
-            .unwrap_or_else(|_| body.clone());
-        egui::CollapsingHeader::new("Last API response")
-            .default_open(false)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut pretty.clone())
-                                .code_editor()
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
-            });
-    }
+
 }
 
 fn draw_oled_canvas(ui: &mut egui::Ui, draw_fn: impl FnOnce(&egui::Painter, egui::Rect, f32)) {
@@ -2392,8 +2712,8 @@ fn custom_oled_preview(ui: &mut egui::Ui, app: &App, base: &str, rows: &[FieldRo
                     let target = match row.size {
                         SizeCls::XLarge => slot as i32 * 18,
                         SizeCls::Large => slot as i32 * 14,
-                        SizeCls::Medium => slot as i32 * 8,
                         SizeCls::Small => slot as i32 * 6,
+                        SizeCls::Medium | SizeCls::Auto => slot as i32 * 8,
                     };
                     target.max(y)
                 }
@@ -2564,12 +2884,38 @@ fn preview_value_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// Mirror of the daemon's `FieldSize::resolve`, so the live OLED preview
+/// picks the SAME class the panel will actually draw. If the two disagreed,
+/// the preview would show a layout the hardware never renders.
+fn resolve_auto(size: &SizeCls, text: &str, avail_w: i32, avail_h: i32) -> SizeCls {
+    if *size != SizeCls::Auto {
+        return *size;
+    }
+    let chars = text.chars().count() as i32;
+    let avail_w = avail_w.max(8);
+    let avail_h = avail_h.max(0);
+    for c in [SizeCls::XLarge, SizeCls::Large, SizeCls::Medium, SizeCls::Small] {
+        let lh = preview_line_h(&c);
+        if lh > avail_h {
+            continue;
+        }
+        let per_line = (avail_w / preview_char_w(&c)).max(1);
+        let lines = ((chars + per_line - 1) / per_line).max(1);
+        if lines * lh <= avail_h {
+            return c;
+        }
+    }
+    SizeCls::Small
+}
+
 fn preview_char_w(size: &SizeCls) -> i32 {
     match size {
         SizeCls::Small => 4,
-        SizeCls::Medium => 5,
         SizeCls::Large => 6,
         SizeCls::XLarge => 8,
+        // Auto must be resolved before this point; Medium is the safe
+        // fallback so an unresolved value still previews something sane.
+        SizeCls::Medium | SizeCls::Auto => 5,
     }
 }
 
@@ -2583,9 +2929,9 @@ fn preview_line_h(size: &SizeCls) -> i32 {
 fn preview_font_size(size: &SizeCls, scale: f32) -> f32 {
     match size {
         SizeCls::Small => 5.0 * scale,
-        SizeCls::Medium => 6.0 * scale,
         SizeCls::Large => 8.0 * scale,
         SizeCls::XLarge => 10.0 * scale,
+        SizeCls::Medium | SizeCls::Auto => 6.0 * scale,
     }
 }
 
@@ -2662,6 +3008,23 @@ fn preview_wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> 
 }
 
 /// Walk a JSON value and produce (path, label) suggestions for leaf scalars.
+/// Re-root a suggested path from the response onto one array element.
+///
+/// Suggestions are generated from the whole response, so for a list API they
+/// look like `hits.0.title`. The article/secondary field set is resolved
+/// INSIDE each element, so it needs `title`. Paths that do not start with the
+/// array root are returned untouched rather than mangled.
+fn strip_root(path: &str, root: &str) -> String {
+    let root_with_index = format!("{root}.0");
+    if let Some(rest) = path.strip_prefix(&root_with_index) {
+        return rest.trim_start_matches('.').to_string();
+    }
+    if let Some(rest) = path.strip_prefix(root) {
+        return rest.trim_start_matches('.').to_string();
+    }
+    path.to_string()
+}
+
 fn suggest_fields(v: &serde_json::Value) -> Vec<(String, String)> {
     fn walk(v: &serde_json::Value, prefix: &str, depth: usize, out: &mut Vec<(String, String)>) {
         if out.len() >= 12 {
@@ -2767,6 +3130,76 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+mod add_custom_tests {
+    use super::*;
+
+    /// The exact table-creation logic `add_custom` uses, so this asserts the
+    /// real behaviour rather than a re-implementation of it.
+    fn insert_new_custom(doc: &mut toml::Value, name: &str, tbl: toml::Value) -> anyhow::Result<()> {
+        let mut root = doc.as_table_mut().ok_or_else(|| anyhow::anyhow!("not a table"))?;
+        let providers = root
+            .entry("providers".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let providers = providers.as_table_mut().ok_or_else(|| anyhow::anyhow!("not a table"))?;
+        let custom = providers
+            .entry("custom".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let custom = custom.as_table_mut().ok_or_else(|| anyhow::anyhow!("not a table"))?;
+        custom.insert(name.to_string(), tbl);
+        Ok(())
+    }
+
+    fn sample() -> toml::Value {
+        let mut t = toml::Table::new();
+        t.insert("enabled".into(), toml::Value::Boolean(true));
+        toml::Value::Table(t)
+    }
+
+    /// Regression: "Add custom" silently did nothing when
+    /// `[providers.custom]` did not already exist -- the insert was inside an
+    /// `if let` with no else branch.
+    #[test]
+    fn add_custom_works_with_no_existing_custom_table() {
+        for start in [
+            "clock = 1",                       // config with no providers at all
+            "[providers.lyrics]
+enabled = true", // providers exists, custom does not
+            "[providers.custom]
+",              // empty custom table
+        ] {
+            let mut doc: toml::Value = toml::from_str(start).expect("parse");
+            insert_new_custom(&mut doc, "custom", sample())
+                .unwrap_or_else(|e| panic!("failed on {start:?}: {e}"));
+            assert!(
+                doc.get("providers").and_then(|p| p.get("custom")).and_then(|c| c.get("custom")).is_some(),
+                "section was not created starting from {start:?}"
+            );
+        }
+    }
+
+    /// A second add must not clobber the first.
+    #[test]
+    fn adding_twice_keeps_both() {
+        let mut doc = toml::Value::Table(toml::Table::new());
+        insert_new_custom(&mut doc, "custom", sample()).unwrap();
+        insert_new_custom(&mut doc, "custom1", sample()).unwrap();
+        let custom = doc.get("providers").and_then(|p| p.get("custom")).unwrap();
+        assert!(custom.get("custom").is_some(), "first add lost");
+        assert!(custom.get("custom1").is_some(), "second add lost");
+    }
+
+    /// A non-table `custom` key must not wedge the button forever.
+    #[test]
+    fn an_existing_custom_table_does_not_block_adding() {
+        let mut doc: toml::Value =
+            toml::from_str("[providers.custom]\nenabled = true\n").expect("parse");
+        insert_new_custom(&mut doc, "custom", sample())
+            .expect("an existing custom table must not block adding");
+        assert!(doc.get("providers").and_then(|p| p.get("custom")).and_then(|c| c.get("custom")).is_some());
+    }
+}
+
+#[cfg(test)]
 mod field_spec_tests {
     use super::*;
 
@@ -2774,6 +3207,24 @@ mod field_spec_tests {
     /// frame, so parse -> serialize must be lossless. A round-trip that flips a
     /// bool or drops `dy` makes a control look non-functional the moment the
     /// user types in it.
+    /// Auto-fill on the SECONDARY table must re-root paths onto one array
+    /// element. Suggestions come from the whole response ("hits.0.title"),
+    /// but secondary fields resolve inside each element ("title"). Without
+    /// this every auto-filled secondary row resolves to nothing.
+    #[test]
+    fn strip_root_re_roots_paths_onto_an_element() {
+        assert_eq!(strip_root("hits.0.title", "hits"), "title");
+        assert_eq!(strip_root("hits.0._highlightResult.title.value", "hits"),
+                   "_highlightResult.title.value");
+        assert_eq!(strip_root("hits.0.a.b.c", "hits"), "a.b.c");
+        // Already element-relative: leave alone.
+        assert_eq!(strip_root("title", "hits"), "title");
+        // A different array must not be mangled into a bogus path.
+        assert_eq!(strip_root("other.0.title", "hits"), "other.0.title");
+        // Only ONE level of index is stripped, not a repeated prefix.
+        assert_eq!(strip_root("hits.0.hits.0.title", "hits"), "hits.0.title");
+    }
+
     #[test]
     fn field_spec_roundtrip_preserves_dy() {
         for dy in [-10, -2, -1, 0, 1, 2, 10] {

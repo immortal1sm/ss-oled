@@ -13,6 +13,14 @@ pub struct HotkeyBindings {
     pub previous: String,
     pub next: String,
     pub lock_toggle: String,
+    /// Step through the array items of a custom-API provider (Left/Right).
+    pub item_next: String,
+    pub item_previous: String,
+    /// Article-view scrolling (Up/Down).
+    pub scroll_up: String,
+    pub scroll_down: String,
+    /// Enter / leave the article view.
+    pub detail_toggle: String,
 }
 
 impl Default for HotkeyBindings {
@@ -21,6 +29,11 @@ impl Default for HotkeyBindings {
             previous: "Ctrl+Shift+Numpad *".to_string(),
             next: "Ctrl+Shift+Numpad /".to_string(),
             lock_toggle: "Ctrl+Shift+Numpad -".to_string(),
+            item_next: "Ctrl+Alt+Right".to_string(),
+            item_previous: "Ctrl+Alt+Left".to_string(),
+            scroll_down: "Ctrl+Alt+Down".to_string(),
+            scroll_up: "Ctrl+Alt+Up".to_string(),
+            detail_toggle: "Ctrl+Alt+Numpad0".to_string(),
         }
     }
 }
@@ -99,6 +112,36 @@ impl InputManager {
                 "lock_toggle",
                 bindings.lock_toggle.as_str(),
                 Command::ToggleLockSource,
+            ),
+            (
+                "item_previous",
+                bindings.item_previous.as_str(),
+                Command::PreviousItem,
+            ),
+            (
+                "item_next",
+                bindings.item_next.as_str(),
+                Command::NextItem,
+            ),
+            (
+                "item_previous",
+                bindings.item_previous.as_str(),
+                Command::PreviousItem,
+            ),
+            (
+                "scroll_up",
+                bindings.scroll_up.as_str(),
+                Command::ScrollUp,
+            ),
+            (
+                "scroll_down",
+                bindings.scroll_down.as_str(),
+                Command::ScrollDown,
+            ),
+            (
+                "detail_toggle",
+                bindings.detail_toggle.as_str(),
+                Command::ToggleDetail,
             ),
         ];
 
@@ -207,6 +250,36 @@ fn register_kde_hotkeys(sender: broadcast::Sender<Command>, bindings: &HotkeyBin
             "Lock / unlock provider",
             bindings.lock_toggle.as_str(),
             Command::ToggleLockSource,
+        ),
+        (
+            "item_previous",
+            "Previous item (custom API)",
+            bindings.item_previous.as_str(),
+            Command::PreviousItem,
+        ),
+        (
+            "item_next",
+            "Next item (custom API)",
+            bindings.item_next.as_str(),
+            Command::NextItem,
+        ),
+        (
+            "scroll_up",
+            "Scroll article up",
+            bindings.scroll_up.as_str(),
+            Command::ScrollUp,
+        ),
+        (
+            "scroll_down",
+            "Scroll article down",
+            bindings.scroll_down.as_str(),
+            Command::ScrollDown,
+        ),
+        (
+            "detail_toggle",
+            "Enter / leave article",
+            bindings.detail_toggle.as_str(),
+            Command::ToggleDetail,
         ),
     ];
 

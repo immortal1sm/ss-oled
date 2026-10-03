@@ -37,6 +37,12 @@ pub enum IpcCommand {
     Prev,
     Lock,
     Unlock,
+    /// Step the current custom-API provider's array cursor.
+    Item(i32),
+    /// Scroll the current custom-API provider's article.
+    Scroll(i32),
+    /// Flip between the highlight list and the article body.
+    ToggleArticle,
 }
 
 /// Handle the scheduler keeps so it can react to IPC-driven state changes.
@@ -164,6 +170,40 @@ async fn serve(stream: UnixStream, handle: IpcHandle) -> Result<()> {
                     format!("ok {target}")
                 }
                 None => format!("err no provider named '{target}'"),
+            }
+        } else if matches!(
+            cmd,
+            "item_next" | "item_prev" | "scroll_up" | "scroll_down" | "article"
+        ) {
+            // Called directly rather than sent as an IpcCommand: the IPC
+            // sender is created here and nothing subscribes to it, so a
+            // message would be dropped. `next`/`prev` only work because they
+            // mutate the shared `current` Atomic directly.
+            let name = handle
+                .provider_names
+                .get(handle.current.load(Ordering::SeqCst))
+                .cloned()
+                .unwrap_or_default();
+            #[cfg(feature = "custom")]
+            {
+                use crate::providers::custom;
+                let (label, ok) = match cmd {
+                    "item_next" => ("item next", custom::step_item(&name, 1)),
+                    "item_prev" => ("item prev", custom::step_item(&name, -1)),
+                    "scroll_up" => ("scroll up", custom::scroll_item(&name, -1)),
+                    "scroll_down" => ("scroll down", custom::scroll_item(&name, 1)),
+                    _ => ("article", custom::toggle_view(&name).is_some()),
+                };
+                if ok {
+                    info!("IPC: {label} on '{name}'");
+                    format!("ok {label} on '{name}'")
+                } else {
+                    format!("no-op: {label} (no items on '{name}')")
+                }
+            }
+            #[cfg(not(feature = "custom"))]
+            {
+                "no-op: built without the custom feature".to_string()
             }
         } else if cmd == "lock" {
             handle.locked.store(true, Ordering::SeqCst);
