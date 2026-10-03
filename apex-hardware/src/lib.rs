@@ -7,6 +7,10 @@ pub use bitvec::prelude::BitVec;
 pub use device::AsyncDevice;
 pub use device::Device;
 #[cfg(feature = "usb")]
+mod reconnect;
+#[cfg(feature = "usb")]
+pub use reconnect::ReconnectingDevice;
+#[cfg(feature = "usb")]
 pub use usb::USBDevice;
 
 pub use device::FrameBuffer;

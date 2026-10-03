@@ -15,4 +15,7 @@ anyhow = "1.0.44"
 bitvec = "1.0.1"
 embedded-graphics = "0.8"
 hidapi = { version = "1.2.6", optional = true }
+# Already a dependency of the other workspace crates; needed so the reconnect
+# wrapper can report when the panel drops and comes back.
+log = "0.4"
 num_enum = "0.5.4"
