@@ -1,10 +1,5 @@
 use anyhow::{anyhow, Result};
-use std::{
-    cell::RefCell,
-    marker::PhantomData,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{marker::PhantomData, time::{Duration, Instant}};
 
 use crate::render::{
     display::ContentProvider,
@@ -14,7 +9,6 @@ use crate::render::{
 use apex_hardware::{AsyncDevice, FrameBuffer};
 use apex_input::Command;
 use config::Config;
-use dbus::Error as DBusError;
 use futures::{pin_mut, stream, stream::Stream, StreamExt};
 use itertools::Itertools;
 use linkme::distributed_slice;
@@ -70,6 +64,12 @@ pub trait ContentWrapper {
 }
 
 impl<T: ContentProvider> ContentWrapper for T {
+    // `provider_locked` is loop-carried state: it is assigned inside the
+    // `select!` arm and read on a LATER iteration (the auto-rotation
+    // suppression further down). The unused_assignments lint cannot see a read
+    // that happens after a `continue`, so these assignments look dead and are
+    // not. Removing them would silently break the lock.
+    #[allow(unused_assignments)]
     fn proxy_stream<'this>(
         &'this mut self,
     ) -> Result<Box<dyn Stream<Item = Result<FrameBuffer>> + 'this>> {
@@ -127,6 +127,12 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
     }
 
     #[allow(clippy::too_many_lines)]
+    // `provider_locked` is loop-carried state: assigned inside the `select!`
+    // arm and read on a LATER iteration (the auto-rotation suppression at the
+    // bottom of the loop). unused_assignments cannot see a read that happens
+    // after a `continue`, so these assignments look dead and are not --
+    // removing them would silently break the lock.
+    #[allow(unused_assignments)]
     pub async fn start(
         &mut self,
         tx: broadcast::Sender<Command>,
@@ -279,7 +285,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         // If everything is 0, we skip the tick to save CPU.
         // Provider lock state (Ctrl+Shift+Numpad- / Numpad+, or IPC lock).
         // Shared with the IPC server so tray/CLI toggles reflect instantly.
-        let mut provider_locked = false; // scheduler-local mirror for select! arm reads
+        let mut provider_locked = false;
 
         let is_auto_change_enabled = config
             .get_int("interval.refresh")
@@ -674,47 +680,6 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
             })
             .unwrap_or(30)
     }
-}
-
-/// Map a kglobalaccel shortcut name to the corresponding MPRIS Player
-/// method. Returns None for shortcuts we don't forward (next/prev) so
-/// kded6's native routing handles them.
-fn shortcut_to_method(shortcut: &str) -> Option<&'static str> {
-    match shortcut {
-        "playpausemedia" => Some("PlayPause"),
-        "pausemedia" => Some("Pause"),
-        "playmedia" => Some("Play"),
-        "stopmedia" => Some("Stop"),
-        _ => None,
-    }
-}
-
-/// Forward a Player method to every running MPRIS player. The active
-/// session accepts the call; the rest no-op. Uses the blocking DBus
-/// API on a worker thread so it doesn't interfere with the tokio
-/// runtime or the kglobalaccel listener's own DBus connection.
-fn send_player_action(method: &'static str) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session().map_err(|e| e.to_string())?;
-    let proxy = conn.with_proxy(
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        Duration::from_millis(500),
-    );
-    let (names,): (Vec<String>,) = proxy
-        .method_call("org.freedesktop.DBus", "ListNames", ())
-        .map_err(|e| e.to_string())?;
-    for name in names {
-        if !name.starts_with("org.mpris.MediaPlayer2.") {
-            continue;
-        }
-        let proxy = conn.with_proxy(&name, "/org/mpris/MediaPlayer2", Duration::from_millis(500));
-        let r: Result<(), DBusError> =
-            proxy.method_call("org.mpris.MediaPlayer2.Player", method, ());
-        if let Err(e) = r {
-            log::debug!("mpris {} to {}: {}", method, name, e);
-        }
-    }
-    Ok(())
 }
 
 /// Listen to KDE kglobalaccel's media-shortcut signals and forward

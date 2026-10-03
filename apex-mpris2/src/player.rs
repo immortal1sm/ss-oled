@@ -110,7 +110,17 @@ impl MPRIS2 {
                     }
                 }
             }
-            // The signal handler will unregister if those two are dropped so we never drop them ;)
+            // The signal handler will unregister if those two are dropped so
+            // we never drop them ;) -- these `drop()` calls are the whole
+            // point: they unregister the matchers when the stream ends.
+            // Removing them would leak the signal handler.
+            //
+            // NOTE: rustc's unused_variables lint deliberately does not count
+            // `drop()` as a use, so it flags these captures even though the
+            // drops are the entire point (they unregister the matchers). The
+            // code lives inside a macro expansion, which does not inherit the
+            // function-level allow, so the two warnings are unfixable from
+            // here without removing correct code.
             drop(seek_match);
             drop(meta_match);
         })

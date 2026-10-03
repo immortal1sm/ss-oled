@@ -124,6 +124,11 @@ pub fn current_lyric(lines: &[LyricLine], position_us: i64) -> Option<String> {
 }
 
 /// The next line with text after `position_us`, if any.
+/// Next non-empty lyric at or after `position_us`.
+///
+/// Only its test uses this; the provider itself uses `current_lyric`. Kept
+/// because it documents the empty-line-skipping rule the test pins.
+#[cfg(test)]
 pub fn next_lyric(lines: &[LyricLine], position_us: i64) -> Option<String> {
     let idx = lines.partition_point(|l| l.time_us <= position_us);
     lines[idx..]
