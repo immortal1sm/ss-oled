@@ -25,3 +25,6 @@ Cargo.lock
 # Wayland hotkey registration. Not referenced by Cargo, any systemd unit, or
 # scripts/ss-oled — the native-Rust path in apex-input supersedes it.
 apex-hotkeys/
+# Cache emitted by the graphify code-graph tool: an AST index keyed by content
+# hash. Large, regenerated on demand, and meaningless outside this checkout.
+/graphify-out/
