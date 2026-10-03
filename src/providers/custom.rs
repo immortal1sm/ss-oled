@@ -23,18 +23,16 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::render::{display::ContentProvider, scheduler::ContentWrapper};
+use crate::render::display::ContentProvider;
 use anyhow::{anyhow, Result};
 use apex_hardware::FrameBuffer;
 use async_stream::try_stream;
 use config::Config;
 use embedded_graphics::{
-    geometry::Size,
     mono_font::{iso_8859_15, MonoTextStyle},
     pixelcolor::BinaryColor,
-    prelude::{Point, Primitive},
-    primitives::{PrimitiveStyle, Rectangle},
-    text::{renderer::TextRenderer, Baseline, Text},
+    prelude::Point,
+    text::{renderer::TextRenderer, Text},
     Drawable,
 };
 use futures::Stream;
@@ -241,11 +239,6 @@ pub fn step_item(name: &str, delta: isize) -> bool {
     true
 }
 
-/// True if this custom provider has array items to step through.
-pub fn has_items(name: &str) -> bool {
-    ITEM_CURSORS.lock().unwrap().contains_key(name)
-}
-
 /// One array element's resolved values, for both views.
 ///
 /// The highlight and article views resolve DIFFERENT field sets from the same
@@ -291,16 +284,6 @@ pub struct CustomProvider {
     /// the stream is running.
     view: Arc<Mutex<View>>,
     scroll: Arc<Mutex<usize>>,
-}
-
-const PER_PAGE: usize = 4;
-
-fn pages_needed(n_fields: usize) -> usize {
-    if n_fields == 0 {
-        1
-    } else {
-        n_fields.div_ceil(PER_PAGE)
-    }
 }
 
 fn value_to_string(v: &serde_json::Value) -> String {
@@ -563,7 +546,7 @@ impl CustomProvider {
         // The first detail field is treated as the body; later ones are
         // appended so `detail_fields` can carry a title line plus a body.
         let mut body = String::new();
-        for (i, f) in detail_fields.iter().enumerate() {
+        for (i, _f) in detail_fields.iter().enumerate() {
             let Some((_, v)) = values.get(i) else { break };
             if !body.is_empty() {
                 body.push('\n');
@@ -613,7 +596,6 @@ impl CustomProvider {
     fn render_rows(
         name: &str,
         values: &[(String, String)],
-        page: u64,
         show_header: bool,
         fields: &[Field],
     ) -> Result<FrameBuffer> {
@@ -833,13 +815,18 @@ impl CustomProvider {
             };
 
             if !label_text.is_empty() {
-                draw_text(
+                // A failed draw means the text silently disappears. Log it
+                // rather than propagating: one bad glyph should not abort the
+                // whole frame and take the provider down with it.
+                if let Err(e) = draw_text(
                     &mut buffer,
                     &label_text,
                     Point::new(x_offset, row_y),
                     style,
                     f.bold,
-                );
+                ) {
+                    log::warn!("custom: label draw failed at y={row_y}: {e}");
+                }
             }
             let value_x = if label_text.is_empty() {
                 x_offset
@@ -855,7 +842,11 @@ impl CustomProvider {
                 if y_pos + line_h > 40 {
                     break; // off-panel
                 }
-                draw_text(&mut buffer, line, Point::new(value_x, y_pos), style, f.bold);
+                if let Err(e) =
+                    draw_text(&mut buffer, line, Point::new(value_x, y_pos), style, f.bold)
+                {
+                    log::warn!("custom: value draw failed at y={y_pos}: {e}");
+                }
             }
         }
 
@@ -864,10 +855,9 @@ impl CustomProvider {
 }
 
 impl ContentProvider for CustomProvider {
-    type ContentStream<'a>
+    type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a
     where
-        Self: 'a,
-    = impl Stream<Item = Result<FrameBuffer>> + 'a;
+        Self: 'a;
 
     fn stream(&mut self) -> Result<Self::ContentStream<'_>> {
         info!("Registering custom display source '{}'.", self.name);
@@ -939,16 +929,12 @@ impl ContentProvider for CustomProvider {
                             show_header,
                         )?;
                     } else {
-                        // Field paging applies WITHIN the selected item.
-                        let page = (frames / page_frames)
-                            % pages_needed(item.main.len()).max(1) as u64;
-                        yield Self::render_rows(
-                            &name,
-                            &item.main,
-                            page,
-                            show_header,
-                            &self.fields,
-                        )?;
+                        // NOTE: paging across fields is NOT applied here.
+                        // render_rows never consumed the page index, so every
+                        // field is laid out on one screen and the remainder is
+                        // clipped. Restoring real paging is a feature change,
+                        // not a warning cleanup.
+                        yield Self::render_rows(&name, &item.main, show_header, &self.fields)?;
                     }
                 }
 

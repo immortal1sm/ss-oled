@@ -9,7 +9,7 @@ use embedded_graphics::{
     geometry::Size,
     pixelcolor::BinaryColor,
     prelude::{Point, Primitive},
-    primitives::{Circle, Line, PrimitiveStyle, Rectangle},
+    primitives::{Line, PrimitiveStyle, Rectangle},
     Drawable,
 };
 
@@ -76,7 +76,7 @@ pub fn draw_cloud(target: &mut FrameBuffer, x: i32, y: i32) {
 pub fn draw_rain(target: &mut FrameBuffer, cloud_x: i32, cloud_y: i32, frame: usize) {
     draw_cloud(target, cloud_x, cloud_y);
     let base_y = cloud_y + 20;
-    for (i, item) in [0usize, 1, 2, 3].iter().enumerate() {
+    for item in [0usize, 1, 2, 3].iter() {
         let dx = cloud_x + 8 + *item as i32 * 7;
         let dy = base_y + ((frame as i32 + *item as i32 * 3) % 12);
         if dy < cloud_y + 38 {

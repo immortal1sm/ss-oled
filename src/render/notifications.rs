@@ -643,7 +643,7 @@ impl<'a> NotificationBuilder<'a> {
         // Each part is placed independently. Explicit rows win; otherwise a
         // line auto-packs below the previous one. A row that would collide with
         // the previous line is pushed down rather than drawn over it.
-        let mut cursor_y = 1i32;
+        let cursor_y = 1i32;
         let app_spec = layout.line(Part::App);
         let mut app_bottom = cursor_y;
 
@@ -670,8 +670,10 @@ impl<'a> NotificationBuilder<'a> {
                 Text::with_baseline(name, Point::new(x + 1, y), style, Baseline::Top)
                     .draw(&mut base_image)?;
             }
+            // Only app_bottom is read from here on; the title block uses it
+            // directly. Writing cursor_y too was a leftover that the compiler
+            // correctly flagged as dead.
             app_bottom = y + app_size.line_height() as i32;
-            cursor_y = app_bottom;
         }
 
         // ---- Title ----

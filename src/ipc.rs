@@ -35,14 +35,6 @@ use tokio::{
 pub enum IpcCommand {
     Next,
     Prev,
-    Lock,
-    Unlock,
-    /// Step the current custom-API provider's array cursor.
-    Item(i32),
-    /// Scroll the current custom-API provider's article.
-    Scroll(i32),
-    /// Flip between the highlight list and the article body.
-    ToggleArticle,
 }
 
 /// Handle the scheduler keeps so it can react to IPC-driven state changes.
@@ -59,17 +51,6 @@ pub struct IpcHandle {
 }
 
 impl IpcHandle {
-    pub fn new(provider_names: Vec<String>) -> Self {
-        let (tx, _) = broadcast::channel(16);
-        Self {
-            tx,
-            locked: Arc::new(AtomicBool::new(false)),
-            provider_names: Arc::new(provider_names),
-            current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            last_change: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
-        }
-    }
-
     fn status_line(&self) -> String {
         let state = if self.locked.load(Ordering::SeqCst) {
             "locked"

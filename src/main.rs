@@ -1,12 +1,5 @@
 #![allow(incomplete_features)]
-#![feature(
-    type_alias_impl_trait,
-    try_blocks,
-    inherent_associated_types,
-    async_iterator,
-    decl_macro,
-    impl_trait_in_assoc_type
-)]
+#![feature(inherent_associated_types, impl_trait_in_assoc_type)]
 #![warn(clippy::pedantic)]
 // `clippy::mut_mut` is disabled because `futures::stream::select!` causes the lint to fire
 // The other lints are just awfully tedious to implement especially when dealing with pixel

@@ -28,7 +28,7 @@ use crate::providers::lrc::{current_lyric, parse_lrc, LyricLine};
 use crate::render::display::ContentProvider;
 use anyhow::Result;
 use apex_hardware::FrameBuffer;
-use apex_music::{AsyncPlayer, Metadata as MetadataTrait};
+use apex_music::Metadata as MetadataTrait;
 use async_stream::try_stream;
 use config::Config;
 use embedded_graphics::{
@@ -274,7 +274,7 @@ fn draw_line(
     let char_w = size.char_w();
     let max_chars = (PANEL_W / char_w).max(1) as usize;
 
-    let mut owned;
+    let owned;
     let text = if text.chars().count() > max_chars {
         // Reserve the last column for the marker so the overflow is visible.
         owned = format!(
@@ -634,10 +634,9 @@ impl LyricsProvider {
 }
 
 impl ContentProvider for LyricsProvider {
-    type ContentStream<'a>
-        where
-            Self: 'a,
-    = impl Stream<Item = Result<FrameBuffer>> + 'a;
+    type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a
+    where
+        Self: 'a;
 
     fn stream(&mut self) -> Result<Self::ContentStream<'_>> {
         info!("Registering lyrics display source.");

@@ -166,13 +166,6 @@ pub struct MediaPlayerBuilder {
     show_timer: bool,
     /// Show media source label (mpris2.show_source_label).
     show_source_label: bool,
-    /// Position (microseconds) at the moment status last transitioned
-    /// out of Playing. Firefox's MPRIS plugin keeps reporting a
-    /// monotonically-increasing position even when paused/stopped, which
-    /// would otherwise let the elapsed timer tick up while the player is
-    /// idle. We snapshot position on each Playing read and freeze it
-    /// when status changes to Paused/Stopped.
-    last_playing_position: i64,
 }
 
 // Ok so the plan for the MPRIS2 module is to wait for two DBUS events
