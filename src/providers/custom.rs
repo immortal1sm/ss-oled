@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::render::display::ContentProvider;
+use crate::render::text::wrap_text;
 use anyhow::{anyhow, Result};
 use apex_hardware::FrameBuffer;
 use async_stream::try_stream;
@@ -432,67 +433,6 @@ fn fetch_values(
     Ok(kept.into_iter().map(both).collect())
 }
 
-/// Wrap `text` into up to `max_lines` lines, each fitting within
-/// `max_px` pixels at `char_w` pixels per character. Splits at the
-/// last word boundary within each line; falls back to character-level
-/// split when no space fits. Returns fewer lines if the text wraps to
-/// fewer than `max_lines`. Returns one entry per line.
-///
-/// Public so the notification renderer can wrap its body the same way —
-/// two independent wrap implementations drift apart on edge cases.
-pub fn wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> Vec<String> {
-    if max_lines == 0 {
-        return vec![];
-    }
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let max_chars = (max_px / char_w).max(1) as usize;
-    let mut lines: Vec<String> = Vec::new();
-    // Convert to owned String once so the loop can reassign remaining
-    // without lifetime gymnastics. We shadow `text` to keep the loop body
-    // reading naturally.
-    let mut remaining = text.to_string();
-    while lines.len() < max_lines {
-        if remaining.chars().count() <= max_chars {
-            lines.push(remaining.to_string());
-            return lines;
-        }
-        // Find the rightmost space within the first max_chars chars.
-        let mut prefix_end_byte = remaining.len();
-        for (i, (byte_idx, _ch)) in remaining.char_indices().enumerate() {
-            if i == max_chars {
-                prefix_end_byte = byte_idx;
-                break;
-            }
-        }
-        let prefix = &remaining[..prefix_end_byte];
-        let split_chars = match prefix.rfind(' ') {
-            Some(byte_idx) if byte_idx > 0 => prefix[..byte_idx].chars().count(),
-            _ => max_chars,
-        };
-        let first: String = remaining.chars().take(split_chars).collect();
-        remaining = remaining
-            .chars()
-            .skip(split_chars)
-            .collect::<String>()
-            .trim_start()
-            .to_string();
-        if first.is_empty() {
-            // Safety: avoid infinite loop if split produced nothing.
-            break;
-        }
-        lines.push(first);
-    }
-    // If we hit max_lines with content still unrendered, truncate
-    // remaining to fit on the last line.
-    if !remaining.is_empty() {
-        let take = max_chars.saturating_sub(1); // leave 1 char for ellipsis
-        let truncated: String = remaining.chars().take(take).collect::<String>();
-        lines.push(format!("{truncated}…"));
-    }
-    lines
-}
 
 /// Draw `text` at `pos`. When `bold` is true, draw it twice with a 1px
 /// horizontal offset to produce a faux-bold appearance (no real bold

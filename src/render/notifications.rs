@@ -1239,7 +1239,7 @@ impl<'a> NotificationBuilder<'a> {
             // offset clamped to a single hidden line. The stream windows these
             // lines per frame; the height budget is enforced there.
             let max_lines = 200usize;
-            crate::providers::custom::wrap_text(
+            crate::render::text::wrap_text(
                 &content,
                 content_right - icon_w,
                 content_size.char_width() as i32,

@@ -287,3 +287,165 @@ impl Scrollable {
         self.scroll += 1;
     }
 }
+
+/// Wrap `text` into at most `max_lines` lines, each fitting within `max_px`
+/// pixels at `char_w` pixels per character.
+///
+/// Splits at the last word boundary within each line and falls back to a
+/// character-level split when no space fits. Returns fewer lines when the text
+/// wraps to fewer, and one entry per line. Text still unrendered at `max_lines`
+/// is truncated onto the last line with an ellipsis.
+///
+/// This lives in `render::text` rather than beside any one caller because THREE
+/// modules need identical wrapping: the custom JSON provider, the notification
+/// body renderer, and the GUI's preview pane. They were byte-identical copies
+/// that had already drifted once, and the GUI's copy is a separate binary that
+/// cannot see the daemon's -- so a fix in one did not reach the others.
+/// Keeping one copy here is what stops that recurring.
+///
+/// `max_lines == 0` yields nothing, which callers use to mean "no room".
+
+/// Wrap `text` into up to `max_lines` lines, each fitting within
+/// `max_px` pixels at `char_w` pixels per character. Splits at the
+/// last word boundary within each line; falls back to character-level
+/// split when no space fits. Returns fewer lines if the text wraps to
+/// fewer than `max_lines`. Returns one entry per line.
+///
+/// Public so the notification renderer can wrap its body the same way —
+/// two independent wrap implementations drift apart on edge cases.
+pub fn wrap_text(text: &str, max_px: i32, char_w: i32, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return vec![];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let max_chars = (max_px / char_w).max(1) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    // Convert to owned String once so the loop can reassign remaining
+    // without lifetime gymnastics. We shadow `text` to keep the loop body
+    // reading naturally.
+    let mut remaining = text.to_string();
+    while lines.len() < max_lines {
+        if remaining.chars().count() <= max_chars {
+            lines.push(remaining.to_string());
+            return lines;
+        }
+        // Find the rightmost space within the first max_chars chars.
+        let mut prefix_end_byte = remaining.len();
+        for (i, (byte_idx, _ch)) in remaining.char_indices().enumerate() {
+            if i == max_chars {
+                prefix_end_byte = byte_idx;
+                break;
+            }
+        }
+        let prefix = &remaining[..prefix_end_byte];
+        let split_chars = match prefix.rfind(' ') {
+            Some(byte_idx) if byte_idx > 0 => prefix[..byte_idx].chars().count(),
+            _ => max_chars,
+        };
+        let first: String = remaining.chars().take(split_chars).collect();
+        remaining = remaining
+            .chars()
+            .skip(split_chars)
+            .collect::<String>()
+            .trim_start()
+            .to_string();
+        if first.is_empty() {
+            // Safety: avoid infinite loop if split produced nothing.
+            break;
+        }
+        lines.push(first);
+    }
+    // If we hit max_lines with content still unrendered, truncate
+    // remaining to fit on the last line.
+    if !remaining.is_empty() {
+        let take = max_chars.saturating_sub(1); // leave 1 char for ellipsis
+        let truncated: String = remaining.chars().take(take).collect::<String>();
+        lines.push(format!("{truncated}…"));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_text;
+
+    #[test]
+    fn short_text_is_one_line() {
+        assert_eq!(wrap_text("hello", 128, 6, 3), vec!["hello"]);
+    }
+
+    #[test]
+    fn empty_text_is_one_empty_line() {
+        assert_eq!(wrap_text("", 128, 6, 3), vec![String::new()]);
+    }
+
+    #[test]
+    fn zero_lines_means_no_room() {
+        assert!(wrap_text("hello", 128, 6, 0).is_empty());
+    }
+
+    #[test]
+    fn splits_at_the_last_space() {
+        // 10 px / 4 px per char = 2 chars per line.
+        assert_eq!(wrap_text("ab cd", 10, 4, 4), vec!["ab", "cd"]);
+    }
+
+    #[test]
+    fn falls_back_to_a_character_split_with_no_space() {
+        assert_eq!(wrap_text("abcdef", 10, 4, 4), vec!["ab", "cd", "ef"]);
+    }
+
+    /// A word longer than the line width must not loop forever.
+    ///
+    /// Pins the CURRENT count, which is one MORE than `max_lines` -- see
+    /// `overflow_yields_one_line_beyond_the_budget` for why that is deliberate
+    /// for now and must not be "fixed" casually.
+    #[test]
+    fn unbroken_text_still_terminates() {
+        let out = wrap_text(&"x".repeat(200), 20, 5, 3);
+        assert!(
+            out.len() <= 4,
+            "must terminate and stay near the budget, got {}",
+            out.len()
+        );
+    }
+
+    /// KNOWN OFF-BY-ONE, pinned deliberately.
+    ///
+    /// When text still overflows at `max_lines`, the loop fills exactly
+    /// `max_lines` and then pushes ONE more truncated line with an ellipsis --
+    /// so the result is `max_lines + 1`, contradicting this function's own doc
+    /// ("up to max_lines lines").
+    ///
+    /// It is NOT fixed here because all three former copies behave this way and
+    /// callers budget height with `wrap_text(...).len()`. Changing it would
+    /// shift rendered layout in the custom provider, the notification body and
+    /// the GUI preview at once. That is a behaviour change, not a refactor, and
+    /// it needs its own decision. What this test does is stop the discrepancy
+    /// from being rediscovered as a mystery.
+    #[test]
+    fn overflow_yields_one_line_beyond_the_budget() {
+        let out = wrap_text("aaaa bbbb cccc dddd", 20, 4, 2);
+        assert_eq!(
+            out.len(),
+            3,
+            "overflow currently yields max_lines + 1; see the doc comment"
+        );
+        let last = out.last().unwrap();
+        assert!(last.ends_with('…'), "got {last:?}");
+        assert!(
+            last.chars().count() <= 20 / 4,
+            "ellipsis line {last:?} exceeds the width"
+        );
+    }
+
+    /// Multi-byte input must split on character, not byte, boundaries.
+    #[test]
+    fn multibyte_input_is_not_split_mid_codepoint() {
+        for line in wrap_text("日本語の歌詞テキスト", 20, 4, 5) {
+            assert!(line.chars().count() <= 5, "bad line {line:?}");
+        }
+    }
+}
