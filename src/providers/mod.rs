@@ -15,7 +15,7 @@ pub(crate) mod lyrics;
 #[cfg(feature = "lyrics")]
 pub(crate) mod lrc;
 #[cfg(any(feature = "dbus-support", target_os = "windows"))]
-pub(crate) mod music;
+pub(crate) mod mpris2;
 #[cfg(feature = "sysinfo")]
 pub(crate) mod sysinfo;
 #[cfg(feature = "weather")]
