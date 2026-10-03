@@ -854,6 +854,22 @@ impl CustomProvider {
     }
 }
 
+/// Draw at most this many fields per page; a longer list cycles pages.
+///
+/// Field paging used to be plumbed all the way into `render_rows`, which
+/// never read the page index -- so every field was laid out on one screen and
+/// the rest were clipped. Paging is applied here, at the call site, where the
+/// values and fields are sliced together so the two cannot drift apart.
+const PER_PAGE: usize = 4;
+
+fn pages_needed(n_fields: usize) -> usize {
+    if n_fields == 0 {
+        1
+    } else {
+        n_fields.div_ceil(PER_PAGE)
+    }
+}
+
 impl ContentProvider for CustomProvider {
     type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a
     where
@@ -934,7 +950,18 @@ impl ContentProvider for CustomProvider {
                         // field is laid out on one screen and the remainder is
                         // clipped. Restoring real paging is a feature change,
                         // not a warning cleanup.
-                        yield Self::render_rows(&name, &item.main, show_header, &self.fields)?;
+                        // Page through the field list: slice values and
+                        // fields together so index i always pairs them.
+                        let page = (frames / page_frames) as usize
+                            % pages_needed(item.main.len());
+                        let start = page * PER_PAGE;
+                        let end = (start + PER_PAGE).min(item.main.len());
+                        yield Self::render_rows(
+                            &name,
+                            &item.main[start..end],
+                            show_header,
+                            &self.fields[start..end],
+                        )?;
                     }
                 }
 
@@ -1336,6 +1363,49 @@ fields = ["{field_spec}"]
     #[test]
     /// Auto must scale with the room available, not be a fixed size in
     /// disguise: the same text gets a bigger class when it has space.
+    #[test]
+    /// Field paging must actually page. It used to be plumbed into
+    /// render_rows, which ignored the index -- so a 6-field list rendered all
+    /// six on one screen (clipped) and never advanced.
+    #[test]
+    fn field_paging_slices_fields_and_values_together() {
+        assert_eq!(pages_needed(0), 1);
+        assert_eq!(pages_needed(4), 1);
+        assert_eq!(pages_needed(5), 2);
+        assert_eq!(pages_needed(6), 2);
+        assert_eq!(pages_needed(9), 3);
+    }
+
+    /// Every field must be reachable across the pages, and no field may appear
+    /// on two pages. This is the property that was broken.
+    #[test]
+    fn every_field_appears_on_exactly_one_page() {
+        let n = 6usize;
+        let values: Vec<(String, String)> = (0..n)
+            .map(|i| (String::new(), format!("value{i}")))
+            .collect();
+        let fields: Vec<Field> = (0..n)
+            .map(|_| Field { path: "x".into(), label: String::new(), show_label: false,
+                show_value: true, align: FieldAlign::Left, size: FieldSize::Medium,
+                row: None, bold: false, dy: 0 })
+            .collect();
+
+        let mut seen: Vec<&str> = Vec::new();
+        for page in 0..pages_needed(n) {
+            let start = page * PER_PAGE;
+            let end = (start + PER_PAGE).min(n);
+            for (_, v) in &values[start..end] {
+                assert!(!seen.contains(&v.as_str()),
+                    "{v} rendered on more than one page (page {page})");
+                seen.push(v);
+            }
+        }
+        seen.sort();
+        let mut expected: Vec<&str> = values.iter().map(|(_, v)| v.as_str()).collect();
+        expected.sort();
+        assert_eq!(seen, expected, "not every field was reachable across pages");
+    }
+
     #[test]
     fn field_auto_scales_with_available_room() {
         let roomy = FieldSize::Auto.resolve("OK", 128, 40);
