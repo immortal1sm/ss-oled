@@ -26,6 +26,7 @@
 
 use crate::providers::lrc::{current_lyric, parse_lrc, LyricLine};
 use crate::render::display::ContentProvider;
+use crate::mpris_shared;
 use anyhow::Result;
 use apex_hardware::FrameBuffer;
 use apex_music::Metadata as MetadataTrait;
@@ -38,7 +39,7 @@ use embedded_graphics::{
     text::{Baseline, Text},
     Drawable,
 };
-use futures::{pin_mut, Stream};
+use futures::Stream;
 use log::{info, warn};
 use std::{
     path::PathBuf,
@@ -157,6 +158,10 @@ enum Source {
 }
 
 pub struct LyricsProvider {
+    /// Shared "what is playing" state. This provider does NOT open its own
+    /// DBus connection: `mpris2` reads the same player, so one owner publishes
+    /// to both and a player restart is recovered from once.
+    mpris: mpris_shared::MprisShared,
     source: Source,
     size: Option<Size>,
     align: Align,
@@ -645,9 +650,11 @@ impl ContentProvider for LyricsProvider {
         let source = self.source;
 
         Ok(try_stream! {
-            #[cfg(target_os = "linux")]
-            let mpris = apex_mpris2::MPRIS2::new().await?;
-            pin_mut!(mpris);
+            // Subscribe to the shared MPRIS state. This is not a DBus handle:
+            // the connection lives on its own task and this only reads the
+            // latest published snapshot, so the stream stays non-blocking
+            // inside the scheduler's `select!`.
+            let mpris = self.mpris.clone();
 
             let mut tick = interval(Duration::from_millis(TICK_MS));
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -656,13 +663,27 @@ impl ContentProvider for LyricsProvider {
                 tick.tick().await;
 
                 let (title, artist, album, url, duration_us, position_us) =
-                    match resolve_track(&mut mpris).await {
-                        Some(t) => t,
+                    match mpris.now() {
+                        Some(np) => (
+                            np.title,
+                            np.artist,
+                            np.album,
+                            np.url,
+                            np.length_us,
+                            np.position_us,
+                        ),
+                        // Shared connection down, or nothing playing yet: draw
+                        // the idle frame and wait. One reconnect brings this
+                        // back along with every other MPRIS consumer.
                         None => {
                             yield self.render(&state.lock().unwrap(), 0, 0)?;
                             continue;
                         }
                     };
+                if title.trim().is_empty() {
+                    yield self.render(&state.lock().unwrap(), 0, 0)?;
+                    continue;
+                }
 
                 let key = track_key(&title, &artist, &album);
                 let needs_fetch = {
@@ -719,38 +740,13 @@ impl ContentProvider for LyricsProvider {
     }
 }
 
-#[cfg(target_os = "linux")]
-type TrackInfo = (String, String, String, String, i64, i64);
-
-/// Pull title/artist/album/url/length/position from the active MPRIS player.
-///
-/// `AsyncPlayer::progress()` bundles metadata + position in one round trip.
-/// Album and track URL are not exposed by `apex-music` today, so they come
-/// back empty — lrclib still matches on title+artist alone, and the
-/// local-sidecar tier needs the URL, so it stays inert until that metadata is
-/// plumbed through.
-#[cfg(target_os = "linux")]
-async fn resolve_track(mpris: &mut apex_mpris2::MPRIS2) -> Option<TrackInfo> {
-    let player = mpris.wait_for_player(None).await.ok()?;
-    let progress = player.progress().await.ok()?;
-    let title = progress.metadata.title().ok()?;
-    if title.trim().is_empty() {
-        return None;
-    }
-    let artist = progress.metadata.artists().unwrap_or_default();
-    let length = progress.metadata.length().unwrap_or(0);
-    Some((
-        title,
-        artist,
-        String::new(),
-        String::new(),
-        length as i64,
-        progress.position,
-    ))
-}
-
 /// Build the provider from `[providers.lyrics]`.
+#[cfg(target_os = "linux")]
 pub fn from_config(config: &Config) -> Result<Option<LyricsProvider>> {
+    // The same process-wide owner `mpris2` reads. Not a second connection: if
+    // the player goes away, both providers see `Disconnected` and one reconnect
+    // restores both.
+    let mpris = mpris_shared::shared().clone();
     if !config.get_bool("providers.lyrics.enabled").unwrap_or(false) {
         return Ok(None);
     }
@@ -793,6 +789,7 @@ pub fn from_config(config: &Config) -> Result<Option<LyricsProvider>> {
     };
 
     Ok(Some(LyricsProvider {
+        mpris,
         source,
         size,
         align,

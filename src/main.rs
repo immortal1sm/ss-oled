@@ -25,6 +25,10 @@ use log::warn;
 // This is kind of pointless on non-Linux platforms
 #[cfg(all(feature = "dbus-support", target_os = "linux"))]
 mod dbus;
+// One MPRIS connection shared by every provider that needs the current track.
+// Linux-only, matching `mod dbus` above and the platform split inside it.
+#[cfg(all(feature = "dbus-support", target_os = "linux"))]
+mod mpris_shared;
 mod ipc;
 
 mod providers;
