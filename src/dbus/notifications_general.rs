@@ -116,6 +116,9 @@ fn register_callback() -> Result<Box<dyn NotificationWrapper>> {
         timer_border: settings
             .get_bool("notifications.timer_border")
             .unwrap_or(true),
+        // DBus notifications carry no badge; the 8ball sets this on its own
+        // layout instance.
+        badge_box: None,
     };
 
     Ok(Box::new(Dbus {

@@ -1,5 +1,9 @@
 use anyhow::{anyhow, Result};
-use std::{marker::PhantomData, time::{Duration, Instant}};
+use std::{
+    marker::PhantomData,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use crate::render::{
     display::ContentProvider,
@@ -17,7 +21,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
-use tokio::time::{error::Elapsed, timeout};
 use tokio::{
     sync::broadcast,
     time::{self, MissedTickBehavior},
@@ -116,6 +119,69 @@ fn provider_setting(config: &Config, name: &str, key: &str) -> Option<config::Va
 pub struct Scheduler<'a, T: AsyncDevice + 'a> {
     device: T,
     _marker: PhantomData<&'a T>,
+}
+
+/// A notification being shown right now, drawn one frame per scheduler
+/// iteration.
+///
+/// The budget is a hard bound on the whole display, tracked against wall-clock
+/// rather than a `timeout` around the stream: the stream no longer runs to
+/// completion inside one `select!` branch, so there is nothing left to wrap, and
+/// an elapsed check is what actually enforces the limit now.
+struct ActiveNotification {
+    stream: Pin<Box<dyn Stream<Item = Result<FrameBuffer>> + Send>>,
+    shown_at: Instant,
+    budget: Duration,
+    frames: u32,
+}
+
+impl ActiveNotification {
+    /// # Memory note
+    ///
+    /// The notification is deliberately leaked for the life of the process.
+    /// `ContentProvider::stream` returns an opaque `impl Stream + '_` that
+    /// borrows the notification, so a struct holding both would be
+    /// self-referential and cannot be built safely. One leak per notification
+    /// is small -- a frame buffer and a few wrapped lines -- and it buys a
+    /// stream that can be polled from inside `select!` alongside the hotkey
+    /// channel. The alternative is `self_cell`/`ouroboros`, i.e. new
+    /// dependencies, which is a worse trade for a handful of allocations on a
+    /// process that displays a few dozen notifications an hour.
+    fn start(notification: Notification) -> Result<Self> {
+        // A new notification always starts at the top, whatever the last one
+        // was scrolled to.
+        crate::render::notifications::reset_notification_scroll();
+        // The stream's own countdown is `duration`; on top of that a scroll
+        // can hold it open for up to SCROLL_HOLD_CAP. The scheduler's budget is
+        // the ceiling on both, so it has to be the SUM or the hold is silently
+        // truncated to whatever slack `expected_duration` left over.
+        let budget = notification.expected_duration()
+            + crate::render::notifications::SCROLL_HOLD_CAP
+            + crate::render::notifications::NOTIF_LOCK_CAP;
+        // `notification` is owned here and is
+        // never touched again; only the stream that borrows it is used.
+        let notification: &'static mut Notification = Box::leak(Box::new(notification));
+        let stream: Pin<Box<dyn Stream<Item = Result<FrameBuffer>> + Send>> =
+            Box::pin(notification.stream()?);
+        Ok(Self {
+            stream,
+            shown_at: Instant::now(),
+            budget,
+            frames: 0,
+        })
+    }
+
+    /// Whether the notification must end regardless of scrolling.
+    ///
+    /// The budget is a bound on the WHOLE display, base duration plus the
+    /// scroll hold allowance -- it is not the countdown the reader sees. The
+    /// stream enforces that countdown itself (it owns the tick loop), so if
+    /// this checked only `budget` it would cut a notification off while the
+    /// reader was still scrolling, which is exactly the "I could scroll once
+    /// and then it died" symptom.
+    fn expired(&self) -> bool {
+        self.shown_at.elapsed() >= self.budget
+    }
 }
 
 impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
@@ -332,6 +398,16 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         log::info!("notifications.override = {notif_override}");
         // One-slot queue for the non-override path; newest wins.
         let mut pending_notification: Option<Notification> = None;
+        // The notification currently being shown, if any.
+        //
+        // This was previously a blocking `timeout(...).await` inside the
+        // `select!` branch that received the notification, which meant the
+        // hotkey channel was never polled for the whole time it displayed:
+        // `select!` polls branches, it does not run them concurrently. Holding
+        // the stream here and drawing ONE frame per `select!` iteration keeps
+        // `rx.recv()` live, so a scroll hotkey pressed mid-notification is
+        // seen on the very next frame.
+        let mut active_notif: Option<ActiveNotification> = None;
         loop {
             provider_locked = ipc_locked.load(Ordering::SeqCst);
             tokio::select! {
@@ -384,11 +460,89 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                         }
                         Ok(Command::ScrollUp) | Ok(Command::ScrollDown) => {
                             let delta = if matches!(cmd, Ok(Command::ScrollUp)) { -1 } else { 1 };
-                            let name = provider_names
-                                .get(current.load(Ordering::SeqCst))
-                                .cloned()
-                                .unwrap_or_default();
-                            crate::providers::custom::scroll_item(&name, delta);
+                            // A notification outranks every provider, so while
+                            // one is up the scroll belongs to it: its body can
+                            // be far longer than any provider's. Falls through
+                            // to the custom provider otherwise.
+                            if active_notif.is_some() {
+                                crate::render::notifications::scroll_notification(delta);
+                                log::info!("scrolled notification body by {delta}");
+                            } else {
+                                let name = provider_names
+                                    .get(current.load(Ordering::SeqCst))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                // Logged: this branch used to be silent, so a
+                                // scroll that did nothing was indistinguishable
+                                // from one that worked.
+                                if crate::providers::custom::scroll_item(&name, delta) {
+                                    // Registered, so the offset moved. Whether
+                                    // that CHANGED the picture is the renderer's
+                                    // call -- it clamps the offset to the real
+                                    // content height -- so this log deliberately
+                                    // claims only the offset, not visible motion.
+                                    log::info!("scroll offset for '{name}' {delta}");
+                                } else {
+                                    log::info!(
+                                        "scroll ignored: '{name}' is not a custom provider"
+                                    );
+                                }
+                                // A hotkey step resets the dwell, so a provider
+                                // being scrolled stays put for a full interval
+                                // instead of being replaced by the next item
+                                // mid-read.
+                                *time_last_change.lock().unwrap() = Instant::now();
+                            }
+                        }
+                        Ok(Command::EightBall) => {
+                            // On-demand source: it sits outside the provider
+                            // rotation and only ever produces frames when
+                            // asked, so this just raises a flag that the 8ball
+                            // stream is polling. No provider index moves and
+                            // rotation resumes normally afterwards.
+                            if crate::providers::eightball::request() {
+                                log::info!("8ball: reading requested");
+                            } else {
+                                log::info!("8ball: request already in flight");
+                            }
+                        }
+                        Ok(Command::ToggleNotificationLock) => {
+                            // Only meaningful while a notification is actually
+                            // on screen. Pinning an empty screen sets a flag
+                            // with nothing to pin, and that flag would then
+                            // make the NEXT notification queue and never be
+                            // displayed -- a notification silently vanishing is
+                            // far worse than a pin being a no-op.
+                            let on_screen = active_notif.is_some();
+                            if on_screen {
+                                let now =
+                                    crate::render::notifications::toggle_notification_lock();
+                            if now {
+                                log::info!(
+                                    "Notification PINNED — timer frozen, scroll still works"
+                                );
+                            } else {
+                                log::info!("Notification unpinned — timer resumed");
+                                // Restart the dwell so releasing a pin does not
+                                // immediately rotate off the provider that was
+                                // hidden behind it.
+                                *time_last_change.lock().unwrap() = Instant::now();
+                            }
+                                // Cheapest of the two options: with a notification
+                                // pinned the provider stream is not polled at all,
+                                // so no provider rendering, no JSON polling and no
+                                // USB writes happen underneath it. The pinned
+                                // notification is the only thing drawing.
+                            } else {
+                                // Pinning an empty screen sets a flag with
+                                // nothing to pin, and that flag would make the
+                                // NEXT notification queue and never display --
+                                // a notification silently vanishing is far
+                                // worse than a pin being a no-op.
+                                log::info!(
+                                    "Notification lock ignored: no notification on screen"
+                                );
+                            }
                         }
                         Ok(Command::ToggleDetail) => {
                             let name = provider_names
@@ -454,53 +608,29 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                 notification = notifications.next(), if !notifications.is_empty() => {
                     if let Some(notification) = notification {
                         match notification {
-                            Ok(mut notification) => {
-                                if notif_override {
+                            Ok(notification) => {
+                                // A pinned notification refuses to be replaced.
+                                // This is what makes the pin usable for the
+                                // case it exists for -- reading a 2FA code --
+                                // because with `override = true` any stray
+                                // notification would otherwise displace it
+                                // mid-read. Queue it instead.
+                                if crate::render::notifications::notification_locked() {
+                                    log::info!(
+                                        "Notification queued: one is pinned"
+                                    );
+                                    pending_notification = Some(notification);
+                                } else if notif_override {
                                     // Interrupt the rotation and show it now.
                                     // A lock suspends auto-rotation, not this:
                                     // with `override = true` a notification has
                                     // the highest priority and is shown even
                                     // while the provider list is locked.
                                     log::info!("Notification received — displaying (override)");
-                                    // Compute the budget BEFORE the mutable
-                                    // borrow that the stream needs.
-                                    let budget = notification.expected_duration();
-                                    let mut stream = Box::pin(notification.stream()?);
-
-                                    // Hard bound. The stream is tick-driven and
-                                    // should always finish, but a notification
-                                    // must never be able to block rotation
-                                    // indefinitely. The budget comes from the
-                                    // notification's own tick count (x2 + slack,
-                                    // see expected_duration), so it tracks the
-                                    // configured duration automatically and
-                                    // never cuts off a legitimate long one.
-                                    let shown_at = Instant::now();
-                                    let mut frames = 0u32;
-                                    let outcome: Result<Result<(), anyhow::Error>, Elapsed> =
-                                        timeout(budget, async {
-                                        while let Some(display) = stream.next().await {
-                                            self.device.draw(&display?).await?;
-                                            frames += 1;
-                                        }
-                                        Ok(())
-                                    })
-                                    .await;
-                                    // Err = the budget expired with the stream
-                                    // still running; Ok(Err) = a draw failed.
-                                    let timed_out = matches!(outcome, Err(_));
-
-                                    if timed_out {
-                                        log::warn!(
-                                            "notification stream exceeded {:?} after {} frames; resuming rotation",
-                                            budget, frames
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "Notification display finished after {:?} ({} frames); resuming rotation",
-                                            shown_at.elapsed(), frames
-                                        );
-                                    }
+                                    // Arm it. Frames are drawn by the
+                                    // `notif_frame` branch below so this branch
+                                    // stays non-blocking.
+                                    active_notif = Some(ActiveNotification::start(notification)?);
                                 } else {
                                     // Queued: hold it until the current
                                     // provider's dwell expires, then show it
@@ -513,7 +643,64 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                         }
                     }
                 }
-                content = y.next() => {
+                // Draw ONE notification frame, then yield back into `select!`
+                // so the hotkey branch is polled again. Holding the stream
+                // here rather than draining it inside the branch that received
+                // the notification is the whole point: a scroll key pressed
+                // mid-notification has to be seen on the next frame.
+                notif_frame = async {
+                    match active_notif.as_mut() {
+                        Some(a) => a.stream.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let mut done = false;
+                    match notif_frame {
+                        Some(Ok(display)) => {
+                            self.device.draw(&display).await?;
+                            if let Some(a) = active_notif.as_mut() {
+                                a.frames += 1;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            log::warn!("Notification stream error: {e}");
+                            done = true;
+                        }
+                        None => done = true,
+                    }
+                    let expired = active_notif.as_ref().is_some_and(|a| a.expired());
+                    if done || expired {
+                        // Suppress the rotation the elapsed dwell would
+                        // otherwise fire on the very next tick: time spent
+                        // showing a notification is not time the provider was
+                        // actually on screen.
+                        suppress_next_rotation = true;
+                        if let Some(a) = active_notif.take() {
+                            if expired && !done {
+                                log::warn!(
+                                    "notification stream exceeded {:?} after {} frames; resuming rotation",
+                                    a.budget, a.frames
+                                );
+                            } else {
+                                log::info!(
+                                    "Notification display finished after {:?} ({} frames); resuming rotation",
+                                    a.shown_at.elapsed(), a.frames
+                                );
+                            }
+                        }
+                        // Restart the provider dwell: time spent showing a
+                        // notification must not count towards the current
+                        // provider's interval, or rotation fires immediately
+                        // afterwards.
+                        *time_last_change.lock().unwrap() = Instant::now();
+                    }
+                },
+                content = y.next(), if active_notif.is_none() => {
+                    // Disabled while a notification is up. Both futures stay
+                    // armed otherwise and whichever ticks last wins, so the
+                    // provider frame overwrote the notification ~20x a second
+                    // -- the flicker. A notification outranks every provider,
+                    // so suppressing this is the correct precedence.
                     if let Some(Ok(content)) = &content {
                         self.device.draw(content).await?;
                     }
@@ -628,13 +815,12 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                             // A queued notification takes this slot instead of
                             // a rotation, so it is shown without advancing the
                             // provider list.
-                            if let Some(mut queued) = pending_notification.take() {
+                            if let Some(queued) = pending_notification.take() {
                                 log::info!("Showing queued notification before rotation");
-                                let mut stream = Box::pin(queued.stream()?);
-                                while let Some(display) = stream.next().await {
-                                    self.device.draw(&display?).await?;
-                                }
-                                log::info!("Queued notification finished");
+                                // Armed rather than drained inline, for the
+                                // same reason as the override path: draining
+                                // here would block the hotkey channel again.
+                                active_notif = Some(ActiveNotification::start(queued)?);
                             } else {
                                 log::info!(
                                     "Rotation timer: rotating from {} (idx {}) after {}s (limit {}s)",
