@@ -20,5 +20,12 @@ pub enum Command {
     ScrollUp,
     /// Enter/leave the article view of the current custom-API provider.
     ToggleDetail,
+    /// Freeze the on-screen notification's timer so it stays put, and release
+    /// it again. Inverse of `LockSource`: there, locking means "keep this
+    /// provider"; here it means "keep this notification", so the timer is what
+    /// gets suspended rather than the rotation.
+    ToggleNotificationLock,
+    /// Ask the on-demand 8ball source for a reading and show it as an overlay.
+    EightBall,
     Shutdown,
 }
