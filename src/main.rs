@@ -43,7 +43,8 @@ use crate::render::{scheduler, scheduler::Scheduler};
 use apex_engine::Engine;
 use apex_hardware::AsyncDevice;
 #[cfg(all(feature = "usb", target_os = "linux", not(feature = "engine")))]
-use apex_hardware::USBDevice;
+#[cfg(all(feature = "usb", target_family = "unix", not(feature = "engine")))]
+use apex_hardware::ReconnectingDevice;
 use log::{info, LevelFilter};
 use simplelog::{Config as LoggerConfig, SimpleLogger};
 use tokio::sync::broadcast;
@@ -87,8 +88,11 @@ pub async fn main() -> Result<()> {
 
     // This channel is used to send commands to the scheduler
     let (tx, rx) = broadcast::channel::<Command>(100);
+    // ReconnectingDevice rather than USBDevice: it starts disconnected and
+    // attaches when the panel appears, instead of making an absent display a
+    // fatal startup error (which with Restart=on-failure became a crash loop).
     #[cfg(all(feature = "usb", target_family = "unix", not(feature = "engine")))]
-    let mut device = USBDevice::try_connect()?;
+    let mut device = ReconnectingDevice::new();
 
     #[cfg(feature = "engine")]
     let mut device = Engine::new().await?;
