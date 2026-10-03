@@ -28,7 +28,6 @@ use crate::providers::lrc::{current_lyric, parse_lrc, LyricLine};
 use crate::render::display::ContentProvider;
 use anyhow::Result;
 use apex_hardware::FrameBuffer;
-use apex_music::Metadata as MetadataTrait;
 use async_stream::try_stream;
 use config::Config;
 use embedded_graphics::{
@@ -645,9 +644,12 @@ impl ContentProvider for LyricsProvider {
         let source = self.source;
 
         Ok(try_stream! {
+            // Shared MPRIS DATA. This provider still drives its own loop and
+            // its own render cadence on the same 250ms tick as before: the
+            // shared module supplies the current track and nothing else. It
+            // never says when to draw, so lyric scrolling is untouched.
             #[cfg(target_os = "linux")]
-            let mpris = apex_mpris2::MPRIS2::new().await?;
-            pin_mut!(mpris);
+            let mpris = crate::mpris_shared::shared().clone();
 
             let mut tick = interval(Duration::from_millis(TICK_MS));
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -656,7 +658,7 @@ impl ContentProvider for LyricsProvider {
                 tick.tick().await;
 
                 let (title, artist, album, url, duration_us, position_us) =
-                    match resolve_track(&mut mpris).await {
+                    match read_track(&mpris) {
                         Some(t) => t,
                         None => {
                             yield self.render(&state.lock().unwrap(), 0, 0)?;
@@ -722,31 +724,29 @@ impl ContentProvider for LyricsProvider {
 #[cfg(target_os = "linux")]
 type TrackInfo = (String, String, String, String, i64, i64);
 
-/// Pull title/artist/album/url/length/position from the active MPRIS player.
+/// Read title/artist/album/url/length/position from the shared MPRIS state.
 ///
-/// `AsyncPlayer::progress()` bundles metadata + position in one round trip.
+/// Synchronous and infallible-by-copy: the owner task already did the DBus
+/// round trip and published a flattened snapshot. This function performs NO
+/// I/O, which is why the caller can keep its existing `.await`-free path
+/// inside the 250ms loop with nothing else changing.
+///
 /// Album and track URL are not exposed by `apex-music` today, so they come
 /// back empty — lrclib still matches on title+artist alone, and the
 /// local-sidecar tier needs the URL, so it stays inert until that metadata is
 /// plumbed through.
 #[cfg(target_os = "linux")]
-async fn resolve_track(mpris: &mut apex_mpris2::MPRIS2) -> Option<TrackInfo> {
-    let player = mpris.wait_for_player(None).await.ok()?;
-    let progress = player.progress().await.ok()?;
-    let title = progress.metadata.title().ok()?;
-    if title.trim().is_empty() {
+fn read_track(shared: &crate::mpris_shared::MprisShared) -> Option<TrackInfo> {
+    let np = shared.now()?;
+    if !np.is_playing_something() {
         return None;
     }
-    let artist = progress.metadata.artists().unwrap_or_default();
-    let length = progress.metadata.length().unwrap_or(0);
-    Some((
-        title,
-        artist,
-        String::new(),
-        String::new(),
-        length as i64,
-        progress.position,
-    ))
+    // Read the extrapolated playhead FIRST: the owner publishes on metadata
+    // change, so `position_us` is frozen at that moment, and reading it
+    // directly left lyrics stuck on one line until the track changed -- the
+    // "stuck even after a daemon restart" symptom.
+    let position = np.position_now();
+    Some((np.title, np.artist, np.album, np.url, np.length_us, position))
 }
 
 /// Build the provider from `[providers.lyrics]`.

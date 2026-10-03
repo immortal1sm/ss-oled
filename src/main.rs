@@ -25,6 +25,12 @@ use log::warn;
 // This is kind of pointless on non-Linux platforms
 #[cfg(all(feature = "dbus-support", target_os = "linux"))]
 mod dbus;
+
+// One MPRIS connection shared by the providers that need the current track.
+// DATA ONLY: it publishes snapshots and never dictates a render cadence, so
+// each provider keeps its own loop and its own timing.
+#[cfg(all(feature = "dbus-support", target_os = "linux"))]
+mod mpris_shared;
 mod ipc;
 
 mod providers;
