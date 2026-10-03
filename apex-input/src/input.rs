@@ -9,5 +9,16 @@ pub enum Command {
     ToggleLockSource,
     /// Return to normal auto-rotation.
     UnlockSource,
+    /// Step to the next item of the current custom-API provider (i.e. the next
+    /// element of the JSON array). No-op for any other provider.
+    NextItem,
+    /// Step to the previous item of the current custom-API provider.
+    PreviousItem,
+    /// Scroll the current custom-API provider's article down one line.
+    ScrollDown,
+    /// Scroll the current custom-API provider's article up one line.
+    ScrollUp,
+    /// Enter/leave the article view of the current custom-API provider.
+    ToggleDetail,
     Shutdown,
 }

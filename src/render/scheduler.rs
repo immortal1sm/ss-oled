@@ -355,6 +355,52 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                             );
                             self.device.clear().await?;
                         },
+                        Ok(Command::NextItem) | Ok(Command::PreviousItem) => {
+                            // Steps the array cursor of the custom-API
+                            // provider currently on screen. A no-op for every
+                            // other provider, so the hotkey is safe to leave
+                            // bound globally.
+                            let delta = matches!(cmd, Ok(Command::PreviousItem)) as isize;
+                            let delta = if delta == 1 { -1 } else { 1 };
+                            let name = provider_names
+                                .get(current.load(Ordering::SeqCst))
+                                .cloned()
+                                .unwrap_or_default();
+                            let stepped = crate::providers::custom::step_item(&name, delta);
+                            if stepped {
+                                log::info!(
+                                    "item {} on '{name}'",
+                                    if delta > 0 { "next" } else { "previous" }
+                                );
+                            } else {
+                                log::debug!("item hotkey: '{name}' has no items");
+                            }
+                        }
+                        Ok(Command::ScrollUp) | Ok(Command::ScrollDown) => {
+                            let delta = if matches!(cmd, Ok(Command::ScrollUp)) { -1 } else { 1 };
+                            let name = provider_names
+                                .get(current.load(Ordering::SeqCst))
+                                .cloned()
+                                .unwrap_or_default();
+                            crate::providers::custom::scroll_item(&name, delta);
+                        }
+                        Ok(Command::ToggleDetail) => {
+                            let name = provider_names
+                                .get(current.load(Ordering::SeqCst))
+                                .cloned()
+                                .unwrap_or_default();
+                            match crate::providers::custom::toggle_view(&name) {
+                                Some(view) => log::info!(
+                                    "'{name}' -> {}",
+                                    if view == crate::providers::custom::View::Article {
+                                        "ARTICLE"
+                                    } else {
+                                        "HIGHLIGHTS"
+                                    }
+                                ),
+                                None => log::debug!("toggle: '{name}' has no article fields"),
+                            }
+                        }
                         Ok(Command::LockSource) => {
                             if !provider_locked {
                                 provider_locked = true;

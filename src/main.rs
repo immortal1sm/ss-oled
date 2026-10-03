@@ -61,7 +61,36 @@ use apex_input::Command;
 #[allow(clippy::missing_errors_doc)]
 #[allow(clippy::missing_panics_doc)]
 pub async fn main() -> Result<()> {
-    SimpleLogger::init(LevelFilter::Info, LoggerConfig::default())?;
+    // Log level comes from `log.level` in settings.toml (settable in the GUI),
+    // falling back to the APEX_LOG environment variable, then Info.
+    //
+    // The settings file is peeked here rather than via the merged `settings`
+    // below because the logger has to be initialised before anything else
+    // logs. The GUI restarts the daemon on Apply, so writing the key is enough
+    // to change it.
+    let mut logger_config = config::Config::default();
+    if let Some(dir) = dirs::config_dir() {
+        let _ = logger_config.merge(
+            config::File::with_name(&dir.join("apex-tux/settings").to_string_lossy())
+                .required(false),
+        );
+    }
+    let level_name = logger_config
+        .get_str("log.level")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(std::env::var("APEX_LOG").ok())
+        .unwrap_or_else(|| "info".to_string())
+        .to_ascii_lowercase();
+    let level = match level_name.as_str() {
+        "debug" => LevelFilter::Debug,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        "off" => LevelFilter::Off,
+        _ => LevelFilter::Info,
+    };
+    SimpleLogger::init(level, LoggerConfig::default())?;
+    log::info!("log level: {level_name}");
 
     // This channel is used to send commands to the scheduler
     let (tx, rx) = broadcast::channel::<Command>(100);
@@ -98,6 +127,19 @@ pub async fn main() -> Result<()> {
                 .get_str("hotkeys.lock_toggle")
                 .or_else(|_| settings.get_str("hotkeys.lock"))
                 .unwrap_or(defaults.lock_toggle),
+            item_next: settings
+                .get_str("hotkeys.item_next")
+                .unwrap_or(defaults.item_next),
+            item_previous: settings
+                .get_str("hotkeys.item_previous")
+                .unwrap_or(defaults.item_previous),
+            scroll_up: settings.get_str("hotkeys.scroll_up").unwrap_or(defaults.scroll_up),
+            scroll_down: settings
+                .get_str("hotkeys.scroll_down")
+                .unwrap_or(defaults.scroll_down),
+            detail_toggle: settings
+                .get_str("hotkeys.detail_toggle")
+                .unwrap_or(defaults.detail_toggle),
         };
         match apex_input::InputManager::new(tx.clone(), bindings) {
             Ok(manager) => Some(manager),
