@@ -1,7 +1,7 @@
-# apex-tux / ss-oled settings example
+# ss-oled / ss-oled settings example
 #
-# This file lives at ~/.config/apex-tux/settings.toml on the host.
-# apex-tux looks for it there first, then in the current working directory.
+# This file lives at ~/.config/ss-oled/settings.toml on the host.
+# ss-oled looks for it there first, then in the current working directory.
 #
 # You can also override individual settings with APEX_<SECTION>__<KEY>
 # environment variables (double underscore between section and key).

@@ -21,7 +21,7 @@
 //!   2. lrclib.net — `/api/get` (exact, needs duration), then `/api/search`,
 //!      then a title-only fuzzy search
 //!
-//! Results are cached to `~/.cache/apex-tux/lyrics/` so repeats and restarts
+//! Results are cached to `~/.cache/ss-oled/lyrics/` so repeats and restarts
 //! don't re-hit lrclib, and so lyrics still show when offline.
 
 use crate::providers::lrc::{current_lyric, parse_lrc, LyricLine};
@@ -53,7 +53,7 @@ const TICK_MS: u64 = 250;
 /// lyrics (or a failed fetch) is retried instead of staying blank.
 const NEGATIVE_TTL: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
-const USER_AGENT: &str = concat!("apex-tux/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("ss-oled/", env!("CARGO_PKG_VERSION"));
 
 /// Marker appended to a line that was cut off.
 ///
@@ -349,7 +349,7 @@ fn cache_dir() -> PathBuf {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".cache")
         });
-    base.join("apex-tux").join("lyrics")
+    base.join("ss-oled").join("lyrics")
 }
 
 /// Filesystem-safe cache filename for a track.

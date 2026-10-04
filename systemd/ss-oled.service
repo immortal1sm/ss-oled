@@ -7,12 +7,12 @@
 #
 # Install:
 #   mkdir -p ~/.config/systemd/user
-#   cp systemd/apex-tux.service ~/.config/systemd/user/
+#   cp systemd/ss-oled.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now apex-tux
+#   systemctl --user enable --now ss-oled
 #
 # Logs:
-#   journalctl --user -u apex-tux -f
+#   journalctl --user -u ss-oled -f
 
 [Unit]
 Description=ss-oled — Apex Pro OLED heads-up display daemon
@@ -24,7 +24,10 @@ Type=simple
 # MPRIS works under Wayland.
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 Environment=XDG_RUNTIME_DIR=%t
+# Binary is still `apex-tux`: the Cargo package name is unchanged (crate
+# rename is deferred). The unit is `ss-oled` because that is the app identity.
 ExecStart=%h/projects/apex-tux/target/release/apex-tux
+WorkingDirectory=%h/.config/ss-oled
 Restart=on-failure
 RestartSec=2
 

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 // round-trips (critical: never drop a key we don't understand).
 
 fn default_config_path() -> PathBuf {
-    dirs_or_home().join(".config/apex-tux/settings.toml")
+    dirs_or_home().join(".config/ss-oled/settings.toml")
 }
 
 fn dirs_or_home() -> PathBuf {
@@ -320,7 +320,7 @@ impl App {
     fn apply(&mut self) {
         match self.save() {
             Ok(()) => match std::process::Command::new("systemctl")
-                .args(["--user", "restart", "apex-tux"])
+                .args(["--user", "restart", "ss-oled"])
                 .status()
             {
                 Ok(_) => self.status = "Applied & daemon restarted".into(),
@@ -1049,7 +1049,7 @@ fn provider_section(ui: &mut egui::Ui, app: &mut App, name: &str) {
             );
             ui.label(
                 "auto sources local .lrc first, then lrclib.net. Cached under \
-                 ~/.cache/apex-tux/lyrics/.",
+                 ~/.cache/ss-oled/lyrics/.",
             );
         }
         "image" => {

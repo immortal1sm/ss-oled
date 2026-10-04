@@ -71,7 +71,7 @@ pub async fn main() -> Result<()> {
     let mut logger_config = config::Config::default();
     if let Some(dir) = dirs::config_dir() {
         let _ = logger_config.merge(
-            config::File::with_name(&dir.join("apex-tux/settings").to_string_lossy())
+            config::File::with_name(&dir.join("ss-oled/settings").to_string_lossy())
                 .required(false),
         );
     }
@@ -104,10 +104,10 @@ pub async fn main() -> Result<()> {
     let mut device = Engine::new().await?;
 
     let mut settings = config::Config::default();
-    // Add in `$USER_CONFIG_DIR/apex-tux/settings.toml`
+    // Add in `$USER_CONFIG_DIR/ss-oled/settings.toml`
     if let Some(user_config_dir) = dirs::config_dir() {
         settings.merge(
-            config::File::with_name(&user_config_dir.join("apex-tux/settings").to_string_lossy())
+            config::File::with_name(&user_config_dir.join("ss-oled/settings").to_string_lossy())
                 .required(false),
         )?;
     }

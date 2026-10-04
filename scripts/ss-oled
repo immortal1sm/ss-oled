@@ -5,7 +5,7 @@ set -euo pipefail
 
 BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 TRAY="$(dirname "$BIN_DIR")/target/release/apex-tray"
-DAEMON="apex-tux"
+DAEMON="ss-oled"
 
 start_daemon() {
     if systemctl --user is-active --quiet $DAEMON; then
@@ -59,7 +59,7 @@ case "${1:-start}" in
         fi
         pgrep -x apex-tray >/dev/null 2>&1 && echo "tray:   running" || echo "tray:   stopped"
         pgrep -f apex-gui >/dev/null 2>&1 && echo "gui:    running" || echo "gui:    closed"
-        socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/apex-tux.sock"
+        socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ss-oled.sock"
         [ -S "$socket" ] && echo "ipc: $(printf 'status -> %s' "$(echo status | socat - UNIX-CONNECT:"$socket" 2>/dev/null || echo unreachable)")"
         ;;
     *)

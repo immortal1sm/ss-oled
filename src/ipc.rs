@@ -3,8 +3,8 @@
 //! A small unix-socket server that lets external tools (tray, CLI, scripts)
 //! drive the running daemon: switch providers, toggle lock, query status.
 //!
-//! Socket path: `$XDG_RUNTIME_DIR/apex-tux.sock` (typically
-//! `/run/user/1000/apex-tux.sock`). Line-based protocol, one command per
+//! Socket path: `$XDG_RUNTIME_DIR/ss-oled.sock` (typically
+//! `/run/user/1000/ss-oled.sock`). Line-based protocol, one command per
 //! line; responses are single lines ending in `\n`.
 //!
 //! Commands:
@@ -70,7 +70,7 @@ impl IpcHandle {
 /// Spawn the IPC server. `handle` is shared with the scheduler so commands
 /// and state stay in sync.
 pub fn spawn(socket_dir: &std::path::Path, handle: IpcHandle) -> Result<()> {
-    let path = socket_dir.join("apex-tux.sock");
+    let path = socket_dir.join("ss-oled.sock");
     // Stale socket from a previous run would bind() to fail.
     let _ = std::fs::remove_file(&path);
 
