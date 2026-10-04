@@ -167,8 +167,14 @@ impl Tray for SsOledTray {
                     // started without one in its environment, supply the usual
                     // Plasma session defaults.
                     let mut cmd = std::process::Command::new("sh");
+                    // Absolute, not a `~/.config/...` relative hop: the config
+                    // dir is not inside the repo, so `../..` from it lands in
+                    // ~/projects -- which happened to work only while both
+                    // happened to be named the same. The crate name is still
+                    // apex-* (the rename covered runtime identity, not crates),
+                    // so the binary stays `apex-gui`.
                     cmd.arg("-c").arg(
-                        "nohup ~/.config/ss-oled/../../projects/ss-oled/target/release/apex-gui \
+                        "nohup ~/projects/apex-tux/target/release/apex-gui \
                          >/dev/null 2>&1 &",
                     );
                     let have_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
