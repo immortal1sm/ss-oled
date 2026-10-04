@@ -30,6 +30,15 @@ use tokio::{
     sync::broadcast,
 };
 
+/// Stands in when no shortcuts are registered, so IPC always has something to
+/// hold and the recorder degrades to "nothing to suspend" rather than failing.
+pub struct NoHotkeys;
+
+impl ss_oled_input::HotkeyControl for NoHotkeys {
+    fn suspend(&self) {}
+    fn resume(&self) {}
+}
+
 /// Commands the scheduler understands from IPC.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcCommand {
@@ -48,6 +57,8 @@ pub struct IpcHandle {
     /// Shared dwell clock — IPC switches restart it so an already-elapsed
     /// dwell can't instantly rotate away the provider we just switched to.
     pub last_change: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// The registered shortcuts, so IPC can lift and restore the grab.
+    pub hotkeys: Arc<dyn ss_oled_input::HotkeyControl>,
 }
 
 impl IpcHandle {
@@ -194,6 +205,14 @@ async fn serve(stream: UnixStream, handle: IpcHandle) -> Result<()> {
             handle.locked.store(false, Ordering::SeqCst);
             info!("IPC: provider UNLOCKED");
             "ok unlocked".to_string()
+        } else if cmd == "hotkeys_suspend" {
+            handle.hotkeys.suspend();
+            info!("IPC: hotkey grabs released for recording");
+            "ok suspended".to_string()
+        } else if cmd == "hotkeys_resume" {
+            handle.hotkeys.resume();
+            info!("IPC: hotkey grabs restored");
+            "ok resumed".to_string()
         } else if cmd == "status" {
             handle.status_line()
         } else if cmd == "providers" {
