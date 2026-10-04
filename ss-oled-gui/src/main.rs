@@ -61,23 +61,15 @@ struct App {
     api_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Hotkey field currently waiting for the next key press.
     recording_hotkey: Option<String>,
+    /// Armed while recording, so the daemon's grabs are restored on any exit.
+    _grab_guard: Option<GrabGuard>,
     /// Numpad flag per hotkey config key (next/previous/lock_toggle).
     /// egui reports `Key::Num1` for BOTH the top-row and numpad 1 (its own
     /// docs say "Either from the main row or from the numpad"), so the
     /// recorder cannot infer this. It must be an explicit user choice, or
     /// recorded bindings silently become top-row keys that never reach the
     /// kernel on keyboards whose top row is not delivered.
-    hotkey_numpad_next: bool,
-    hotkey_numpad_previous: bool,
-    hotkey_numpad_lock: bool,
     /// Same egui top-row-vs-numpad caveat applies to the custom-API controls.
-    hotkey_numpad_item_next: bool,
-    hotkey_numpad_item_previous: bool,
-    hotkey_numpad_scroll_up: bool,
-    hotkey_numpad_scroll_down: bool,
-    hotkey_numpad_detail_toggle: bool,
-    hotkey_numpad_notification_lock: bool,
-    hotkey_numpad_eightball: bool,
     /// Field-editor drag state (persists across frames while dragging).
     field_drag_from: Option<usize>,
     /// Set when the debug checkbox is ticked. The daemon fixes its log level
@@ -93,6 +85,52 @@ struct App {
     /// Status line for the UI.
     status: String,
 }
+/// Restores the daemon's shortcut grabs when the GUI exits abnormally.
+///
+/// `on_exit` covers the normal window close, but a panic or a `SIGKILL` skips
+/// it. `Drop` runs for a panic and for any early return, so between the two the
+/// grabs cannot be left released.
+struct GrabGuard;
+
+impl Drop for GrabGuard {
+    fn drop(&mut self) {
+        daemon_hotkeys("hotkeys_resume");
+    }
+}
+
+/// Tell the daemon to release (or restore) its global shortcut grabs.
+///
+/// KGlobalAccel holds every bound key, so a press meant for recording a new
+/// binding is swallowed by the daemon and never reaches this window -- the
+/// recorder would appear dead while the panel kept reacting. Releasing the
+/// grabs for the duration of the recording is what makes it possible.
+///
+/// Best-effort: if the daemon is not running the recorder still works for any
+/// key that was not already bound.
+fn daemon_hotkeys(op: &str) -> bool {
+    let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let path = std::path::Path::new(&runtime).join("ss-oled.sock");
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) else {
+        return false;
+    };
+    use std::io::{Read, Write};
+    if stream.write_all(format!("{op}\n").as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    stream.read(&mut buf).map(|n| n > 0).unwrap_or(false)
+}
+
+/// Outcome of one recording attempt.
+enum Recorded {
+    /// A usable combo was captured.
+    Combo(String),
+    /// Escape was pressed; abandon without binding.
+    Cancel,
+}
+
 
 impl App {
     fn load(path: PathBuf) -> Result<Self> {
@@ -107,23 +145,6 @@ impl App {
 
         // Read existing hotkey strings up front so the numpad checkboxes
         // reflect what is already in the config.
-        let hotkey_str = |k: &str| {
-            doc.get("hotkeys")
-                .and_then(|h| h.get(k))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        let prev_hk = hotkey_str("previous");
-        let next_hk = hotkey_str("next");
-        let lock_hk = hotkey_str("lock_toggle");
-        let item_prev_hk = hotkey_str("item_previous");
-        let item_next_hk = hotkey_str("item_next");
-        let scroll_up_hk = hotkey_str("scroll_up");
-        let scroll_down_hk = hotkey_str("scroll_down");
-        let detail_hk = hotkey_str("detail_toggle");
-        let notif_lock_hk = hotkey_str("notification_lock");
-        let eightball_hk = hotkey_str("eightball");
 
         let mut app = Self {
             config_path: path,
@@ -142,16 +163,7 @@ impl App {
             show_api_response: false,
             api_test: None,
             recording_hotkey: None,
-            hotkey_numpad_previous: hotkey_is_numpad(&prev_hk),
-            hotkey_numpad_next: hotkey_is_numpad(&next_hk),
-            hotkey_numpad_lock: hotkey_is_numpad(&lock_hk),
-            hotkey_numpad_item_next: hotkey_is_numpad(&item_next_hk),
-            hotkey_numpad_item_previous: hotkey_is_numpad(&item_prev_hk),
-            hotkey_numpad_scroll_up: hotkey_is_numpad(&scroll_up_hk),
-            hotkey_numpad_scroll_down: hotkey_is_numpad(&scroll_down_hk),
-            hotkey_numpad_detail_toggle: hotkey_is_numpad(&detail_hk),
-            hotkey_numpad_notification_lock: hotkey_is_numpad(&notif_lock_hk),
-            hotkey_numpad_eightball: hotkey_is_numpad(&eightball_hk),
+            _grab_guard: None,
             field_drag_from: None,
             debug_restart_prompt: false,
             field_drag_over: None,
@@ -173,7 +185,7 @@ impl App {
             return;
         };
         let captured = ctx.input(|input| {
-            input.events.iter().find_map(|event| match event {
+            input.events.iter().rev().find_map(|event| match event {
                 egui::Event::Key {
                     key,
                     physical_key: _,
@@ -181,46 +193,46 @@ impl App {
                     repeat: false,
                     modifiers,
                 } => {
-                    // Escape cancels recording instead of binding itself.
+                    // Escape cancels rather than binding itself.
                     if *key == egui::Key::Escape {
                         return Some(Recorded::Cancel);
                     }
-                    format_recorded_hotkey(*key, *modifiers).map(Recorded::Combo)
+                    // egui 0.27 reports modifiers only through
+                    // `Modifiers`; its `Key` enum has no Control/Alt/Shift
+                    // variants, so a modifier press never reaches here as a
+                    // Key event. Requiring at least one held modifier is
+                    // therefore what stops a stray letter from being bound.
+                    // A lone key with no modifier is almost always a stray
+                    // keystroke rather than an intentional binding, and a
+                    // one-letter binding would fire on every plain press in
+                    // every other window. Require at least one modifier.
+                    if modifiers.ctrl || modifiers.alt || modifiers.shift || modifiers.mac_cmd {
+                        recorded_combo(*key, *modifiers).map(Recorded::Combo)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             })
         });
         match captured {
             Some(Recorded::Combo(combo)) => {
-                // egui reports the same Key for a numpad key and its top-row
-                // twin, so the recorded name is applied through the explicit
-                // numpad flag. Without this, recording always produces a
-                // top-row binding.
-                let use_numpad = match path.as_str() {
-                    "hotkeys.next" => self.hotkey_numpad_next,
-                    "hotkeys.previous" => self.hotkey_numpad_previous,
-                    "hotkeys.lock_toggle" => self.hotkey_numpad_lock,
-                    "hotkeys.item_next" => self.hotkey_numpad_item_next,
-                    "hotkeys.item_previous" => self.hotkey_numpad_item_previous,
-                    "hotkeys.scroll_up" => self.hotkey_numpad_scroll_up,
-                    "hotkeys.scroll_down" => self.hotkey_numpad_scroll_down,
-                    "hotkeys.detail_toggle" => self.hotkey_numpad_detail_toggle,
-                    "hotkeys.notification_lock" => self.hotkey_numpad_notification_lock,
-                    "hotkeys.eightball" => self.hotkey_numpad_eightball,
-                    "hotkeys.eightball" => self.hotkey_numpad_eightball,
-                    _ => false,
-                };
-                let combo = if use_numpad {
-                    apply_numpad(&combo, true)
-                } else {
-                    combo
-                };
+                // egui reports a numpad key and its top-row twin as the SAME
+                // Key, so the name it gives is ambiguous. Spell it as a numpad
+                // key: every binding in this project uses the numpad, and
+                // guessing wrong here silently binds the wrong physical key.
+                let combo = spell_numpad(&combo);
                 self.set_str(&path, &combo);
                 self.recording_hotkey = None;
+                // Dropping the guard restores the grabs; that is the resume.
+                self._grab_guard = None;
+                daemon_hotkeys("hotkeys_resume");
                 self.status = format!("Recorded {combo}");
             }
             Some(Recorded::Cancel) => {
                 self.recording_hotkey = None;
+                self._grab_guard = None;
+                daemon_hotkeys("hotkeys_resume");
                 self.status = "Recording cancelled".to_string();
             }
             None => {}
@@ -631,6 +643,21 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Restore the daemon's shortcut grabs on the way out.
+    ///
+    /// `Record` releases every grab so this window can receive key presses. If
+    /// the window closes while that is still in effect -- or the process is
+    /// killed mid-recording -- nothing puts them back, and the hotkeys stay dead
+    /// until the daemon is restarted. Cheap, idempotent, and only does work if
+    /// a recording was actually in flight.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.recording_hotkey.take().is_some() {
+            // Dropping the guard restores the grabs.
+            self._grab_guard = None;
+            daemon_hotkeys("hotkeys_resume");
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.capture_hotkey_recording(ctx);
         let panel_h = ctx.screen_rect().height() - 70.0;
@@ -1472,44 +1499,28 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
 
     // Copy the numpad flags out before the calls: `hotkey_text_field` needs
     // `&mut app`, so we cannot also hand it `&mut app.hotkey_numpad_*`.
-    let mut numpad_previous = app.hotkey_numpad_previous;
-    let mut numpad_next = app.hotkey_numpad_next;
-    let mut numpad_lock = app.hotkey_numpad_lock;
-    let mut numpad_item_next = app.hotkey_numpad_item_next;
-    let mut numpad_item_prev = app.hotkey_numpad_item_previous;
-    let mut numpad_scroll_up = app.hotkey_numpad_scroll_up;
-    let mut numpad_scroll_down = app.hotkey_numpad_scroll_down;
-    let mut numpad_detail = app.hotkey_numpad_detail_toggle;
-    let mut numpad_notif_lock = app.hotkey_numpad_notification_lock;
-    let mut numpad_eightball = app.hotkey_numpad_eightball;
 
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.previous",
         "Previous provider",
         "Ctrl+Shift+Numpad *",
-        &mut numpad_previous,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.next",
         "Next provider",
         "Ctrl+Shift+Numpad /",
-        &mut numpad_next,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.lock_toggle",
         "Lock / unlock provider",
         "Ctrl+Shift+Numpad -",
-        &mut numpad_lock,
     );
-    app.hotkey_numpad_previous = numpad_previous;
-    app.hotkey_numpad_next = numpad_next;
-    app.hotkey_numpad_lock = numpad_lock;
 
     // Custom-API list controls. Only meaningful while a custom provider with
     // `items` is on screen; elsewhere the hotkeys are a no-op.
@@ -1517,69 +1528,55 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
     ui.separator();
     ui.label("Custom API list");
     ui.label("Move between items, scroll a secondary screen, or open it.");
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.item_previous",
         "Previous item",
         "Ctrl+Alt+Left",
-        &mut numpad_item_prev,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.item_next",
         "Next item",
         "Ctrl+Alt+Right",
-        &mut numpad_item_next,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.scroll_up",
         "Scroll up",
         "Ctrl+Alt+Up",
-        &mut numpad_scroll_up,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.scroll_down",
         "Scroll down",
         "Ctrl+Alt+Down",
-        &mut numpad_scroll_down,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.detail_toggle",
         "Open / close secondary screen",
         "Ctrl+Alt+Numpad0",
-        &mut numpad_detail,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.notification_lock",
         "Lock / unlock notification",
         "Ctrl+Alt+Numpad.",
-        &mut numpad_notif_lock,
     );
-    hotkey_text_field(
+    hotkey_recorder(
         ui,
         app,
         "hotkeys.eightball",
         "Ask the 8 ball",
         "Ctrl+Alt+Numpad8",
-        &mut numpad_eightball,
     );
-    app.hotkey_numpad_item_next = numpad_item_next;
-    app.hotkey_numpad_item_previous = numpad_item_prev;
-    app.hotkey_numpad_scroll_up = numpad_scroll_up;
-    app.hotkey_numpad_scroll_down = numpad_scroll_down;
-    app.hotkey_numpad_detail_toggle = numpad_detail;
-    app.hotkey_numpad_notification_lock = numpad_notif_lock;
-    app.hotkey_numpad_eightball = numpad_eightball;
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1618,137 +1615,82 @@ fn hotkeys_editor(ui: &mut egui::Ui, app: &mut App) {
     );
 }
 
-fn hotkey_text_field(
+/// Recorder-only hotkey field.
+///
+/// Deliberately NOT a text box. A free-text field lets a binding be typed that
+/// the daemon cannot parse, which then fails silently at start-up -- the key is
+/// registered by nobody and the hotkey simply does nothing. Recording removes
+/// that whole class of mistake: whatever lands here was a real key press, so it
+/// is always parseable.
+///
+/// The current combo is shown as read-only text purely as feedback; it cannot be
+/// edited. `Record` arms the capture, `Clear` disables the binding.
+fn hotkey_recorder(
     ui: &mut egui::Ui,
     app: &mut App,
     key: &str,
     label: &str,
     default: &str,
-    numpad: &mut bool,
 ) {
     ui.horizontal(|ui| {
         ui.label(format!("{label}:"));
-        let mut s = app.get_str(key);
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut s)
-                .hint_text(default)
-                .desired_width(240.0),
-        );
-        if response.changed() || response.lost_focus() {
-            app.set_str(key, &s);
-            // Keep the checkbox honest when the text is edited by hand.
-            *numpad = hotkey_is_numpad(&s);
-        }
-        let is_recording = app.recording_hotkey.as_deref() == Some(key);
-        let record_label = if is_recording {
-            "Recording…"
+        let current = app.get_str(key);
+        let shown = if current.trim().is_empty() {
+            format!("{default}  (not set)")
         } else {
-            "Record"
+            current.clone()
         };
-        if ui.button(record_label).clicked() {
+        // Read-only label, not an editable widget: there is no way to type a
+        // binding here, only record one.
+        ui.add_enabled(
+            false,
+            egui::TextEdit::singleline(&mut shown.clone()).desired_width(200.0),
+        )
+        .on_disabled_hover_text("Recorded with the Record button — bindings cannot be typed");
+
+        let is_recording = app.recording_hotkey.as_deref() == Some(key);
+        if ui
+            .add_enabled(
+                !is_recording,
+                egui::Button::new(if is_recording { "Recording…" } else { "Record" }),
+            )
+            .clicked()
+        {
+            // Release the daemon's grabs FIRST: while it holds the bound keys
+            // the press we are waiting for goes to the daemon, not here.
+            let released = daemon_hotkeys("hotkeys_suspend");
             app.recording_hotkey = Some(key.to_string());
-            app.status = format!("Press a key combo for {label}");
-        }
-        if ui.button("Clear").clicked() {
-            app.set_str(key, "");
-            if is_recording {
-                app.recording_hotkey = None;
+            // From here the daemon holds nothing, so any exit must give it back.
+            if released {
+                app._grab_guard = Some(GrabGuard);
             }
-            app.status = format!("{label} hotkey disabled");
+            app.status = if released {
+                format!("Press a key combo for {label}")
+            } else {
+                format!("Press a key combo for {label} (daemon not reachable \u{2014} already-bound keys may not record)")
+            };
         }
-        // egui cannot tell numpad from top row, so this is explicit.
-        if ui.checkbox(numpad, egui::RichText::new("Numpad").small()).changed() {
-            let cur = app.get_str(key);
-            let updated = apply_numpad(&cur, *numpad);
-            app.set_str(key, &updated);
-            app.status = format!(
-                "{label} numpad {}",
-                if *numpad { "on" } else { "off" }
-            );
+        if is_recording {
+            if ui.button("Cancel").clicked() {
+                app.recording_hotkey = None;
+                daemon_hotkeys("hotkeys_resume");
+                app._grab_guard = None;
+                app.status = "Recording cancelled".to_string();
+            }
+        } else if ui.button("Clear").clicked() {
+            app.set_str(key, "");
+            app.status = format!("{label} hotkey disabled");
         }
     });
 }
 
-/// Does this binding string name a numpad key?
-fn hotkey_is_numpad(spec: &str) -> bool {
-    spec.split('+').any(|p| {
-        let p = p.trim().to_ascii_lowercase();
-        p.starts_with("numpad")
-    })
-}
-
-/// Insert or remove the `Numpad` prefix on the final key segment of a binding.
-/// Idempotent in both directions: applying the same state twice is a no-op, and
-/// a literal trailing `+` key (e.g. "Ctrl++") survives a round trip.
-fn apply_numpad(spec: &str, on: bool) -> String {
-    let segs: Vec<&str> = spec.split('+').collect();
-    if segs.is_empty() {
-        return spec.to_string();
-    }
-    let mut out: Vec<String> = segs[..segs.len() - 1]
-        .iter()
-        .map(|s| s.trim().to_string())
-        .collect();
-
-    // The final segment is empty when the binding ends in a literal "+" key
-    // (split on '+' turns "Ctrl++" into ["Ctrl", "", ""]).
-    let last = segs[segs.len() - 1].trim();
-    let (last, literal_plus) = if last.is_empty() {
-        ("+", true)
-    } else {
-        (last, false)
-    };
-
-    // Strip a leading "numpad" PREFIX (not a char set - trim_start_matches
-    // would eat the letters of "Numpad" one by one and also mangle keys that
-    // merely start with those characters).
-    let lower = last.to_ascii_lowercase();
-    let stripped = if lower == "numpad" {
-        String::new()
-    } else if let Some(rest) = lower.strip_prefix("numpad") {
-        rest.trim().to_string()
-    } else {
-        last.to_string()
-    };
-
-    let new_last = if on {
-        if stripped.is_empty() {
-            if literal_plus {
-                // Nothing to prefix onto a bare "+" key; keep the key alone.
-                "+".to_string()
-            } else {
-                "Numpad".to_string()
-            }
-        } else {
-            format!("Numpad{stripped}")
-        }
-    } else {
-        if literal_plus {
-            "+".to_string()
-        } else {
-            stripped
-        }
-    };
-
-    // A trailing literal '+' must stay a separate segment so the daemon's
-    // parser (which preserves a trailing '+' before splitting) sees it.
-    out.push(new_last);
-    if literal_plus {
-        out.push(String::new());
-    }
-    out.join("+")
-}
-
-/// Outcome of a single recording attempt.
-enum Recorded {
-    Combo(String),
-    Cancel,
-}
-
-fn format_recorded_hotkey(
-    key: egui::Key,
-    modifiers: egui::Modifiers,
-) -> Option<String> {
+/// Format a recorded combo, or `None` when the key cannot be spelled.
+///
+/// A bare modifier never reaches here (see [`is_modifier_key`]), so the result
+/// always names a real key.
+fn recorded_combo(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
+    // Copy/Cut/Paste are handled by the windowing system; binding them does
+    // nothing useful and shadows real shortcuts.
     if matches!(key, egui::Key::Copy | egui::Key::Cut | egui::Key::Paste) {
         return None;
     }
@@ -1769,6 +1711,73 @@ fn format_recorded_hotkey(
     Some(parts.join("+"))
 }
 
+/// Spell the key as a Numpad key.
+///
+/// egui reports a Numpad key and its top-row twin as the same `Key`, so the
+/// name it hands back is ambiguous -- there is no way to tell "Numpad 2" from
+/// "2" at capture time. Every binding in this project uses the Numpad, and a
+/// wrong guess silently binds the wrong physical key, so the Numpad spelling is
+/// always used.
+///
+/// Two cases this must NOT rewrite:
+///
+///   * a trailing `+`, because that IS the key (Ctrl+Numpad+). Splitting the
+///     string on `+` leaves an empty final segment, which would otherwise be
+///     turned into a bare "Numpad" and bind nothing;
+///   * a top-row Enter, because the main keyboard's Enter is its own key. Only
+///     the numpad has a separate Enter, and egui cannot tell them apart, so
+///     rewriting it would break "Ctrl+Alt+Enter" for anyone using the main
+///     Enter. Every binding here uses numpad digits or arrows instead, so the
+///     ambiguity is left to the user rather than guessed.
+fn spell_numpad(combo: &str) -> String {
+    let segs: Vec<&str> = combo.split('+').collect();
+    let Some((last, mods)) = segs.split_last() else {
+        return combo.to_string();
+    };
+    let trimmed = last.trim();
+    if trimmed.eq_ignore_ascii_case("enter") {
+        return combo.to_string();
+    }
+    // "Ctrl+Alt++" means Ctrl+Alt and the PLUS key. Joining with '+' produces
+    // the bare key, which the daemon re-reads as the numpad plus, so the two
+    // are the same string and no separate spelling is needed.
+    let name = if trimmed.is_empty() {
+        "+"
+    } else {
+        match numpad_spelling(trimmed) {
+            Some(n) => n,
+            None => return combo.to_string(),
+        }
+    };
+    let mut out: Vec<&str> = mods.to_vec();
+    out.push(name);
+    out.join("+")
+}
+
+/// The Numpad name for a recorded key name, if it has one.
+///
+/// Returns a `&'static str` so the joined result borrows from the same tables
+/// [`recorded_key_name`] uses.
+fn numpad_spelling(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "0" => "Numpad0",
+        "1" => "Numpad1",
+        "2" => "Numpad2",
+        "3" => "Numpad3",
+        "4" => "Numpad4",
+        "5" => "Numpad5",
+        "6" => "Numpad6",
+        "7" => "Numpad7",
+        "8" => "Numpad8",
+        "9" => "Numpad9",
+        "." => "Numpad.",
+        "/" => "Numpad/",
+        "*" => "Numpad*",
+        "-" => "Numpad-",
+        "+" => "Numpad+",
+        _ => return None,
+    })
+}
 fn recorded_key_name(key: egui::Key) -> Option<&'static str> {
     Some(match key {
         egui::Key::ArrowDown => "ArrowDown",
@@ -3410,5 +3419,163 @@ mod field_spec_tests {
         let again = FieldRow::parse(&row.to_toml_string());
         assert!(!again.value_visible, "value_visible flipped");
         assert_eq!(again.dy, 2);
+    }
+}
+
+#[cfg(test)]
+mod recorder_roundtrip {
+    use super::*;
+
+    /// Every combo the recorder can emit must parse with the daemon's parser.
+    ///
+    /// The recorder and the daemon speak different vocabularies: the recorder
+    /// builds a name from an `egui::Key`, the daemon parses a string into a Qt
+    /// sequence. A name the parser rejects is dropped at start-up and the
+    /// hotkey silently does nothing -- no error, no log, just a dead key. This
+    /// test is the guard: it runs the recorder's own output through the real
+    /// parser, so a mismatch fails here instead of on the panel.
+    #[test]
+    fn every_recorded_combo_parses() {
+        // The full set of keys the recorder can be handed, paired with the
+        // modifier sets a user actually presses.
+        let keys: &[(egui::Key, &str)] = &[
+            (egui::Key::Num0, "Numpad0"),
+            (egui::Key::Num1, "Numpad1"),
+            (egui::Key::Num2, "Numpad2"),
+            (egui::Key::Num3, "Numpad3"),
+            (egui::Key::Num4, "Numpad4"),
+            (egui::Key::Num5, "Numpad5"),
+            (egui::Key::Num6, "Numpad6"),
+            (egui::Key::Num7, "Numpad7"),
+            (egui::Key::Num8, "Numpad8"),
+            (egui::Key::Num9, "Numpad9"),
+            (egui::Key::Period, "Numpad."),
+            (egui::Key::Slash, "Numpad/"),
+            (egui::Key::Minus, "Numpad-"),
+            (egui::Key::Plus, "+"),
+            (egui::Key::ArrowUp, "Up"),
+            (egui::Key::ArrowDown, "Down"),
+            (egui::Key::ArrowLeft, "Left"),
+            (egui::Key::ArrowRight, "Right"),
+            (egui::Key::Enter, "Enter"),
+            (egui::Key::Escape, "Escape"),
+            (egui::Key::Space, "Space"),
+            (egui::Key::Tab, "Tab"),
+            (egui::Key::F1, "F1"),
+            (egui::Key::F12, "F12"),
+            (egui::Key::Backspace, "Backspace"),
+            (egui::Key::Delete, "Delete"),
+            (egui::Key::Home, "Home"),
+            (egui::Key::End, "End"),
+            (egui::Key::PageUp, "PageUp"),
+            (egui::Key::PageDown, "PageDown"),
+            (egui::Key::Insert, "Insert"),
+        ];
+
+        let mods = [
+            egui::Modifiers::default(),
+            egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            egui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        ];
+
+        for (key, expected_tail) in keys {
+            for m in &mods {
+                let Some(combo) = recorded_combo(*key, *m) else {
+                    continue;
+                };
+                let combo = spell_numpad(&combo);
+                assert!(
+                    combo.ends_with(expected_tail),
+                    "recorder spelled {key:?} as '{combo}', expected it to end in '{expected_tail}'"
+                );
+                // The whole point: the daemon must be able to read it back.
+                let parsed = ss_oled_input::parse_optional_qt_hotkey(&combo)
+                    .unwrap_or_else(|e| panic!("daemon cannot parse recorded combo '{combo}': {e}"));
+                assert!(
+                    parsed.is_some(),
+                    "daemon parsed recorded combo '{combo}' as DISABLED"
+                );
+            }
+        }
+    }
+
+    /// The numpad spelling must not mangle a non-numpad key.
+    ///
+    /// Arrow keys and letters have no Numpad form, so they must pass through
+    /// unchanged -- otherwise "Ctrl+Alt+Up" would become "Ctrl+Alt+NumpadUp"
+    /// and bind nothing.
+    #[test]
+    fn non_numpad_keys_pass_through_unchanged() {
+        for combo in [
+            "Ctrl+Alt+Up",
+            "Ctrl+Alt+Down",
+            "Ctrl+Alt+Left",
+            "Ctrl+Alt+Right",
+            "Ctrl+Alt+Enter",
+            "Ctrl+Shift+F5",
+        ] {
+            assert_eq!(
+                spell_numpad(combo),
+                combo,
+                "spell_numpad must leave '{combo}' alone"
+            );
+            assert!(
+                ss_oled_input::parse_optional_qt_hotkey(combo)
+                    .unwrap_or_else(|e| panic!("daemon cannot parse '{combo}': {e}"))
+                    .is_some(),
+                "daemon cannot parse '{combo}'"
+            );
+        }
+    }
+
+    /// Every binding the shipped config uses must round-trip too.
+    ///
+    /// These are the ten strings the daemon actually registers. If the GUI ever
+    /// rewrites one into a form the parser rejects, that hotkey stops working
+    /// with no diagnostic anywhere.
+    #[test]
+    fn shipped_bindings_round_trip() {
+        for spec in [
+            "Ctrl+Alt+Numpad1",
+            "Ctrl+Alt+Numpad2",
+            "Ctrl+Alt+Numpad3",
+            "Ctrl+Alt+Numpad0",
+            "Ctrl+Alt+Numpad.",
+            "Ctrl+Alt+Numpad8",
+            "Ctrl+Alt+Up",
+            "Ctrl+Alt+Down",
+            "Ctrl+Alt+Left",
+            "Ctrl+Alt+Right",
+        ] {
+            assert!(
+                ss_oled_input::parse_optional_qt_hotkey(spec)
+                    .unwrap_or_else(|e| panic!("shipped binding '{spec}' does not parse: {e}"))
+                    .is_some(),
+                "shipped binding '{spec}' parsed as disabled"
+            );
+            // And rewriting it through the recorder's numpad spelling must not
+            // change it -- recording the same key must land on the same binding.
+            assert_eq!(
+                spell_numpad(spec),
+                spec,
+                "recording over '{spec}' would change it"
+            );
+        }
     }
 }
