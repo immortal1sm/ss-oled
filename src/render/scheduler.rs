@@ -10,8 +10,8 @@ use crate::render::{
     notifications::{Notification, NotificationProvider},
     stream::multiplex,
 };
-use apex_hardware::{AsyncDevice, FrameBuffer};
-use apex_input::Command;
+use ss_oled_hardware::{AsyncDevice, FrameBuffer};
+use ss_oled_input::Command;
 use config::Config;
 use futures::{pin_mut, stream, stream::Stream, StreamExt};
 use itertools::Itertools;

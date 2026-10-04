@@ -1,0 +1,16 @@
+[package]
+name = "ss-oled-mpris2"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dbus = "0.9"
+dbus-tokio = { version = "0.7" }
+ss-oled-music = { path= "../ss-oled-music" }
+anyhow = "1.0.44"
+tokio = {version = "1", features=["time", "net", "macros", "rt-multi-thread", "sync"]}
+async-stream = "0.3.2"
+futures-util = "0.3.17"
+futures-core = "0.3.17"

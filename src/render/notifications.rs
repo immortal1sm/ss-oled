@@ -21,7 +21,7 @@ use embedded_graphics::{
 };
 use futures_core::stream::Stream;
 
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use tinybmp::Bmp;
 use tokio::{
     time,

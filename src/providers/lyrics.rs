@@ -1,6 +1,6 @@
 //! Lyrics provider — synchronized lyrics for the currently playing track.
 //!
-//! Reads track metadata from MPRIS (via `apex-mpris2`), fetches LRC lyrics, and
+//! Reads track metadata from MPRIS (via `ss-oled-mpris2`), fetches LRC lyrics, and
 //! renders the line active at the current playback position.
 //!
 //! ```toml
@@ -27,7 +27,7 @@
 use crate::providers::lrc::{current_lyric, parse_lrc, LyricLine};
 use crate::render::display::ContentProvider;
 use anyhow::Result;
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use async_stream::try_stream;
 use config::Config;
 use embedded_graphics::{
@@ -731,7 +731,7 @@ type TrackInfo = (String, String, String, String, i64, i64);
 /// I/O, which is why the caller can keep its existing `.await`-free path
 /// inside the 250ms loop with nothing else changing.
 ///
-/// Album and track URL are not exposed by `apex-music` today, so they come
+/// Album and track URL are not exposed by `ss-oled-music` today, so they come
 /// back empty — lrclib still matches on title+artist alone, and the
 /// local-sidecar tier needs the URL, so it stays inert until that metadata is
 /// plumbed through.
@@ -910,7 +910,7 @@ mod tests {
         /// Rightmost lit column in the buffer, or None if the buffer is blank.
         fn rightmost_inked_column(buf: &FrameBuffer) -> Option<u32> {
             // FrameBuffer stores bits row-major with an 8-byte header offset;
-            // see apex-hardware/src/device.rs.
+            // see ss-oled-hardware/src/device.rs.
             let mut rightmost: Option<u32> = None;
             for y in 0..PANEL_H as u32 {
                 for x in 0..PANEL_W as u32 {

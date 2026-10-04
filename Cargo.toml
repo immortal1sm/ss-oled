@@ -1,28 +1,28 @@
 [package]
-name = "apex-tux"
+name = "ss-oled"
 version = "1.0.4"
 edition = "2021"
 
 [workspace]
 
 members = [
-    "apex-ctl",
-    "apex-hardware",
-    "apex-mpris2",
-    "apex-music",
-    "apex-simulator",
-    "apex-input",
-    "apex-tray",
-    "apex-gui",
-    "apex-engine",
-    "apex-windows"
+    "ss-oled-ctl",
+    "ss-oled-hardware",
+    "ss-oled-mpris2",
+    "ss-oled-music",
+    "ss-oled-simulator",
+    "ss-oled-input",
+    "ss-oled-tray",
+    "ss-oled-gui",
+    "ss-oled-engine",
+    "ss-oled-windows"
 ]
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-apex-hardware = { path = "./apex-hardware", features = ["async"] }
+ss-oled-hardware = { path = "./ss-oled-hardware", features = ["async"] }
 
 
 anyhow = "1"
@@ -42,10 +42,10 @@ pin-project-lite = "0.2"
 itertools = "0.14"
 chrono = "0.4"
 num-traits = "0.2"
-apex-input = {path = "./apex-input" }
-apex-music = { path = "./apex-music" }
-apex-simulator = { path = "./apex-simulator", optional = true }
-apex-engine = { path = "./apex-engine", optional = true }
+ss-oled-input = {path = "./ss-oled-input" }
+ss-oled-music = { path = "./ss-oled-music" }
+ss-oled-simulator = { path = "./ss-oled-simulator", optional = true }
+ss-oled-engine = { path = "./ss-oled-engine", optional = true }
 sysinfo = { version = "0.27.7", optional = true }
 image  = { version = "0.25", optional = true }
 dirs = "6"
@@ -54,21 +54,21 @@ serde_json = { version = "1", optional = true }
 
 
 [target.'cfg(target_os = "windows")'.dependencies]
-apex-windows = {path = "./apex-windows"}
+ss-oled-windows = {path = "./ss-oled-windows"}
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
-apex-mpris2 = { path = "./apex-mpris2", optional = true }
+ss-oled-mpris2 = { path = "./ss-oled-mpris2", optional = true }
 dbus = { version = "0.9", optional = true }
 dbus-tokio = { version = "0.7.6", optional = true }
 
 [features]
 default = ["dbus-support", "usb"]
-dbus-support = ["dbus", "dbus-tokio", "apex-mpris2"]
-simulator = ["apex-simulator"]
-usb = ["apex-hardware/usb"]
-hotkeys = ["apex-input/hotkeys"]
-engine = ["apex-engine"]
+dbus-support = ["dbus", "dbus-tokio", "ss-oled-mpris2"]
+simulator = ["ss-oled-simulator"]
+usb = ["ss-oled-hardware/usb"]
+hotkeys = ["ss-oled-input/hotkeys"]
+engine = ["ss-oled-engine"]
 sysinfo = ["dep:sysinfo"]
 image = ["dep:image"]
 weather = ["dep:ureq", "dep:serde_json"]

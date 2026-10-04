@@ -1,0 +1,13 @@
+[package]
+name = "ss-oled-ctl"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.44"
+clap = { version = "4.0.26", features = ["derive"] }
+log = "0.4.14"
+simplelog = "0.12"
+ss-oled-hardware = { path = "../ss-oled-hardware", features= ["usb"] }

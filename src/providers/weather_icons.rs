@@ -4,7 +4,7 @@
 //! no bitmap assets to maintain. Each condition exposes `draw(target, frame)`
 //! where `frame` advances ~every 300ms for animation.
 
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use embedded_graphics::{
     geometry::Size,
     pixelcolor::BinaryColor,
