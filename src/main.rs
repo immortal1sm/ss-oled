@@ -42,20 +42,20 @@ compile_error!(
 );
 
 #[cfg(feature = "simulator")]
-use apex_simulator::Simulator;
+use ss_oled_simulator::Simulator;
 
 use crate::render::{scheduler, scheduler::Scheduler};
 #[cfg(feature = "engine")]
-use apex_engine::Engine;
-use apex_hardware::AsyncDevice;
+use ss_oled_engine::Engine;
+use ss_oled_hardware::AsyncDevice;
 #[cfg(all(feature = "usb", target_os = "linux", not(feature = "engine")))]
 #[cfg(all(feature = "usb", target_family = "unix", not(feature = "engine")))]
-use apex_hardware::ReconnectingDevice;
+use ss_oled_hardware::ReconnectingDevice;
 use log::{info, LevelFilter};
 use simplelog::{Config as LoggerConfig, SimpleLogger};
 use tokio::sync::broadcast;
 
-use apex_input::Command;
+use ss_oled_input::Command;
 
 #[tokio::main]
 #[allow(clippy::missing_errors_doc)]
@@ -120,8 +120,8 @@ pub async fn main() -> Result<()> {
 
     #[cfg(feature = "hotkeys")]
     let hkm = {
-        let defaults = apex_input::HotkeyBindings::default();
-        let bindings = apex_input::HotkeyBindings {
+        let defaults = ss_oled_input::HotkeyBindings::default();
+        let bindings = ss_oled_input::HotkeyBindings {
             previous: settings
                 .get_str("hotkeys.previous")
                 .unwrap_or(defaults.previous),
@@ -150,7 +150,7 @@ pub async fn main() -> Result<()> {
                 .get_str("hotkeys.eightball")
                 .unwrap_or(defaults.eightball),
         };
-        match apex_input::InputManager::new(tx.clone(), bindings) {
+        match ss_oled_input::InputManager::new(tx.clone(), bindings) {
             Ok(manager) => Some(manager),
             Err(e) => {
                 log::warn!("hotkeys unavailable: {e}");

@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use crate::render::display::ContentProvider;
 use crate::render::text::wrap_text;
 use anyhow::{anyhow, Result};
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use async_stream::try_stream;
 use config::Config;
 use embedded_graphics::{

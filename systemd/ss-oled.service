@@ -26,7 +26,7 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 Environment=XDG_RUNTIME_DIR=%t
 # Binary is still `apex-tux`: the Cargo package name is unchanged (crate
 # rename is deferred). The unit is `ss-oled` because that is the app identity.
-ExecStart=%h/projects/apex-tux/target/release/apex-tux
+ExecStart=%h/projects/apex-tux/target/release/ss-oled
 WorkingDirectory=%h/.config/ss-oled
 Restart=on-failure
 RestartSec=2

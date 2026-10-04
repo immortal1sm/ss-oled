@@ -3,10 +3,10 @@
 //! Named `mpris2` because that is the name it registers under and the
 //! config table it reads (`mpris2.*`). It was called `music.rs`, which made
 //! the knowledge graph read it as dead code -- searching the graph for
-//! `mpris2` landed on the `apex-mpris2` crate instead of on this file.
+//! `mpris2` landed on the `ss-oled-mpris2` crate instead of on this file.
 //!
-//! The MPRIS protocol layer itself lives in the `apex-mpris2` crate; the
-//! Windows implementation in `apex-windows`.
+//! The MPRIS protocol layer itself lives in the `ss-oled-mpris2` crate; the
+//! Windows implementation in `ss-oled-windows`.
 use crate::render::{
     display::ContentProvider,
     scheduler::{ContentWrapper, FocusChannel, CONTENT_PROVIDERS},
@@ -28,7 +28,7 @@ use tinybmp::Bmp;
 use tokio::time;
 
 use crate::mpris_shared::NowPlaying;
-use apex_music::PlaybackStatus;
+use ss_oled_music::PlaybackStatus;
 use config::Config;
 use embedded_graphics::{
     mono_font::{iso_8859_15, MonoTextStyle},
@@ -40,7 +40,7 @@ use std::{
 };
 use tokio::time::{Duration, MissedTickBehavior};
 
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 
 static NOTE_ICON: &[u8] = include_bytes!("./../../assets/note.bmp");
 static PAUSE_ICON: &[u8] = include_bytes!("./../../assets/pause.bmp");
@@ -132,8 +132,8 @@ struct SnapshotProgress {
 /// Read a snapshot from the Windows player, flattening it into the same shape
 /// the shared module publishes on Linux. Keeps `update()` platform-agnostic.
 #[cfg(not(all(feature = "dbus-support", target_os = "linux")))]
-async fn now_from_windows(player: &apex_windows::Player) -> NowPlaying {
-    use apex_music::{AsyncPlayer, Metadata as MetadataTrait};
+async fn now_from_windows(player: &ss_oled_windows::Player) -> NowPlaying {
+    use ss_oled_music::{AsyncPlayer, Metadata as MetadataTrait};
     let Ok(progress) = player.progress().await else {
         return NowPlaying::default();
     };
@@ -568,7 +568,7 @@ impl ContentProvider for MediaPlayerBuilder {
                         _ = poll.tick() => None,
                     };
                     #[cfg(not(all(feature = "dbus-support", target_os = "linux")))]
-                    let event: Option<Result<apex_music::PlayerEvent, tokio::sync::broadcast::error::RecvError>> = {
+                    let event: Option<Result<ss_oled_music::PlayerEvent, tokio::sync::broadcast::error::RecvError>> = {
                         poll.tick().await;
                         None
                     };
@@ -593,7 +593,7 @@ impl ContentProvider for MediaPlayerBuilder {
                     let np = mpris.now();
                     #[cfg(not(all(feature = "dbus-support", target_os = "linux")))]
                     let np = {
-                        let player = apex_windows::Player::new()?;
+                        let player = ss_oled_windows::Player::new()?;
                         Some(now_from_windows(&player).await)
                     };
 
@@ -623,7 +623,7 @@ impl ContentProvider for MediaPlayerBuilder {
                         // (rare but happens). Timer events don't fire focus.
                         if matches!(
                             event,
-                            apex_music::PlayerEvent::Properties | apex_music::PlayerEvent::Seeked
+                            ss_oled_music::PlayerEvent::Properties | ss_oled_music::PlayerEvent::Seeked
                         ) {
                             // Honor mpris2.event_focus: when disabled, media state
                             // changes still re-render this screen if it's shown, but
@@ -664,7 +664,7 @@ impl ContentProvider for MediaPlayerBuilder {
 mod render_tests {
     use super::*;
     use std::time::Duration;
-    use apex_music::PlaybackStatus;
+    use ss_oled_music::PlaybackStatus;
 
     fn raw(fb: &FrameBuffer) -> Vec<u8> {
         fb.framebuffer.as_raw_slice().to_vec()

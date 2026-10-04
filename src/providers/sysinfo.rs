@@ -3,7 +3,7 @@ use crate::{
     scheduler::CONTENT_PROVIDERS,
 };
 use anyhow::Result;
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use async_stream::try_stream;
 use num_traits::{pow, Pow};
 

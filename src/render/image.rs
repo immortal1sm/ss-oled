@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use embedded_graphics::{
     image::{Image, ImageRaw},
     pixelcolor::BinaryColor,

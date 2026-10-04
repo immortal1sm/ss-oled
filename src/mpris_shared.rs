@@ -26,7 +26,7 @@
 //! restart is recovered from once and every subscriber sees `Down` together
 //! rather than each discovering it independently.
 
-use apex_music::{AsyncPlayer, Metadata as MetadataTrait, PlaybackStatus, PlayerEvent, Progress};
+use ss_oled_music::{AsyncPlayer, Metadata as MetadataTrait, PlaybackStatus, PlayerEvent, Progress};
 use futures::StreamExt;
 use log::{info, warn};
 use std::sync::OnceLock;
@@ -227,7 +227,7 @@ async fn owner_loop(tx: watch::Sender<State>, events: broadcast::Sender<PlayerEv
     // Bounded so a persistent MPRIS outage does not spin: 1s doubling to 10s.
     let mut backoff_secs = 1u64;
     loop {
-        match apex_mpris2::MPRIS2::new().await {
+        match ss_oled_mpris2::MPRIS2::new().await {
             Ok(mpris) => {
                 let _ = tx.send_if_modified(|s| {
                     *s = State::Live(Box::new(NowPlaying::default()));
@@ -265,7 +265,7 @@ async fn owner_loop(tx: watch::Sender<State>, events: broadcast::Sender<PlayerEv
 /// nothing about when they should draw.
 #[cfg(target_os = "linux")]
 async fn serve(
-    mpris: &apex_mpris2::MPRIS2,
+    mpris: &ss_oled_mpris2::MPRIS2,
     tx: &watch::Sender<State>,
     events: &broadcast::Sender<PlayerEvent>,
 ) {
@@ -331,7 +331,7 @@ async fn serve(
 }
 
 #[cfg(target_os = "linux")]
-fn to_snapshot(player: String, progress: Progress<apex_mpris2::Metadata>) -> NowPlaying {
+fn to_snapshot(player: String, progress: Progress<ss_oled_mpris2::Metadata>) -> NowPlaying {
     let meta = progress.metadata;
     NowPlaying {
         title: MetadataTrait::title(&meta).unwrap_or_default(),

@@ -3,7 +3,7 @@
 
 use crate::providers::weather_icons::draw_condition_icon;
 use anyhow::Result;
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use embedded_graphics::{
     mono_font::{iso_8859_15, MonoTextStyle},
     pixelcolor::BinaryColor,

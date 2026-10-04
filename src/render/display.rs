@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-pub use apex_hardware::FrameBuffer;
+pub use ss_oled_hardware::FrameBuffer;
 use futures_core::Stream;
 
 pub trait ContentProvider {

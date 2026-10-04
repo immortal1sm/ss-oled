@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use anyhow::Result;
-use apex_hardware::FrameBuffer;
+use ss_oled_hardware::FrameBuffer;
 use async_stream::try_stream;
 use config::Config;
 use embedded_graphics::{
