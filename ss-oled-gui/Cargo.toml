@@ -15,3 +15,8 @@ rfd = "0.13"
 toml = "0.8"
 ureq = "2"
 serde_json = "1"
+
+[dev-dependencies]
+# The recorder writes binding strings the daemon parses; the round-trip test
+# proves every string it can produce parses, using the real parser.
+ss-oled-input = { path = "../ss-oled-input", features = ["hotkeys"] }
