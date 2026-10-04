@@ -199,6 +199,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
     // after a `continue`, so these assignments look dead and are not --
     // removing them would silently break the lock.
     #[allow(unused_assignments)]
+
     pub async fn start(
         &mut self,
         tx: broadcast::Sender<Command>,
@@ -372,12 +373,19 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
         // in sync. Errors here are non-fatal: the daemon runs headless.
         let ipc_locked = Arc::new(AtomicBool::new(false));
         {
+            // A no-op stand-in when the hotkeys feature is off (or the
+            // registry was never populated), so IPC always has something to
+            // hold. Recording simply cannot lift a grab that does not exist.
+            let hotkeys: Arc<dyn ss_oled_input::HotkeyControl> = ss_oled_input::registry_handle()
+                .map(|h| Arc::new(h) as Arc<dyn ss_oled_input::HotkeyControl>)
+                .unwrap_or_else(|| Arc::new(crate::ipc::NoHotkeys));
             let handle = crate::ipc::IpcHandle {
                 tx: broadcast::Sender::new(16),
                 locked: Arc::clone(&ipc_locked),
                 provider_names: Arc::new(provider_names.clone()),
                 current: Arc::clone(&current),
                 last_change: Arc::clone(&time_last_change),
+                hotkeys,
             };
             let socket_dir =
                 std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
