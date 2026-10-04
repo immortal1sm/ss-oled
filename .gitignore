@@ -28,3 +28,10 @@ apex-hotkeys/
 # Cache emitted by the graphify code-graph tool: an AST index keyed by content
 # hash. Large, regenerated on demand, and meaningless outside this checkout.
 /graphify-out/
+
+# Throwaway evdev probes written while diagnosing the hotkey bug. Each one
+# hardcoded the node number and modifiers of the failure it was chasing
+# (scripts/evtest_apex.py still opens /dev/input/event259), so they would
+# mislead anyone who found them. The round-trip tests in ss-oled-gui now cover
+# the same ground, and unlike these they run in CI.
+scripts/evtest_*.py
