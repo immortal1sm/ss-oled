@@ -83,8 +83,88 @@ fn wait_for_kde_session() -> bool {
     false
 }
 
+/// SteelSeries Apex Pro, used to recognise the keyboard on the bus.
+const APEX_PRO_VENDOR: u16 = 0x1038;
+const APEX_PRO_PRODUCT: u16 = 0x1610;
+
+/// How long to wait for the keyboard to appear, and how often to look.
+const INPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const INPUT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Is a SteelSeries Apex Pro keyboard present on the bus right now?
+///
+/// Enumerates `/sys/class/input/event*/device/uevent` and matches on the
+/// `PRODUCT=<bus>/<vendor>/<product>/<version>` line. That is a kernel
+/// property, so it is present the instant the device is registered and needs
+/// no permissions beyond reading sysfs.
+fn keyboard_present() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/input") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("event") {
+            continue;
+        }
+        let Ok(uevent) = std::fs::read_to_string(entry.path().join("device/uevent")) else {
+            continue;
+        };
+        let Some(product) = uevent.lines().find_map(|l| l.strip_prefix("PRODUCT=")) else {
+            continue;
+        };
+        let parts: Vec<&str> = product.split('/').collect();
+        if parts.len() >= 3 {
+            let vendor = u16::from_str_radix(parts[1], 16).unwrap_or(0);
+            let model = u16::from_str_radix(parts[2], 16).unwrap_or(0);
+            if vendor == APEX_PRO_VENDOR && model == APEX_PRO_PRODUCT {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Wait for the keyboard to enumerate before registering shortcuts.
+///
+/// The keyboard is plugged into the monitor's hub, so on a boot without the
+/// monitor attached it does not enumerate until much later -- or not at all.
+/// Registering before that leaves KGlobalAccel holding grabs on keys the
+/// compositor cannot yet see, and the shortcuts then never fire for the rest of
+/// the session: registration reports success, nothing is logged, and the hotkeys
+/// are simply dead until something re-registers them.
+///
+/// Waiting is bounded, and a missing keyboard is only a warning -- the daemon
+/// still runs and the panel still works. A headless boot simply has no hotkeys,
+/// which is correct rather than broken.
+fn wait_for_keyboard() -> bool {
+    if keyboard_present() {
+        return true;
+    }
+    info!("keyboard not on the bus yet; waiting up to {INPUT_WAIT:?}");
+    let deadline = std::time::Instant::now() + INPUT_WAIT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(INPUT_POLL);
+        if keyboard_present() {
+            let waited = INPUT_WAIT.saturating_sub(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            );
+            info!("keyboard appeared after {waited:?}");
+            return true;
+        }
+    }
+    false
+}
+
 impl InputManager {
     pub fn new(sender: broadcast::Sender<Command>, bindings: HotkeyBindings) -> Result<Self> {
+        // Before the session wait: a keyboard that has not enumerated cannot be
+        // grabbed, and registering anyway leaves the shortcuts silently dead.
+        if !wait_for_keyboard() {
+            warn!(
+                "no Apex Pro keyboard after {INPUT_WAIT:?}; hotkeys will not work \
+                 until it enumerates (expected on a headless boot)"
+            );
+        }
         if wait_for_kde_session() {
             if register_kde_hotkeys(sender.clone(), &bindings) {
                 // KDE owns the actual registrations. Do NOT construct a
@@ -247,7 +327,112 @@ fn kde_wayland_session() -> bool {
     names.0.iter().any(|n| n == "org.kde.KWin")
 }
 
+/// Live control over the registered KGlobalAccel shortcuts.
+///
+/// KGlobalAccel keeps a grab on every active shortcut, so a key the user
+/// presses while recording a NEW binding is consumed by the daemon and never
+/// reaches the settings window -- which is why recording could not work at all
+/// for any key that was already bound. Suspending clears the shortcuts
+/// (passing an empty key list to `setShortcutKeys` releases the grab without
+/// unregistering the component), and resuming re-applies them.
+pub struct ShortcutRegistry {
+    inner: std::sync::Mutex<Vec<(Vec<String>, i32)>>,
+}
+
+/// Lets `src/ipc.rs` drive the registry without depending on dbus types.
+/// Trait the daemon's IPC layer drives to lift and restore grabs.
+///
+/// Declared here so the settings window's recorder can release the daemon's
+/// grabs over the existing IPC socket, and the daemon can serve it without the
+/// two crates depending on each other.
+pub mod crate_hotkey_control {
+    pub trait HotkeyControl: Send + Sync {
+        /// Release every grab. Safe to call when nothing is grabbed.
+        fn suspend(&self);
+        /// Re-register everything `suspend` released. Safe to call twice.
+        fn resume(&self);
+    }
+}
+
+pub struct RegistryHandle(std::sync::Arc<ShortcutRegistry>);
+
+impl crate_hotkey_control::HotkeyControl for RegistryHandle {
+    fn suspend(&self) {
+        self.0.suspend();
+    }
+    fn resume(&self) {
+        self.0.resume();
+    }
+}
+
+pub fn registry_handle() -> Option<RegistryHandle> {
+    SHORTCUT_REGISTRY.get().cloned().map(RegistryHandle)
+}
+
+impl ShortcutRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Remember every shortcut as it is registered.
+    fn remember(&self, action_id: &[String], seq: i32) {
+        let spec = action_id.first().cloned().unwrap_or_default();
+        let action = action_id.get(1).cloned().unwrap_or_default();
+        self.inner
+            .lock()
+            .unwrap()
+            .push((vec![spec, action], seq));
+    }
+
+    fn apply(&self, seqs: Option<&[i32]>, label: &str) -> bool {
+        let Ok(conn) = dbus::blocking::Connection::new_session() else {
+            return false;
+        };
+        let proxy = conn.with_proxy(
+            "org.kde.KWin",
+            "/kglobalaccel",
+            std::time::Duration::from_secs(3),
+        );
+        let entries = self.inner.lock().unwrap();
+        for (ids, seq) in entries.iter() {
+            let keys: Vec<(Vec<i32>,)> = match seqs {
+                Some(s) => vec![(s.to_vec(),)],
+                None => vec![(vec![*seq],)],
+            };
+            // flags: 2 = SetPresent (activate), 4 = NoAutoloading
+            let _ = proxy.method_call::<(), _, _, _>(
+                "org.kde.KGlobalAccel",
+                "setShortcutKeys",
+                (ids.clone(), keys, 2_u32 | 4_u32),
+            );
+        }
+        info!("KDE hotkeys: {label} ({} shortcut(s))", entries.len());
+        true
+    }
+
+    /// Release every grab so the settings window can receive key presses.
+    pub fn suspend(&self) {
+        if !self.apply(None, "grabs released") {
+            warn!("KDE hotkeys: could not release grabs");
+        }
+    }
+
+    /// Re-apply every shortcut released by [`Self::suspend`].
+    pub fn resume(&self) {
+        if !self.apply(Some(&[]), "grabs restored") {
+            warn!("KDE hotkeys: could not restore grabs");
+        }
+    }
+}
+
 fn register_kde_hotkeys(sender: broadcast::Sender<Command>, bindings: &HotkeyBindings) -> bool {
+    // Created here so every registration is remembered, and so the daemon can
+    // later release the grabs while the settings window records new bindings.
+    let registry = std::sync::Arc::new(ShortcutRegistry::new());
+    let _ = SHORTCUT_REGISTRY.set(registry.clone());
+
     let requested = [
         (
             "previous",
@@ -364,6 +549,8 @@ fn register_kde_hotkeys(sender: broadcast::Sender<Command>, bindings: &HotkeyBin
         match parse_optional_qt_hotkey(spec) {
             Ok(Some(seq)) => {
                 let keys: Vec<(Vec<i32>,)> = vec![(vec![seq],)];
+                // Remember it so the recorder can release this grab later.
+                registry.remember(&action_id, seq);
                 match proxy.method_call::<(Vec<(Vec<i32>,)>,), _, _, _>(
                     "org.kde.KGlobalAccel",
                     "setShortcutKeys",
@@ -469,6 +656,46 @@ async fn subscribe_kde_hotkeys(sender: broadcast::Sender<Command>, active: Vec<(
 mod tests {
     use super::*;
 
+    /// The keyboard must be found on a machine that has one, or the wait in
+    /// `InputManager::new` always times out and every boot warns.
+    #[test]
+    fn keyboard_present_matches_a_real_device() {
+        assert!(
+            keyboard_present(),
+            "no Apex Pro found in /sys/class/input on a machine that has one"
+        );
+    }
+
+    /// The PRODUCT parsing must match the kernel's exact format.
+    ///
+    /// `PRODUCT=<bus>/<vendor>/<product>/<version>` -- all hex. A short or
+    /// malformed line must not panic or false-positive.
+    #[test]
+    fn product_line_parsing() {
+        // Real line from event6 on this machine.
+        let line = "3/1038/1610/111";
+        let parts: Vec<&str> = line.split('/').collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(u16::from_str_radix(parts[1], 16).unwrap(), APEX_PRO_VENDOR);
+        assert_eq!(u16::from_str_radix(parts[2], 16).unwrap(), APEX_PRO_PRODUCT);
+
+        // A different SteelSeries product must not match.
+        let other = "3/1038/1611/111";
+        let p: Vec<&str> = other.split('/').collect();
+        assert_ne!(u16::from_str_radix(p[2], 16).unwrap(), APEX_PRO_PRODUCT);
+
+        // Malformed input must not panic.
+        for bad in ["", "3", "3/", "3/1038", "zz/1038/1610/111"] {
+            let parts: Vec<&str> = bad.split('/').collect();
+            if parts.len() >= 3 {
+                let _ = u16::from_str_radix(parts[1], 16);
+                let _ = u16::from_str_radix(parts[2], 16);
+            }
+        }
+    }
+
+    use super::*;
+
     #[test]
     fn recorded_plus_binding_is_accepted() {
         assert_eq!(parse_qt_hotkey("Ctrl+Shift++").unwrap(), 0x0600_002b);
@@ -495,7 +722,18 @@ mod tests {
     }
 }
 
-fn parse_optional_qt_hotkey(input: &str) -> Result<Option<i32>> {
+/// The live shortcut registry, set once at start-up by [`register_kde_hotkeys`].
+pub static SHORTCUT_REGISTRY: std::sync::OnceLock<std::sync::Arc<ShortcutRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Parse a binding string into the Qt key sequence KGlobalAccel expects.
+///
+/// Public so the settings GUI can prove that every combo its recorder can
+/// produce actually parses. That round-trip check is what stops a recorded
+/// binding from being silently dropped at daemon start-up: the recorder emits a
+/// key name, the daemon parses a different vocabulary, and nothing complains
+/// until the hotkey simply does not work.
+pub fn parse_optional_qt_hotkey(input: &str) -> Result<Option<i32>> {
     let trimmed = input.trim();
     if trimmed.is_empty() || matches!(trimmed.to_ascii_lowercase().as_str(), "none" | "disabled") {
         return Ok(None);
@@ -582,6 +820,11 @@ fn qt_key_code(part: &str) -> Result<(i32, bool)> {
         // and would bail on a non-digit.
         "numpad." | "numpaddecimal" | "numpaddot" => (0x2e, true),
         "period" | "dot" => (0x2e, false),
+        // The generic single-char arm below only accepts alphanumerics, so these
+        // two had to be listed or a recorded combo naming them was rejected.
+        "backspace" => (0x0100_0003, false),
+        // "." is matched above as "period" | "dot".
+        "." => (0x2e, false),
         // Accept both "Numpad1" and "Numpad 1". egui cannot distinguish a
         // numpad key from its top-row twin (Key::Num1 is documented as
         // "Either from the main row or from the numpad"), so the GUI's own
