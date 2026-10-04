@@ -758,7 +758,7 @@ impl<'a, T: 'a + AsyncDevice> Scheduler<'a, T> {
                                 } else {
                                     // No-op: already showing mpris2. We intentionally
                                     // log this at INFO so that running
-                                    // `journalctl --user -u apex-tux -f` shows a
+                                    // `journalctl --user -u ss-oled -f` shows a
                                     // heartbeat that events are arriving.
                                     log::info!("Focus event on mpris2 (already showing, no-op)");
                                 }

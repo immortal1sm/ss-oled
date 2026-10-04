@@ -47,7 +47,7 @@ fn register_callback() -> Result<Box<dyn NotificationWrapper>> {
     let mut settings = config::Config::default();
     if let Some(dir) = dirs::config_dir() {
         let _ = settings.merge(
-            config::File::with_name(&dir.join("apex-tux/settings").to_string_lossy())
+            config::File::with_name(&dir.join("ss-oled/settings").to_string_lossy())
                 .required(false),
         );
     }

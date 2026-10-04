@@ -18,7 +18,7 @@ use config::Config;
 use linkme::distributed_slice;
 
 /// The API 403s unless a User-Agent is sent, so this is required, not cosmetic.
-const USER_AGENT: &str = "apex-tux/1.0";
+const USER_AGENT: &str = "ss-oled/1.0";
 const DEFAULT_URL: &str = "https://eightballapi.com/api?locale=en";
 
 #[distributed_slice(NOTIFICATION_PROVIDERS)]
@@ -32,7 +32,7 @@ fn register_callback() -> Result<Box<dyn NotificationWrapper>> {
     let mut settings = Config::default();
     if let Some(dir) = dirs::config_dir() {
         let _ = settings.merge(
-            config::File::with_name(&dir.join("apex-tux/settings").to_string_lossy())
+            config::File::with_name(&dir.join("ss-oled/settings").to_string_lossy())
                 .required(false),
         );
     }

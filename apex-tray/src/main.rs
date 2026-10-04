@@ -168,7 +168,7 @@ impl Tray for SsOledTray {
                     // Plasma session defaults.
                     let mut cmd = std::process::Command::new("sh");
                     cmd.arg("-c").arg(
-                        "nohup ~/.config/apex-tux/../../projects/apex-tux/target/release/apex-gui \
+                        "nohup ~/.config/ss-oled/../../projects/ss-oled/target/release/apex-gui \
                          >/dev/null 2>&1 &",
                     );
                     let have_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -189,7 +189,7 @@ impl Tray for SsOledTray {
                 label: "Restart daemon".into(),
                 activate: Box::new(|_tray: &mut Self| {
                     let _ = std::process::Command::new("systemctl")
-                        .args(["--user", "restart", "apex-tux"])
+                        .args(["--user", "restart", "ss-oled"])
                         .spawn();
                 }),
                 ..Default::default()
@@ -206,7 +206,7 @@ impl Tray for SsOledTray {
                         .args(["-f", "apex-gui"])
                         .spawn();
                     let _ = std::process::Command::new("systemctl")
-                        .args(["--user", "stop", "apex-tux"])
+                        .args(["--user", "stop", "ss-oled"])
                         .spawn();
                     std::process::exit(0);
                 }),
@@ -222,7 +222,7 @@ impl Tray for SsOledTray {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    let socket_path = PathBuf::from(runtime_dir).join("apex-tux.sock");
+    let socket_path = PathBuf::from(runtime_dir).join("ss-oled.sock");
 
     // Initial state from the daemon.
     let status = ipc("status", &socket_path).unwrap_or_else(|_| "unlocked ?".into());

@@ -108,7 +108,7 @@ Wire it into `src/providers/mod.rs`:
 pub(crate) mod uptime;
 ```
 
-Then enable it in `~/.config/apex-tux/settings.toml`:
+Then enable it in `~/.config/ss-oled/settings.toml`:
 
 ```toml
 [uptime]

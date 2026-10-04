@@ -12,7 +12,7 @@ const EVENT: &str = "SCREEN";
 
 const REGISTER_GAME: RegisterGame = RegisterGame {
     game: GAME,
-    display_name: Some("apex-tux"),
+    display_name: Some("ss-oled"),
     developer: Some("not-jan"),
     timeout: None,
 };
