@@ -1,22 +1,12 @@
-# User-level systemd unit for the ss-oled daemon.
-#
-# Requires DBus session bus (for MPRIS) and the udev rule that grants
-# access to the Apex Pro keyboard (vendor 1038, product 1610). Both are
-# inherited from the graphical session via DBUS_SESSION_BUS_ADDRESS and
-# the uaccess tag.
-#
-# Install:
-#   mkdir -p ~/.config/systemd/user
-#   cp systemd/ss-oled.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now ss-oled
-#
-# Logs:
-#   journalctl --user -u ss-oled -f
-
 [Unit]
 Description=ss-oled — Apex Pro OLED heads-up display daemon
-After=graphical-session.target
+# The keyboard is plugged into the monitor's USB hub, so on a boot without the
+# monitor it does not enumerate until later -- or not at all. `After=` on the
+# device units makes systemd wait for the keyboard to be recognised before
+# starting us, so the daemon never registers grabs against a keyboard the
+# compositor cannot see yet.
+After=graphical-session.target systemd-logind.service
+Wants=systemd-logind.service
 
 [Service]
 Type=simple
