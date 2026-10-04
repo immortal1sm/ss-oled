@@ -326,18 +326,26 @@ fn register_kde_hotkeys(sender: broadcast::Sender<Command>, bindings: &HotkeyBin
     );
 
     for (action, friendly, spec, command) in requested {
+        // Component and application MUST be the same string. KGlobalAccel
+        // persists a registration under the APPLICATION field, so a mismatch
+        // (component "ss_oled", application "ss-oled") writes the binding into
+        // a `[ss-oled]` config group that no component drives -- the keys then
+        // sit there while /component/<component> reports isActive=false and
+        // never grabs them. Every other string in this project already uses
+        // "ss-oled"; only this file had the underscore spelling.
+        let app_name = "ss-oled".to_string();
         let action_id = vec![
-            "ss_oled".to_string(),
+            app_name.clone(),   // component
             action.to_string(),
-            "ss-oled".to_string(),
+            app_name,           // application
             friendly.to_string(),
         ];
         // Clear any stale registration left behind by a previous run before
-        // re-registering. kglobalaccel keeps a persistent registry: if a prior
-        // process died without unregistering, its component entry survives and
-        // doRegister lands a *second* entry. The duplicate makes
-        // /component/ss_oled report isActive=false, so the key is never grabbed
-        // and no globalShortcutPressed signal is ever delivered.
+        // re-registering. kglobalaccel keeps a persistent registry, and a prior
+        // process that died without unregistering leaves its entry behind;
+        // doRegister would then land a duplicate and /component/<name> would
+        // report isActive=false, so the key is never grabbed and no
+        // globalShortcutPressed signal is delivered.
         let _ = proxy.method_call::<(), _, _, _>(
             "org.kde.KGlobalAccel",
             "unRegister",
@@ -443,7 +451,9 @@ async fn subscribe_kde_hotkeys(sender: broadcast::Sender<Command>, active: Vec<(
         }
         let component = strs.get(0).map(|s| s.as_str()).unwrap_or("");
         let action = strs.get(1).map(|s| s.as_str()).unwrap_or("");
-        if component != "ss_oled" {
+        // Must match the component registered above. kglobalaccel sends the
+        // component field of the actionId as the signal's first argument.
+        if component != "ss-oled" {
             continue;
         }
         let Some((_, command)) = active.iter().find(|(name, _)| name == action) else {
