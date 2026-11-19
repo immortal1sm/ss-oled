@@ -7,6 +7,7 @@ edition = "2021"
 
 members = [
     "ss-oled-ctl",
+    "ss-oled-feeds",
     "ss-oled-hardware",
     "ss-oled-mpris2",
     "ss-oled-music",
@@ -51,6 +52,8 @@ image  = { version = "0.25", optional = true }
 dirs = "6"
 ureq = { version = "2", optional = true, features = ["json"] }
 serde_json = { version = "1", optional = true }
+ss-oled-feeds = { path = "./ss-oled-feeds", optional = true }
+rand = { version = "0.9", optional = true }
 
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -72,6 +75,6 @@ engine = ["ss-oled-engine"]
 sysinfo = ["dep:sysinfo"]
 image = ["dep:image"]
 weather = ["dep:ureq", "dep:serde_json"]
-custom = ["dep:ureq", "dep:serde_json"]
+custom = ["dep:ureq", "dep:serde_json", "dep:ss-oled-feeds", "dep:rand"]
 lyrics = ["dep:ureq", "dep:serde_json"]
 debug = []

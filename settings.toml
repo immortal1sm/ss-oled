@@ -66,3 +66,19 @@ path = "images/sample_1.gif"
 # (e.g. "1:23 / 3:45"), and the progress bar at the bottom. Position and
 # Length data come from MPRIS. If a player doesn't publish track length
 # (e.g. Telegram, some browser tabs), only elapsed time is shown.
+
+# Custom API providers. The same engine reads JSON and XML/RSS/Atom; see
+# docs/PROVIDERS.md for the field-spec syntax and the XML path rules.
+# Requires the binary to be built with `--features custom`.
+#
+# [providers.custom.archnews]
+# enabled = true
+# source = "https://archlinux.org/feeds/news/"
+# format = "xml"              # auto | json | xml (rss / atom also accepted)
+# header = "User-Agent: ss-oled/1.0"
+# poll = 300                  # seconds between fetches
+# items = "rss.channel.item"  # one screen per feed entry
+# max_items = 10
+# article = true              # second, scrolled screen
+# fields = ["title: - | s=M", "pubDate: Date | a=R s=S"]
+# article_fields = ["description: -"]

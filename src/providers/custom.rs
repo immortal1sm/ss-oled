@@ -1,8 +1,8 @@
-//! Custom JSON-API providers.
+//! Custom API providers — JSON, or XML/RSS/Atom.
 //!
-//! Users define screens fed by any HTTP JSON endpoint directly in
-//! settings.toml — no recompile. Each `[providers.custom.<name>]` section
-//! becomes a rotation slot:
+//! Users define screens fed by any HTTP endpoint directly in settings.toml —
+//! no recompile. Each `[providers.custom.<name>]` section becomes a rotation
+//! slot:
 //!
 //! ```toml
 //! [providers.custom.youtube]
@@ -11,22 +11,40 @@
 //! interval = 30              # seconds on screen per rotation cycle
 //! poll = 300                 # seconds between API fetches
 //! source = "https://api.example.com/stats"
+//! format = "json"            # json | xml | auto (default: auto)
 //! header = "Authorization: Bearer ${YT_KEY}"   # optional; ${ENV} expanded
 //! fields = ["items[0].statistics.subscriberCount: Subs",
 //!           "items[0].snippet.title: Name"]
 //! ```
 //!
-//! `fields` entries are `<json-path>: <label>`. Paths use dot notation with
+//! `fields` entries are `<path>: <label>`. Paths use dot notation with
 //! optional `[index]` segments. Rendering shows up to 4 label/value rows per
 //! page under the provider name; more fields cycle pages silently.
+//!
+//! `format = "xml"` reads an RSS/Atom (or any XML) document instead, mapped
+//! onto the same value tree by `ss-oled-feeds`, so `fields`, `items`,
+//! `article_fields` and every layout option work unchanged:
+//!
+//! ```toml
+//! [providers.custom.archnews]
+//! enabled = true
+//! source = "https://archlinux.org/feeds/news/"
+//! format = "xml"
+//! header = "User-Agent: ss-oled/1.0"
+//! items = "rss.channel.item"
+//! fields = ["title: - | s=M", "pubDate: Date"]
+//! article_fields = ["description: -"]
+//! article = true
+//! ```
+//!
+//! With `format = "auto"` (the default) the body decides: a leading `<` means
+//! XML, anything else JSON. `strip_html` defaults to on for XML, because an
+//! RSS `<description>` is a fragment of markup.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
-use crate::render::display::ContentProvider;
-use crate::render::text::wrap_text;
+use crate::render::{display::ContentProvider, text::wrap_text};
 use anyhow::{anyhow, Result};
-use ss_oled_hardware::FrameBuffer;
 use async_stream::try_stream;
 use config::Config;
 use embedded_graphics::{
@@ -38,6 +56,8 @@ use embedded_graphics::{
 };
 use futures::Stream;
 use log::{info, warn};
+use ss_oled_feeds::{self as feeds, get_path, value_to_text, Format};
+use ss_oled_hardware::FrameBuffer;
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -184,7 +204,10 @@ struct ItemHandle {
 fn register_item_handle(name: &str, handle: ItemHandle) {
     let mut map = ITEM_CURSORS.lock().unwrap();
     map.insert(name.to_string(), handle);
-    log::info!("item hotkeys registered for '{name}' (have: {:?})", map.keys().collect::<Vec<_>>());
+    log::info!(
+        "item hotkeys registered for '{name}' (have: {:?})",
+        map.keys().collect::<Vec<_>>()
+    );
 }
 
 /// Scroll the article view by `delta` lines. False when the provider has no
@@ -215,9 +238,7 @@ pub fn scroll_item(name: &str, delta: isize) -> bool {
     // Log the real numbers. The old line claimed only "an offset was requested",
     // which is indistinguishable from a working scroll in the journal -- so a
     // scroll that moved nothing looked identical to one that moved.
-    log::info!(
-        "scroll '{name}' delta={delta}: offset {before} -> {after} (ceiling {max})"
-    );
+    log::info!("scroll '{name}' delta={delta}: offset {before} -> {after} (ceiling {max})");
     true
 }
 
@@ -251,7 +272,10 @@ pub fn toggle_view(name: &str) -> Option<View> {
 pub fn step_item(name: &str, delta: isize) -> bool {
     let map = ITEM_CURSORS.lock().unwrap();
     let Some(handle) = map.get(name) else {
-        log::warn!("step_item: '{name}' not registered (have: {:?})", map.keys().collect::<Vec<_>>());
+        log::warn!(
+            "step_item: '{name}' not registered (have: {:?})",
+            map.keys().collect::<Vec<_>>()
+        );
         return false;
     };
     // Take the guard ONCE. `*m.lock() = m.lock() + delta` deadlocks: the
@@ -290,6 +314,11 @@ pub struct CustomProvider {
     poll_secs: u64,
     /// Whether to draw the provider-name header row.
     show_header: bool,
+    /// How to read the response body: `auto` sniffs, or forced json / xml.
+    format: Format,
+    /// Strip HTML markup from every string in the response. Defaults to on
+    /// when the format resolves to XML, off otherwise.
+    strip_html: bool,
     /// Shared latest values, updated by fetch threads.
     ///
     /// One entry per ITEM when `items` is configured (the common case for an
@@ -315,35 +344,6 @@ pub struct CustomProvider {
     /// Largest legal scroll offset for the content on screen. Written by the
     /// renderers, read by `scroll_item` to clamp at the real bound.
     max_scroll: Arc<Mutex<usize>>,
-}
-
-fn value_to_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// Simple JSON path resolver: `a.b[0].c`.
-fn get_path<'a>(json: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    let mut cur = json;
-    for seg in path.split('.') {
-        if seg.is_empty() {
-            continue;
-        }
-        if let Some((key, idx)) = seg.split_once('[') {
-            // Segment like "[0]" (no key, just an array index) or "key[0]"
-            // (key + array index). Only do the key lookup if key is non-empty.
-            if !key.is_empty() {
-                cur = cur.get(key.trim_end_matches('['))?;
-            }
-            let idx: usize = idx.trim_end_matches(']').parse().ok()?;
-            cur = cur.get(idx)?;
-        } else {
-            cur = cur.get(seg)?;
-        }
-    }
-    Some(cur)
 }
 
 /// Expand `${VAR}` references from the process environment.
@@ -375,7 +375,7 @@ fn resolve_fields(json: &serde_json::Value, fields: &[Field]) -> Vec<(String, St
         .filter(|f| f.show_label || f.show_value)
         .map(|f| {
             let val = get_path(json, &f.path)
-                .map(value_to_string)
+                .map(value_to_text)
                 .unwrap_or_else(|| "—".into());
             (f.label.clone(), val)
         })
@@ -388,6 +388,10 @@ fn resolve_fields(json: &serde_json::Value, fields: &[Field]) -> Vec<(String, St
 /// path and each element becomes its own screen. Elements whose FIRST field
 /// resolves to empty are dropped -- list APIs routinely include nulls,
 /// deleted posts and placeholders, and rendering "—" for each is noise.
+///
+/// `format` selects the reader (JSON, or XML/RSS/Atom converted to the same
+/// value tree) and `strip_html` removes markup from the text before it reaches
+/// the panel.
 fn fetch_values(
     source: &str,
     header: &Option<String>,
@@ -395,6 +399,8 @@ fn fetch_values(
     detail_fields: &[Field],
     items: Option<&str>,
     max_items: usize,
+    format: Format,
+    strip_html: bool,
 ) -> Result<Vec<ItemValues>> {
     let mut req = ureq::get(source).timeout(Duration::from_secs(8));
     if let Some(h) = header {
@@ -407,7 +413,23 @@ fn fetch_values(
         }
     }
     let body = req.call()?.into_string()?;
-    let json: serde_json::Value = serde_json::from_str(&body)?;
+    // One reader for both shapes. A failure names what arrived, because the
+    // usual cause is an HTML error page or a login redirect rather than a
+    // malformed feed, and the first bytes say which at a glance.
+    let (mut json, used) = feeds::decode_with(&body, format).map_err(|e| {
+        anyhow!(
+            "{e}; body starts {:?}",
+            body.trim_start().chars().take(60).collect::<String>()
+        )
+    })?;
+    if strip_html {
+        feeds::strip_html_in_place(&mut json);
+    }
+    log::info!(
+        "custom: read {} body ({} bytes) from {source}",
+        used.as_str(),
+        body.len()
+    );
 
     // Resolve both field sets against the same object. Doing it here is what
     // lets the article view show the ARTICLE rather than re-showing the
@@ -421,11 +443,32 @@ fn fetch_values(
         return Ok(vec![both(&json)]);
     };
 
-    let array = match get_path(&json, items_path) {
-        Some(serde_json::Value::Array(a)) => a,
-        Some(_) => return Err(anyhow::anyhow!("`{items_path}` is not an array")),
-        None => return Ok(Vec::new()),
+    let array: Vec<&serde_json::Value> = match get_path(&json, items_path) {
+        Some(serde_json::Value::Array(a)) => a.iter().collect(),
+        // A feed carrying exactly one <item>/<entry> is not an array. Accepting
+        // the single object keeps `items` working on a valid feed instead of
+        // failing with "not an array" until a second entry is published.
+        Some(single @ serde_json::Value::Object(_)) => {
+            log::info!("custom: items '{items_path}' holds a single object; treating it as one item");
+            vec![single]
+        }
+        Some(_) => return Err(anyhow!("`{items_path}` is not an array")),
+        None => {
+            // Report the miss instead of returning an empty list in silence:
+            // an empty list renders NO DATA, which is indistinguishable from a
+            // feed that is genuinely empty.
+            let keys: Vec<String> = json
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            warn!(
+                "custom: items path '{items_path}' not found in the {} response (top-level keys: {keys:?})",
+                used.as_str()
+            );
+            return Ok(Vec::new());
+        }
     };
+    let total = array.len();
 
     let first_visible = fields
         .iter()
@@ -434,7 +477,7 @@ fn fetch_values(
         .unwrap_or_default();
 
     let kept: Vec<&serde_json::Value> = array
-        .iter()
+        .into_iter()
         .take(max_items.max(1))
         .filter(|el| {
             // Filter on the first visible field: an item with nothing to show
@@ -455,11 +498,10 @@ fn fetch_values(
         "custom: items '{}' -> {} of {} elements kept",
         items_path,
         kept.len(),
-        array.len()
+        total
     );
     Ok(kept.into_iter().map(both).collect())
 }
-
 
 /// Draw `text` at `pos`. When `bold` is true, draw it twice with a 1px
 /// horizontal offset to produce a faux-bold appearance (no real bold
@@ -587,7 +629,13 @@ impl CustomProvider {
             if ly >= 40 || ly + line_h <= y {
                 continue;
             }
-            draw_text(&mut buffer, line, Point::new(0, ly), style, detail_fields[0].bold)?;
+            draw_text(
+                &mut buffer,
+                line,
+                Point::new(0, ly),
+                style,
+                detail_fields[0].bold,
+            )?;
         }
         Ok(buffer)
     }
@@ -878,9 +926,13 @@ impl CustomProvider {
                 if y_draw + line_h <= y0 || y_draw >= 40 {
                     continue;
                 }
-                if let Err(e) =
-                    draw_text(&mut buffer, line, Point::new(value_x, y_draw), style, f.bold)
-                {
+                if let Err(e) = draw_text(
+                    &mut buffer,
+                    line,
+                    Point::new(value_x, y_draw),
+                    style,
+                    f.bold,
+                ) {
                     log::warn!("custom: value draw failed at y={y_draw}: {e}");
                 }
             }
@@ -907,7 +959,8 @@ fn pages_needed(n_fields: usize) -> usize {
 }
 
 impl ContentProvider for CustomProvider {
-    type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a
+    type ContentStream<'a>
+        = impl Stream<Item = Result<FrameBuffer>> + 'a
     where
         Self: 'a;
 
@@ -930,6 +983,9 @@ impl ContentProvider for CustomProvider {
         let view = Arc::clone(&self.view);
         let scroll = Arc::clone(&self.scroll);
         let detail_fields = self.detail_fields.clone();
+        // Copy types, so each spawn_blocking closure takes its own copy.
+        let format = self.format;
+        let strip_html = self.strip_html;
 
         Ok(try_stream! {
             // Initial fetch off-thread; placeholder rows until first success.
@@ -942,7 +998,7 @@ impl ContentProvider for CustomProvider {
                 let items = items.clone();
                 let detail_fields = detail_fields.clone();
                 tokio::task::spawn_blocking(move || {
-                    match fetch_values(&source, &header, &fields, &detail_fields, items.as_deref(), max_items) {
+                    match fetch_values(&source, &header, &fields, &detail_fields, items.as_deref(), max_items, format, strip_html) {
                         Ok(v) => *values.lock().unwrap() = v,
                         Err(e) => warn!("custom '{init_name}' initial fetch failed: {e}"),
                     }
@@ -1037,7 +1093,7 @@ impl ContentProvider for CustomProvider {
                     let items = items.clone();
                     let detail_fields = detail_fields.clone();
                     tokio::task::spawn_blocking(move || {
-                        match fetch_values(&source, &header, &fields, &detail_fields, items.as_deref(), max_items) {
+                        match fetch_values(&source, &header, &fields, &detail_fields, items.as_deref(), max_items, format, strip_html) {
                             Ok(v) => *values.lock().unwrap() = v,
                             Err(e) => warn!("custom provider refresh failed: {e}"),
                         }
@@ -1200,6 +1256,18 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         .get_bool(&format!("{prefix}.show_header"))
         .unwrap_or(true);
 
+    let format = config
+        .get_str(&format!("{prefix}.format"))
+        .map(|s| Format::parse(&s))
+        .unwrap_or(Format::Auto);
+
+    // The default follows the format: an RSS <description> is HTML, and its
+    // tags on a 1-bit panel are never what was wanted. `auto` stays false so
+    // an existing JSON provider renders exactly as it did before.
+    let strip_html = config
+        .get_bool(&format!("{prefix}.strip_html"))
+        .unwrap_or_else(|_| feeds::default_strip_html(format));
+
     let fields = parse_field_specs(config, &prefix, "fields");
 
     if fields.is_empty() {
@@ -1230,7 +1298,19 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         })
         .unwrap_or(false);
     let detail_fields: Vec<Field> = if article_enabled {
-        parse_field_specs(config, &format!("providers.custom.{name}"), "article_fields")
+        let mut specs = parse_field_specs(
+            config,
+            &format!("providers.custom.{name}"),
+            "article_fields",
+        );
+        if specs.is_empty() {
+            specs = parse_field_specs(
+                config,
+                &format!("providers.custom.{name}"),
+                "detail.fields",
+            );
+        }
+        specs
             .into_iter()
             .filter(|f| f.show_label || f.show_value)
             .collect()
@@ -1276,10 +1356,11 @@ pub fn from_config_section(name: &str, config: &Config) -> Result<Option<CustomP
         fields,
         poll_secs,
         show_header,
+        format,
+        strip_html,
         values: Arc::new(Mutex::new(Vec::new())),
     }))
 }
-
 
 #[cfg(test)]
 mod dy_tests {
@@ -1298,14 +1379,187 @@ fields = ["{field_spec}"]
         );
         // Same pattern main.rs uses for the daemon's config load.
         let mut cfg = Config::default();
-        cfg.merge(config::File::from_str(
-            &toml_src,
-            config::FileFormat::Toml,
-        ))
-        .expect("config merge");
+        cfg.merge(config::File::from_str(&toml_src, config::FileFormat::Toml))
+            .expect("config merge");
         from_config_section("t", &cfg)
             .expect("parse")
             .expect("enabled")
+    }
+
+    /// The XML path end to end: config -> decode -> fields, against the live
+    /// Arch news feed (RSS 2.0, real-world markup and all).
+    #[test]
+    fn an_xml_feed_provider_resolves_its_fields() {
+        let toml_src = r#"
+[providers.custom.news]
+enabled = true
+source = "https://archlinux.org/feeds/news/"
+format = "xml"
+items = "rss.channel.item"
+max_items = 3
+article = true
+fields = ["title: - | s=M", "pubDate: Date"]
+article_fields = ["description: -"]
+"#;
+        let mut cfg = Config::default();
+        cfg.merge(config::File::from_str(toml_src, config::FileFormat::Toml))
+            .expect("config merge");
+        let provider = from_config_section("news", &cfg)
+            .expect("parse")
+            .expect("enabled");
+
+        assert_eq!(provider.format, Format::Xml);
+        assert!(provider.strip_html, "xml defaults to stripping HTML");
+        assert_eq!(provider.items.as_deref(), Some("rss.channel.item"));
+        assert_eq!(provider.max_items, 3);
+        assert_eq!(provider.detail_fields.len(), 1);
+
+        let body = include_str!("../../ss-oled-feeds/tests/fixtures/arch-news.xml");
+        let mut json = feeds::decode(body, provider.format).expect("decode feed");
+        if provider.strip_html {
+            feeds::strip_html_in_place(&mut json);
+        }
+        let item = get_path(&json, "rss.channel.item[0]").expect("first item");
+
+        let values = resolve_fields(item, &provider.fields);
+        assert_eq!(values.len(), 2);
+        assert!(values[0].1.contains("php"), "title: {:?}", values[0]);
+        assert!(values[1].1.contains("2026"), "pubDate: {:?}", values[1]);
+
+        let detail = resolve_fields(item, &provider.detail_fields);
+        assert!(
+            !detail[0].1.contains('<'),
+            "the article body still carries markup: {:?}",
+            detail[0]
+        );
+        assert!(detail[0].1.contains("PHP"), "article body: {:?}", detail[0]);
+    }
+
+    /// The new keys must leave an existing JSON provider exactly as it was.
+    #[test]
+    fn existing_json_providers_are_untouched_by_the_format_keys() {
+        let provider = build_with("title: -");
+        assert_eq!(provider.format, Format::Auto);
+        assert!(!provider.strip_html, "auto format must not enable stripping");
+
+        let body = r#"{"hits":[{"title":"Real one"},{"title":""}]}"#;
+        let json = feeds::decode(body, provider.format).expect("json still decodes");
+        assert_eq!(
+            get_path(&json, "hits[0].title")
+                .map(value_to_text)
+                .as_deref(),
+            Some("Real one")
+        );
+        // The junk filter still drops an element whose first field is empty.
+        let first_visible = provider.fields[0].path.clone();
+        let kept = json["hits"]
+            .as_array()
+            .expect("hits array")
+            .iter()
+            .filter(|el| match get_path(el, &first_visible) {
+                Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+                Some(serde_json::Value::Null) | None => false,
+                Some(_) => true,
+            })
+            .count();
+        assert_eq!(kept, 1);
+    }
+
+    /// The whole provider path against the live endpoint: real HTTP fetch,
+    /// decode, HTML strip, junk filter and field resolution — the same
+    /// `fetch_values` the daemon calls. Network-bound, so `#[ignore]`d by
+    /// default; run deliberately with:
+    ///
+    /// ```sh
+    /// cargo test --features 'hotkeys sysinfo image weather custom lyrics' \
+    ///   --bin ss-oled -- --ignored live_feed
+    /// ```
+    #[test]
+    #[ignore = "requires network access"]
+    fn live_feed_fetch_end_to_end() {
+        let provider = {
+            let mut cfg = Config::default();
+            cfg.merge(config::File::from_str(
+                r#"
+[providers.custom.news]
+enabled = true
+source = "https://archlinux.org/feeds/news/"
+format = "xml"
+header = "User-Agent: ss-oled-test/1.0"
+items = "rss.channel.item"
+max_items = 5
+article = true
+fields = ["title: - | s=M", "pubDate: Date"]
+article_fields = ["description: -"]
+"#,
+                config::FileFormat::Toml,
+            ))
+            .expect("config merge");
+            from_config_section("news", &cfg)
+                .expect("parse")
+                .expect("enabled")
+        };
+
+        let items = fetch_values(
+            &provider.source,
+            &provider.header,
+            &provider.fields,
+            &provider.detail_fields,
+            provider.items.as_deref(),
+            provider.max_items,
+            provider.format,
+            provider.strip_html,
+        )
+        .expect("live fetch");
+
+        // Structural assertions only: the headlines change daily, the shape
+        // must not.
+        assert!(!items.is_empty(), "the feed returned no items");
+        assert!(items.len() <= 5, "max_items was exceeded: {}", items.len());
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(item.main.len(), 2, "item {i} lost a highlight field");
+            assert!(!item.main[0].1.trim().is_empty(), "item {i} has no title");
+            assert!(!item.main[1].1.trim().is_empty(), "item {i} has no date");
+            assert_eq!(item.detail.len(), 1, "item {i} lost its article field");
+            let body = &item.detail[0].1;
+            assert!(!body.trim().is_empty(), "item {i} has an empty body");
+            assert!(!body.contains('<'), "item {i} body still carries markup: {body}");
+            assert!(!body.contains("&lt;"), "item {i} body still carries escaped markup");
+            assert_ne!(
+                item.main[0].1, *body,
+                "item {i} article re-showed the headline instead of its own field set"
+            );
+        }
+    }
+
+    /// `strip_html` is settable in both directions; the default only fills in
+    /// when the key is absent.
+    #[test]
+    fn strip_html_can_be_forced_off_or_on_explicitly() {
+        let mut cfg = Config::default();
+        cfg.merge(config::File::from_str(
+            r#"
+[providers.custom.a]
+enabled = true
+source = "https://example.com/a.json"
+format = "json"
+strip_html = true
+fields = ["title: -"]
+
+[providers.custom.b]
+enabled = true
+source = "https://example.com/b.xml"
+format = "xml"
+strip_html = false
+fields = ["title: -"]
+"#,
+            config::FileFormat::Toml,
+        ))
+        .expect("config merge");
+        let a = from_config_section("a", &cfg).unwrap().unwrap();
+        assert!(a.strip_html, "explicit true wins over the json default");
+        let b = from_config_section("b", &cfg).unwrap().unwrap();
+        assert!(!b.strip_html, "explicit false wins over the xml default");
     }
 
     /// `d=` must reach the Field through the real config parser, and default to
@@ -1405,11 +1659,29 @@ fields = ["{field_spec}"]
     fn fitting_field_does_not_scroll() {
         let provider = build_with("a.b: -");
         let values = vec![("Lbl".to_string(), "short".to_string())];
-        let top = CustomProvider::render_rows("t", &values, false, &provider.fields, 0, &Arc::new(Mutex::new(0)))
-            .expect("render 0");
-        let down = CustomProvider::render_rows("t", &values, false, &provider.fields, 8, &Arc::new(Mutex::new(0)))
-            .expect("render 8");
-        assert_eq!(raw(&top), raw(&down), "a fitting field shifted under scroll");
+        let top = CustomProvider::render_rows(
+            "t",
+            &values,
+            false,
+            &provider.fields,
+            0,
+            &Arc::new(Mutex::new(0)),
+        )
+        .expect("render 0");
+        let down = CustomProvider::render_rows(
+            "t",
+            &values,
+            false,
+            &provider.fields,
+            8,
+            &Arc::new(Mutex::new(0)),
+        )
+        .expect("render 8");
+        assert_eq!(
+            raw(&top),
+            raw(&down),
+            "a fitting field shifted under scroll"
+        );
     }
 
     #[test]
@@ -1421,7 +1693,10 @@ fields = ["{field_spec}"]
         for scroll in [0usize, 1, 4, 5, 15, 19, 100, 9999] {
             let clamped = scroll.min(all.len().saturating_sub(visible));
             let more_below = clamped + visible < all.len();
-            assert!(clamped + visible <= all.len(), "window overran content: {clamped}");
+            assert!(
+                clamped + visible <= all.len(),
+                "window overran content: {clamped}"
+            );
             assert!(
                 !more_below || clamped < all.len(),
                 "reported more content below while at the end"
@@ -1445,14 +1720,33 @@ fields = ["{field_spec}"]
         )
         .unwrap();
         let fields = vec![
-            Field { path: "title".into(), label: "t".into(), show_label: true, show_value: true,
-                    align: FieldAlign::Left, size: FieldSize::Medium, row: None, bold: false, dy: 0 },
-            Field { path: "author".into(), label: "a".into(), show_label: true, show_value: true,
-                    align: FieldAlign::Left, size: FieldSize::Medium, row: None, bold: false, dy: 0 },
+            Field {
+                path: "title".into(),
+                label: "t".into(),
+                show_label: true,
+                show_value: true,
+                align: FieldAlign::Left,
+                size: FieldSize::Medium,
+                row: None,
+                bold: false,
+                dy: 0,
+            },
+            Field {
+                path: "author".into(),
+                label: "a".into(),
+                show_label: true,
+                show_value: true,
+                align: FieldAlign::Left,
+                size: FieldSize::Medium,
+                row: None,
+                bold: false,
+                dy: 0,
+            },
         ];
         // Exercise the same resolution path fetch_values uses.
         let resolved: Vec<Vec<(String, String)>> = json["hits"]
-            .as_array().unwrap()
+            .as_array()
+            .unwrap()
             .iter()
             .map(|el| resolve_fields(el, &fields))
             .collect();
@@ -1473,12 +1767,28 @@ fields = ["{field_spec}"]
             r#"{"title":"Headline text","url":"https://example.com","story_text":"the full article body"}"#,
         )
         .unwrap();
-        let main_fields = vec![Field { path: "title".into(), label: "t".into(),
-            show_label: false, show_value: true, align: FieldAlign::Left,
-            size: FieldSize::Medium, row: None, bold: false, dy: 0 }];
-        let detail_fields = vec![Field { path: "story_text".into(), label: "b".into(),
-            show_label: false, show_value: true, align: FieldAlign::Left,
-            size: FieldSize::Medium, row: None, bold: false, dy: 0 }];
+        let main_fields = vec![Field {
+            path: "title".into(),
+            label: "t".into(),
+            show_label: false,
+            show_value: true,
+            align: FieldAlign::Left,
+            size: FieldSize::Medium,
+            row: None,
+            bold: false,
+            dy: 0,
+        }];
+        let detail_fields = vec![Field {
+            path: "story_text".into(),
+            label: "b".into(),
+            show_label: false,
+            show_value: true,
+            align: FieldAlign::Left,
+            size: FieldSize::Medium,
+            row: None,
+            bold: false,
+            dy: 0,
+        }];
 
         let item = ItemValues {
             main: resolve_fields(&json, &main_fields),
@@ -1495,19 +1805,37 @@ fields = ["{field_spec}"]
     /// A field that is absent must not silently become the OTHER view's text.
     #[test]
     fn missing_detail_field_does_not_fall_back_to_the_headline() {
-        let json: serde_json::Value =
-            serde_json::from_str(r#"{"title":"Headline text"}"#).unwrap();
-        let main_fields = vec![Field { path: "title".into(), label: "t".into(),
-            show_label: false, show_value: true, align: FieldAlign::Left,
-            size: FieldSize::Medium, row: None, bold: false, dy: 0 }];
-        let detail_fields = vec![Field { path: "story_text".into(), label: "b".into(),
-            show_label: false, show_value: true, align: FieldAlign::Left,
-            size: FieldSize::Medium, row: None, bold: false, dy: 0 }];
+        let json: serde_json::Value = serde_json::from_str(r#"{"title":"Headline text"}"#).unwrap();
+        let main_fields = vec![Field {
+            path: "title".into(),
+            label: "t".into(),
+            show_label: false,
+            show_value: true,
+            align: FieldAlign::Left,
+            size: FieldSize::Medium,
+            row: None,
+            bold: false,
+            dy: 0,
+        }];
+        let detail_fields = vec![Field {
+            path: "story_text".into(),
+            label: "b".into(),
+            show_label: false,
+            show_value: true,
+            align: FieldAlign::Left,
+            size: FieldSize::Medium,
+            row: None,
+            bold: false,
+            dy: 0,
+        }];
         let item = ItemValues {
             main: resolve_fields(&json, &main_fields),
             detail: resolve_fields(&json, &detail_fields),
         };
-        assert_ne!(item.detail[0].1, item.main[0].1, "article fell back to the headline");
+        assert_ne!(
+            item.detail[0].1, item.main[0].1,
+            "article fell back to the headline"
+        );
         assert_eq!(item.detail[0].1, "\u{2014}"); // the em-dash placeholder
     }
 
@@ -1517,11 +1845,22 @@ fields = ["{field_spec}"]
             r#"[{"title":"Real one"},{"title":null},{"title":""},{"title":"   "},{"nope":1}]"#,
         )
         .unwrap();
-        let fields = vec![Field { path: "title".into(), label: "t".into(), show_label: true,
-            show_value: true, align: FieldAlign::Left, size: FieldSize::Medium, row: None,
-            bold: false, dy: 0 }];
+        let fields = vec![Field {
+            path: "title".into(),
+            label: "t".into(),
+            show_label: true,
+            show_value: true,
+            align: FieldAlign::Left,
+            size: FieldSize::Medium,
+            row: None,
+            bold: false,
+            dy: 0,
+        }];
         let first_visible = fields[0].path.clone();
-        let kept: Vec<&serde_json::Value> = json.as_array().unwrap().iter()
+        let kept: Vec<&serde_json::Value> = json
+            .as_array()
+            .unwrap()
+            .iter()
             .filter(|el| match get_path(el, &first_visible) {
                 Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
                 Some(serde_json::Value::Null) | None => false,
@@ -1529,7 +1868,10 @@ fields = ["{field_spec}"]
             })
             .collect();
         assert_eq!(kept.len(), 1, "only the real item should survive");
-        assert_eq!(get_path(kept[0], "title").unwrap(), &serde_json::json!("Real one"));
+        assert_eq!(
+            get_path(kept[0], "title").unwrap(),
+            &serde_json::json!("Real one")
+        );
     }
 
     /// Field paging must actually page. It used to be plumbed into
@@ -1553,9 +1895,17 @@ fields = ["{field_spec}"]
             .map(|i| (String::new(), format!("value{i}")))
             .collect();
         let fields: Vec<Field> = (0..n)
-            .map(|_| Field { path: "x".into(), label: String::new(), show_label: false,
-                show_value: true, align: FieldAlign::Left, size: FieldSize::Medium,
-                row: None, bold: false, dy: 0 })
+            .map(|_| Field {
+                path: "x".into(),
+                label: String::new(),
+                show_label: false,
+                show_value: true,
+                align: FieldAlign::Left,
+                size: FieldSize::Medium,
+                row: None,
+                bold: false,
+                dy: 0,
+            })
             .collect();
 
         let mut seen: Vec<&str> = Vec::new();
@@ -1563,8 +1913,10 @@ fields = ["{field_spec}"]
             let start = page * PER_PAGE;
             let end = (start + PER_PAGE).min(n);
             for (_, v) in &values[start..end] {
-                assert!(!seen.contains(&v.as_str()),
-                    "{v} rendered on more than one page (page {page})");
+                assert!(
+                    !seen.contains(&v.as_str()),
+                    "{v} rendered on more than one page (page {page})"
+                );
                 seen.push(v);
             }
         }
@@ -1577,19 +1929,29 @@ fields = ["{field_spec}"]
     #[test]
     fn field_auto_scales_with_available_room() {
         let roomy = FieldSize::Auto.resolve("OK", 128, 40);
-        let tight = FieldSize::Auto.resolve("a considerably longer value that will not fit", 128, 12);
+        let tight =
+            FieldSize::Auto.resolve("a considerably longer value that will not fit", 128, 12);
         assert!(
             roomy.line_h() > tight.line_h(),
             "auto did not scale: roomy={roomy:?} tight={tight:?}"
         );
-        assert_eq!(roomy, FieldSize::XLarge, "full-height short text should reach XL");
+        assert_eq!(
+            roomy,
+            FieldSize::XLarge,
+            "full-height short text should reach XL"
+        );
     }
 
     /// An explicit size is returned untouched whatever the text or room.
     #[test]
     fn explicit_field_sizes_pass_through() {
         let huge = "x".repeat(500);
-        for c in [FieldSize::Small, FieldSize::Medium, FieldSize::Large, FieldSize::XLarge] {
+        for c in [
+            FieldSize::Small,
+            FieldSize::Medium,
+            FieldSize::Large,
+            FieldSize::XLarge,
+        ] {
             assert_eq!(c.resolve("anything", 128, 40), c);
             assert_eq!(c.resolve(&huge, 10, 5), c);
         }
@@ -1729,7 +2091,8 @@ fields = ["title: x |s=A", "author: y |s=XL"]
         .expect("render article");
         let published = *max_scroll.lock().unwrap();
         assert_ne!(
-            published, usize::MAX,
+            published,
+            usize::MAX,
             "renderer must overwrite the sentinel with a real ceiling"
         );
         assert!(
@@ -1767,7 +2130,6 @@ fields = ["title: x |s=A", "author: y |s=XL"]
         assert_eq!(*max_scroll.lock().unwrap(), 0, "nothing to scroll");
     }
 
-
     /// `render_rows` must publish a POSITIVE ceiling for overflowing content.
     ///
     /// Regression: the publish originally wrote the CLAMPED offset rather than
@@ -1782,15 +2144,8 @@ fields = ["title: x |s=A", "author: y |s=XL"]
         let provider = build_with("a.b: -");
         let long = "the quick brown fox jumps over the lazy dog ".repeat(12);
         let values = vec![("Lbl".to_string(), long)];
-        CustomProvider::render_rows(
-            "t",
-            &values,
-            false,
-            &provider.fields,
-            0,
-            &max_scroll,
-        )
-        .expect("render");
+        CustomProvider::render_rows("t", &values, false, &provider.fields, 0, &max_scroll)
+            .expect("render");
         let published = *max_scroll.lock().unwrap();
         assert_ne!(published, usize::MAX, "must overwrite the sentinel");
         assert!(
@@ -1821,7 +2176,4 @@ fields = ["title: x |s=A", "author: y |s=XL"]
             "an empty view must clear the previous ceiling"
         );
     }
-
-
-
 }

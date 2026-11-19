@@ -224,7 +224,95 @@ For `[providers.custom.<name>]` entries, `apex-gui` includes a live 128×40 OLED
 preview below the fields table. Click **Test** to fetch the endpoint, then edit
 labels, visibility, alignment, size, row slots, and bold state; the preview uses
 the last response to show the expected layout before saving or applying the
-config.
+config. **Test** decodes with the provider's own `format`, so an XML feed
+previews as the path tree the field specs address rather than as raw markup.
+
+## Custom API providers (JSON and XML/RSS)
+
+A `[providers.custom.<name>]` section turns any HTTP endpoint into a screen
+without recompiling. The same engine reads JSON and XML — RSS, Atom, or any
+other XML — because an XML body is converted to the same value tree first.
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `true` to put this provider in the rotation |
+| `source` | the URL |
+| `poll` | seconds between fetches (default 300, minimum 10) |
+| `header` | one HTTP header, `Name: value`; `${ENV_VAR}` is expanded |
+| `format` | `auto` (default), `json`, or `xml` (`rss`/`atom`/`feed` also accepted) |
+| `strip_html` | strip HTML markup from the text. defaults to on for `format = "xml"`, off otherwise |
+| `fields` | field specs, `"<path>: <label>"` — one row per spec, 4 rows per page |
+| `items` | path to the array to iterate; each element becomes its own screen |
+| `max_items` | how many elements to keep (default 50, max 200) |
+| `article` | `true` to enable the second, scrolled screen |
+| `article_fields` | field specs for that second screen |
+| `show_header` | draw the provider name at the top (default true) |
+| `interval.<name>` | seconds this screen stays before the rotation moves on |
+
+A field spec is `<path>: <label>`, with an optional layout suffix:
+`"title: - | s=M a=C r=1 b=1 d=-2"` — `-` as the label hides the label text,
+`!` after the path hides the value, `a=` alignment (`L`/`C`/`R`), `s=` size
+(`S`/`M`/`L`/`X`), `r=` explicit row slot (`0`-`5`), `b=1` faux-bold, `d=`
+vertical nudge in pixels.
+
+### Reading a feed
+
+`format = "xml"` maps the document onto the value tree like this:
+
+| XML | value tree |
+|---|---|
+| `<title>Hello</title>` | `{"title": "Hello"}` |
+| repeated siblings `<item>…</item>` | `{"item": [ … ]}` |
+| `<link href="…"/>` | `{"link": {"@href": "…"}}` |
+| `<title type="html">Hi</title>` | `{"title": {"@type": "html", "#text": "Hi"}}` |
+| `content:encoded` | `{"content_encoded": …, "encoded": …}` |
+
+Rules worth knowing:
+
+- **The root element keeps its name.** An RSS document starts at `rss.channel`,
+  an Atom document at `feed`. So `items = "rss.channel.item"` (`feed.entry`
+  for Atom).
+- **Repeated elements become an array**; a single one stays an object, and
+  `items` accepts either — a feed with exactly one entry still renders.
+- **Attributes are `@name`**, and a value that is an object renders its own text
+  (or its `@href`) rather than a JSON blob, so `guid` and a single Atom
+  `<link/>` both display something readable. Use `guid.#text` to be explicit.
+- **Namespaces become underscores**: `dc:creator` is at `dc_creator`, and also
+  at `creator` when that name is unambiguous. `<atom:link>` sits beside `<link>`
+  as `atom_link`, so `channel.link` stays the plain URL.
+- **Indentation and entities are cleaned**: whitespace collapses, `&amp;` and
+  `&#8217;` decode, CDATA counts as text, and `strip_html` removes the `<p>`/
+  `<a href>` markup that RSS descriptions are full of.
+- **Malformed feeds degrade instead of disappearing**: a dangling `&`, a
+  truncated body, comments, DTDs and unknown entities are all tolerated. A body
+  that yields no elements at all is an error, and the log line says what
+  arrived.
+
+Worked example — Arch Linux news (an RSS 2.0 feed), showing the headline list
+plus a scrolled article view:
+
+```toml
+[providers.custom.archnews]
+enabled = true
+source = "https://archlinux.org/feeds/news/"
+format = "xml"
+header = "User-Agent: ss-oled/1.0"
+items = "rss.channel.item"
+max_items = 10
+article = true
+fields = ["title: - | s=M", "pubDate: Date | a=R s=S"]
+article_fields = ["description: -"]
+```
+
+The alternative is `format = "auto"` (or simply omitting the key, which is the
+default): a body starting with `<` is read as XML, anything else as JSON. `auto`
+leaves `strip_html` off, so set the format explicitly for a feed.
+
+Two hotkeys drive an `items` provider: Ctrl+Alt+Left/Right step between
+elements, Ctrl+Alt+Up/Down scroll the article. If the panel shows NO DATA,
+check the journal — the fetch logs `custom: read xml body (… bytes)` and either
+`items 'rss.channel.item' -> N of M elements kept` or the list of top-level keys
+it found instead, which is usually enough to see a wrong path immediately.
 
 ## Testing without hardware
 

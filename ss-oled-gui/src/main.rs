@@ -10,6 +10,7 @@
 //!   Apply  — write file AND restart the daemon
 
 use anyhow::Result;
+use ss_oled_feeds::{self as feeds, Format};
 use std::path::PathBuf;
 
 // ---------- settings.toml model ----------
@@ -435,7 +436,11 @@ impl App {
 
     /// Fire a background GET against `source` with the optional header;
     /// result lands in self.api_test for the poll loop to collect.
-    fn test_api(&mut self, source: &str, header: &str) {
+    ///
+    /// `format` is carried into the thread because the body is decoded there:
+    /// for XML the useful preview is the path structure the field specs have to
+    /// address, not the raw markup.
+    fn test_api(&mut self, source: &str, header: &str, format: Format) {
         use std::sync::mpsc;
         if source.is_empty() {
             self.status = "API test: endpoint is empty".into();
@@ -462,10 +467,13 @@ impl App {
                     .map_err(|e| format!("{e}"))?
                     .into_string()
                     .map_err(|e| format!("read failed: {e}"))?;
-                // Pretty-print JSON when possible for the preview.
-                match serde_json::from_str::<serde_json::Value>(&body) {
-                    Ok(v) => serde_json::to_string_pretty(&v).map_err(|e| e.to_string()),
-                    Err(_) => Ok(body.chars().take(2000).collect()),
+                // Validate that the body decodes successfully with the given format.
+                match feeds::decode(&body, format) {
+                    Ok(_) => Ok(body),
+                    Err(e) => Err(format!(
+                        "{e} — body starts {:?}",
+                        body.trim_start().chars().take(120).collect::<String>()
+                    )),
                 }
             })();
             let _ = tx.send(result);
@@ -639,6 +647,15 @@ impl App {
             };
         }
         table.insert(parts[parts.len() - 1].to_string(), val);
+    }
+
+    fn push_field(&mut self, path: &str, field_str: &str) {
+        let mut arr = match self.get_value_owned(path) {
+            Some(toml::Value::Array(a)) => a,
+            _ => Vec::new(),
+        };
+        arr.push(toml::Value::String(field_str.to_string()));
+        self.set_value(path, toml::Value::Array(arr));
     }
 }
 
@@ -1276,8 +1293,8 @@ fn eightball_editor(ui: &mut egui::Ui, app: &mut App) {
          provider: it never enters the rotation and has no dwell or priority.",
     );
     ui.label(
-        "The ball animates while the answer is fetched, then shows the reading \
-         beside it. Requests are made only when the key is pressed.",
+        "The ball spins briefly, then shows the reading beside it. Answers are generated \
+         locally, so it works offline and replies instantly.",
     );
 
     ui.separator();
@@ -1311,21 +1328,9 @@ fn eightball_editor(ui: &mut egui::Ui, app: &mut App) {
 
     ui.separator();
     ui.label("Source");
-    let mut url = app.get_str("eightball.url");
-    if url.is_empty() {
-        url = "https://eightballapi.com/api?locale=en".into();
-    }
-    ui.horizontal(|ui| {
-        ui.label("URL:");
-        ui.text_edit_singleline(&mut url);
-        if ui.button("Reset").clicked() {
-            url = "https://eightballapi.com/api?locale=en".into();
-            app.set_str("eightball.url", &url);
-        }
-    });
     ui.label(
-        "The API returns 403 without a User-Agent header; the daemon always \
-         sends one, so no key or token is needed.",
+        "The classic 20 Magic 8-Ball answers, picked uniformly at random on this machine. \
+         No network request is made.",
     );
     ui.label("Restart the daemon for changes to take effect.");
 }
@@ -1940,7 +1945,7 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
 
     ui.horizontal(|ui| {
         ui.label(format!("{name} —"));
-        ui.colored_label(egui::Color32::LIGHT_BLUE, "custom JSON-API screen");
+        ui.colored_label(egui::Color32::LIGHT_BLUE, "custom API screen — JSON, XML/RSS");
     });
     ui.add_space(4.0);
 
@@ -2061,21 +2066,126 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
             app.test_api(
                 &s.trim().to_string(),
                 &app.get_str(&format!("{base}.header")),
+                Format::parse(&app.get_str(&format!("{base}.format"))),
             );
         }
     });
-    // Live API test result (raw JSON preview) polled from background thread.
+    // Format + HTML stripping. Read from the document each frame, so switching
+    // either one takes effect for the next Test/preview without a save.
+    ui.horizontal(|ui| {
+        ui.label("Response:")
+            .on_hover_text("How the response body is read. Auto sniffs it: a leading '<' means XML.");
+        let current = Format::parse(&app.get_str(&format!("{base}.format")));
+        let mut chosen = current;
+        egui::ComboBox::from_id_source(("custom-format", name))
+            .selected_text(match current {
+                Format::Auto => "Auto (sniff)",
+                Format::Json => "JSON",
+                Format::Xml => "XML / RSS / Atom",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut chosen, Format::Auto, "Auto (sniff)");
+                ui.selectable_value(&mut chosen, Format::Json, "JSON");
+                ui.selectable_value(&mut chosen, Format::Xml, "XML / RSS / Atom");
+            });
+        if chosen != current {
+            app.set_str(&format!("{base}.format"), chosen.as_str());
+            app.status = format!("Response format set to {}", chosen.as_str());
+        }
+
+        ui.add_space(8.0);
+        if ui.selectable_label(current == Format::Json, "JSON").clicked() {
+            app.set_str(&format!("{base}.format"), "json");
+            app.status = "Response format set to JSON".into();
+        }
+        if ui.selectable_label(current == Format::Xml, "XML").clicked() {
+            app.set_str(&format!("{base}.format"), "xml");
+            app.status = "Response format set to XML".into();
+        }
+
+        // Show the EFFECTIVE value rather than whether the key is present: the
+        // default follows the format, so an unchecked box beside a feed would
+        // misrepresent what the daemon does.
+        let effective = app
+            .get_value(&format!("{base}.strip_html"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| feeds::default_strip_html(current));
+        let mut strip = effective;
+        if ui
+            .checkbox(&mut strip, "Strip HTML")
+            .on_hover_text(
+                "Removes <p>/<a href> markup from the text. Defaults to on for XML feeds, off for JSON.",
+            )
+            .changed()
+        {
+            app.set_bool(&format!("{base}.strip_html"), strip);
+        }
+    });
+
+    // XML preset helper buttons
+    let current_fmt = Format::parse(&app.get_str(&format!("{base}.format")));
+    if current_fmt == Format::Xml {
+        ui.horizontal(|ui| {
+            ui.label("XML Presets:");
+            if ui.button("RSS 2.0 News")
+                .on_hover_text("Set items = rss.channel.item, fields = title + pubDate, article description")
+                .clicked()
+            {
+                app.set_str(&format!("{base}.items"), "rss.channel.item");
+                app.set_bool(&format!("{base}.article"), true);
+                app.set_bool(&format!("{base}.strip_html"), true);
+                let fields_val = toml::Value::Array(vec![
+                    toml::Value::String("title: - | s=M".into()),
+                    toml::Value::String("pubDate: Date | a=R s=S".into()),
+                ]);
+                app.set_value(&format!("{base}.fields"), fields_val);
+                let detail_fields_val = toml::Value::Array(vec![
+                    toml::Value::String("description: -".into()),
+                ]);
+                app.set_value(&format!("{base}.detail.fields"), detail_fields_val);
+                app.status = "Applied RSS 2.0 News preset".into();
+            }
+            if ui.button("Atom Feed")
+                .on_hover_text("Set items = feed.entry, fields = title + updated, article content")
+                .clicked()
+            {
+                app.set_str(&format!("{base}.items"), "feed.entry");
+                app.set_bool(&format!("{base}.article"), true);
+                app.set_bool(&format!("{base}.strip_html"), true);
+                let fields_val = toml::Value::Array(vec![
+                    toml::Value::String("title: - | s=M".into()),
+                    toml::Value::String("updated: Date | a=R s=S".into()),
+                ]);
+                app.set_value(&format!("{base}.fields"), fields_val);
+                let detail_fields_val = toml::Value::Array(vec![
+                    toml::Value::String("content: -".into()),
+                ]);
+                app.set_value(&format!("{base}.detail.fields"), detail_fields_val);
+                app.status = "Applied Atom Feed preset".into();
+            }
+        });
+    }
+
+    // Live API test result (decoded tree, pretty-printed) polled from a thread.
     if let Some(result) = app.take_api_result() {
+        let format = Format::parse(&app.get_str(&format!("{base}.format")));
         match result {
             Ok(body) => {
                 app.api_preview = Some(body.clone());
                 // A fresh response is exactly when the user wants to read it.
                 app.show_api_response = true;
                 // Auto-suggest field rows from the response structure.
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                    app.api_suggested = Some(suggest_fields(&v));
+                match feeds::decode(&body, format) {
+                    Ok(v) => {
+                        app.api_suggested = Some(suggest_fields(&v));
+                        app.status = format!(
+                            "API OK ({} bytes, read as {})",
+                            body.len(),
+                            feeds::resolve(&body, format).as_str()
+                        );
+                    }
+                    Err(e) => app.status = format!("API returned something unusable: {e}"),
                 }
-                app.status = format!("API OK ({} bytes)", body.len());
             }
             Err(e) => {
                 app.status = format!("API test failed: {e}");
@@ -2101,7 +2211,22 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
 
     ui.add_space(6.0);
     ui.separator();
-    ui.label("Fields — JSON path : label");
+    ui.label("Fields — path : label");
+    let current_fmt = Format::parse(&app.get_str(&format!("{base}.format")));
+    if current_fmt == Format::Xml {
+        ui.horizontal(|ui| {
+            ui.colored_label(egui::Color32::GRAY, "Quick XML fields:");
+            if ui.button("+ title").clicked() {
+                app.push_field(&format!("{base}.fields"), "title: - | s=M");
+            }
+            if ui.button("+ pubDate").clicked() {
+                app.push_field(&format!("{base}.fields"), "pubDate: Date | a=R s=S");
+            }
+            if ui.button("+ description").clicked() {
+                app.push_field(&format!("{base}.fields"), "description: -");
+            }
+        });
+    }
     edit_fields_table(ui, app, &base, "fields");
 
     // ---- List mode ----------------------------------------------------
@@ -2135,37 +2260,38 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     }
 
     if list_on {
-    ui.horizontal(|ui| {
-        ui.label("Array path:");
-        let path = format!("{base}.items");
-        let mut v = app.get_str(&path);
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut v)
-                    .desired_width(160.0)
-                    .hint_text("e.g. hits — blank for a single object"),
-            )
-            .on_hover_text(
-                "JSON path to the array to iterate. Each element renders as its own screen.",
-            )
-            .changed()
-        {
-            app.set_str(&path, v.trim());
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.label("Max items:");
-        let path = format!("{base}.max_items");
-        let mut n = app.get_int(&path).max(1) as i32;
-        if ui
-            .add(egui::DragValue::new(&mut n).clamp_range(1..=200))
-            .on_hover_text("How many array elements to keep from the response")
-            .changed()
-        {
-            app.set_int(&path, n as i64);
-        }
-    });
-
+        ui.horizontal(|ui| {
+            ui.label("Array path:");
+            let path = format!("{base}.items");
+            let mut v = app.get_str(&path);
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut v)
+                        .desired_width(160.0)
+                        .hint_text("e.g. hits — or rss.channel.item for a feed"),
+                )
+                .on_hover_text(
+                    "Path to the array to iterate — each element renders as its own screen. \
+                     JSON: hits.  XML/RSS: rss.channel.item (a feed with one item works too).",
+                )
+                .changed()
+            {
+                app.set_str(&path, v.trim());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Max items:");
+            let path = format!("{base}.max_items");
+            let raw = app.get_int(&path);
+            let mut n = if raw <= 0 { 10 } else { raw as i32 };
+            if ui
+                .add(egui::DragValue::new(&mut n).clamp_range(1..=200))
+                .on_hover_text("How many array elements to keep from the response")
+                .changed()
+            {
+                app.set_int(&path, n as i64);
+            }
+        });
     }
 
     // ---- Secondary screen ---------------------------------------------
@@ -2185,7 +2311,7 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
             app.set_bool(&format!("{base}.article"), article_on);
         }
         if article_on {
-            edit_fields_table(ui, app, &base, "article_fields");
+            edit_fields_table(ui, app, &base, "detail.fields");
             ui.label("Shown after Ctrl+Alt+Numpad0, scrolled with Ctrl+Alt+Up/Down.");
         } else {
             ui.label("   Ctrl+Alt+Left / Right move between items.");
@@ -2198,9 +2324,13 @@ fn custom_provider_editor(ui: &mut egui::Ui, app: &mut App, name: &str) {
     ui.add_space(6.0);
     ui.separator();
     if app.api_preview.is_some() {
-        let pretty = serde_json::from_str::<serde_json::Value>(&app.api_preview.clone().unwrap())
-            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
-            .unwrap_or_else(|_| app.api_preview.clone().unwrap());
+        let body = app.api_preview.clone().unwrap_or_default();
+        let format = Format::parse(&app.get_str(&format!("{base}.format")));
+        // Decode with the provider's own format so an XML feed previews as the
+        // path tree the field specs address, not as raw markup.
+        let pretty = feeds::decode(&body, format)
+            .and_then(|v| serde_json::to_string_pretty(&v).map_err(|e| anyhow::anyhow!("{e}")))
+            .unwrap_or_else(|e| format!("[could not decode: {e}]\n\n{}", body));
         // egui 0.27's CollapsingHeader has no `show_open`; toggling the header
         // updates the flag, and the flag drives `default_open` next frame.
         let resp = egui::CollapsingHeader::new("Last API response")
@@ -2818,7 +2948,12 @@ fn custom_oled_preview(ui: &mut egui::Ui, app: &App, base: &str, rows: &[FieldRo
             y = 2;
         }
 
-        let Some(values) = preview_values_from_last_response(app, rows) else {
+        let Some(values) = preview_values_from_last_response(
+            app,
+            base,
+            rows,
+            Format::parse(&app.get_str(&format!("{base}.format"))),
+        ) else {
             draw_preview_text(
                 painter,
                 rect,
@@ -2972,10 +3107,23 @@ fn custom_oled_preview(ui: &mut egui::Ui, app: &App, base: &str, rows: &[FieldRo
 
 fn preview_values_from_last_response(
     app: &App,
+    base: &str,
     rows: &[FieldRow],
+    format: Format,
 ) -> Option<Vec<(String, String)>> {
     let body = app.api_preview.as_ref()?;
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let json: serde_json::Value = feeds::decode(body, format).ok()?;
+    let items_path = app.get_str(&format!("{base}.items"));
+    let target = if !items_path.trim().is_empty() {
+        match feeds::get_path(&json, items_path.trim()) {
+            Some(serde_json::Value::Array(arr)) => arr.first().unwrap_or(&json),
+            Some(single @ serde_json::Value::Object(_)) => single,
+            _ => &json,
+        }
+    } else {
+        &json
+    };
+
     let mut values = Vec::new();
     for row in rows
         .iter()
@@ -2985,39 +3133,13 @@ fn preview_values_from_last_response(
         let value = if row.path.trim().is_empty() {
             "—".to_string()
         } else {
-            preview_get_path(&json, row.path.trim())
-                .map(preview_value_to_string)
+            feeds::get_path(target, row.path.trim())
+                .map(feeds::value_to_text)
                 .unwrap_or_else(|| "—".to_string())
         };
         values.push((label, value));
     }
     Some(values)
-}
-
-fn preview_get_path<'a>(json: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    let mut cur = json;
-    for seg in path.split('.') {
-        if seg.is_empty() {
-            continue;
-        }
-        if let Some((key, idx)) = seg.split_once('[') {
-            if !key.is_empty() {
-                cur = cur.get(key.trim_end_matches('['))?;
-            }
-            let idx: usize = idx.trim_end_matches(']').parse().ok()?;
-            cur = cur.get(idx)?;
-        } else {
-            cur = cur.get(seg)?;
-        }
-    }
-    Some(cur)
-}
-
-fn preview_value_to_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
 }
 
 /// Mirror of the daemon's `FieldSize::resolve`, so the live OLED preview
@@ -3163,7 +3285,7 @@ fn strip_root(path: &str, root: &str) -> String {
 
 fn suggest_fields(v: &serde_json::Value) -> Vec<(String, String)> {
     fn walk(v: &serde_json::Value, prefix: &str, depth: usize, out: &mut Vec<(String, String)>) {
-        if out.len() >= 12 {
+        if out.len() >= 100 {
             return;
         }
         match v {

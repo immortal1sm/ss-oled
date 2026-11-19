@@ -15,6 +15,9 @@ rfd = "0.13"
 toml = "0.8"
 ureq = "2"
 serde_json = "1"
+# One decoder for the daemon and the GUI. A second copy here would drift from
+# what the daemon actually renders (see the shared-editor notes).
+ss-oled-feeds = { path = "../ss-oled-feeds" }
 
 [dev-dependencies]
 # The recorder writes binding strings the daemon parses; the round-trip test
