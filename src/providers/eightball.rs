@@ -2,7 +2,7 @@
 use anyhow::Result;
 use async_stream::try_stream;
 use futures::Stream;
-use log::{debug, info, warn};
+use log::info;
 use std::{sync::LazyLock, time::Duration};
 
 use crate::render::{
@@ -17,9 +17,37 @@ use crate::render::{
 use config::Config;
 use linkme::distributed_slice;
 
-/// The API 403s unless a User-Agent is sent, so this is required, not cosmetic.
-const USER_AGENT: &str = "ss-oled/1.0";
-const DEFAULT_URL: &str = "https://eightballapi.com/api?locale=en";
+/// The classic 20 Magic 8-Ball answers, generated locally.
+///
+/// No network: a reading is one uniform random pick from this table, so the
+/// overlay works offline and answers in nanoseconds instead of a cloud
+/// round-trip. The set is the standard one — 10 affirmative, 5 non-committal,
+/// 5 negative — all ASCII, so every glyph has a panel font entry.
+const ANSWERS: [&str; 20] = [
+    // Affirmative
+    "It is certain",
+    "It is decidedly so",
+    "Without a doubt",
+    "Yes definitely",
+    "You may rely on it",
+    "As I see it, yes",
+    "Most likely",
+    "Outlook good",
+    "Yes",
+    "Signs point to yes",
+    // Non-committal
+    "Reply hazy, try again",
+    "Ask again later",
+    "Better not tell you now",
+    "Cannot predict now",
+    "Concentrate and ask again",
+    // Negative
+    "Don't count on it",
+    "My reply is no",
+    "My sources say no",
+    "Outlook not so good",
+    "Very doubtful",
+];
 
 #[distributed_slice(NOTIFICATION_PROVIDERS)]
 static PROVIDER_INIT: fn() -> Result<Box<dyn NotificationWrapper>> = register_callback;
@@ -44,7 +72,7 @@ static REQUESTED: LazyLock<std::sync::atomic::AtomicBool> =
     LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
 
 /// Called from the hotkey handler. Returns false if a request is already in
-/// flight, so holding the key down cannot queue a pile of duplicate fetches.
+/// flight, so holding the key down cannot queue a pile of duplicate requests.
 pub fn request() -> bool {
     REQUESTED
         .compare_exchange(
@@ -232,7 +260,6 @@ fn still_badge() -> Badge {
 }
 
 pub struct EightBall {
-    url: String,
     duration_seconds: u64,
     layout: crate::render::notifications::Layout,
 }
@@ -312,9 +339,6 @@ impl EightBall {
             });
         }
         Self {
-            url: settings
-                .get_str("eightball.url")
-                .unwrap_or_else(|_| DEFAULT_URL.to_string()),
             // Clamped so a typo cannot wedge the display for an hour.
             duration_seconds: settings
                 .get_int("eightball.duration")
@@ -334,24 +358,12 @@ impl EightBall {
     }
 }
 
-/// Fetch one reading. Runs inside `spawn_blocking` by the caller: `ureq` is
-/// synchronous, and blocking the reactor would stall the whole render loop for
-/// the duration of the request.
-fn fetch(url: String) -> Result<String> {
-    let body: serde_json::Value = ureq::get(&url)
-        .set("User-Agent", USER_AGENT)
-        .timeout(Duration::from_secs(8))
-        .call()?
-        .into_json()?;
-    let reading = body
-        .get("reading")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("8ball response had no 'reading' field"))?;
-    let reading = reading.trim();
-    if reading.is_empty() {
-        anyhow::bail!("8ball returned an empty reading");
-    }
-    Ok(reading.to_string())
+/// Pick one reading locally: a uniform draw from the classic answer table.
+/// Nanoseconds and zero I/O, so it runs directly on the reactor — no
+/// `spawn_blocking` hop the way the synchronous cloud fetch needed.
+fn local_reading() -> &'static str {
+    use rand::Rng;
+    ANSWERS[rand::rng().random_range(0..ANSWERS.len())]
 }
 
 impl NotificationProvider for EightBall {
@@ -360,8 +372,7 @@ impl NotificationProvider for EightBall {
     where
         Self: 'a;
 
-    /// Idle until a request arrives, then show the spin while fetching and the
-    /// reading once it lands.
+    /// Idle until a request arrives, then a brief spin and the reading.
     ///
     /// The spin is a SEPARATE notification from the reading, not a badge
     /// update on one long-lived notification: `Notification` is immutable
@@ -369,7 +380,6 @@ impl NotificationProvider for EightBall {
     /// text without tearing down the stream mid-await. Each is short, so the
     /// scheduler's overlay rules apply unchanged.
     fn stream(&mut self) -> Result<Self::NotificationStream<'_>> {
-        let url = self.url.clone();
         let duration_seconds = self.duration_seconds;
         let layout = self.layout.clone();
         Ok(try_stream! {
@@ -384,15 +394,15 @@ impl NotificationProvider for EightBall {
 
                 // --- spinner phase ---
                 // A short held notification whose only content is the badge.
-                // Its duration doubles as the fetch timeout window: if the
-                // request has not landed by then it yields the reading itself
-                // with whatever arrived, or reports the failure below.
+                // The reading is generated locally and is ready immediately,
+                // so this is pure showmanship: one second of spin before the
+                // reveal, not a fetch timeout window.
                 let spin = NotificationBuilder::new()
                     .with_title("")
                     .with_app_name("8ball")
                     .with_layout(layout.clone())
                     .with_badge(spin_badge())
-                    .with_hold_seconds(2)
+                    .with_hold_seconds(1)
                     .build()?;
                 // Yield the notification itself, not its frames: the
                 // scheduler owns the per-frame loop and the overlay rules. The
@@ -400,30 +410,12 @@ impl NotificationProvider for EightBall {
                 // exactly like any other.
                 yield spin;
 
-                // --- fetch, off the reactor ---
-                // Clone INSIDE the loop: this stream runs forever, so a copy
-                // hoisted above the loop would be moved out on the first pass
-                // and every later request would fail to compile.
-                let url_this_pass = url.clone();
-                let fetched =
-                    tokio::task::spawn_blocking(move || fetch(url_this_pass)).await;
+                // --- reading, generated locally ---
+                // One uniform pick from the classic answer table: no network,
+                // no blocking task, no failure path.
+                let reading = local_reading();
                 complete();
-
-                let reading = match fetched {
-                    Ok(Ok(text)) => text,
-                    Ok(Err(e)) => {
-                        // Logged, not displayed: the user asked for the live
-                        // API, and a fabricated or canned answer on failure
-                        // would be worse than nothing appearing.
-                        warn!("8ball fetch failed: {e}");
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("8ball fetch task failed: {e}");
-                        continue;
-                    }
-                };
-                debug!("8ball reading: {reading}");
+                info!("8ball reading: {reading}");
 
                 // The reading goes in the BODY, not the title. The title is a
                 // single horizontally-scrolling line by design, so a long answer
@@ -431,7 +423,7 @@ impl NotificationProvider for EightBall {
                 // fixed size, which is what is wanted here.
                 let notif = NotificationBuilder::new()
                     .with_title("")
-                    .with_content(reading.clone())
+                    .with_content(reading)
                     .with_app_name("8ball")
                     .with_layout(layout.clone())
                     .with_badge(still_badge())
@@ -440,5 +432,75 @@ impl NotificationProvider for EightBall {
                 yield notif;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[test]
+    fn answer_set_is_the_classic_twenty() {
+        assert_eq!(ANSWERS.len(), 20);
+        let mut sorted = ANSWERS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 20, "duplicate answer");
+        for a in ANSWERS {
+            assert!(!a.is_empty());
+            assert!(a.is_ascii(), "non-ASCII glyph would render blank: {a}");
+        }
+    }
+
+    #[test]
+    fn every_pick_is_a_member() {
+        for _ in 0..1_000 {
+            assert!(ANSWERS.contains(&local_reading()));
+        }
+    }
+
+    #[test]
+    fn distribution_covers_all_answers() {
+        let mut counts = [0u32; 20];
+        for _ in 0..20_000 {
+            let r = local_reading();
+            counts[ANSWERS.iter().position(|a| *a == r).unwrap()] += 1;
+        }
+        // Expected 1000 per answer; a uniform draw lands well inside this band.
+        for (a, c) in ANSWERS.iter().zip(counts) {
+            assert!((600..=1_400).contains(&c), "{a}: {c} draws");
+        }
+    }
+
+    #[test]
+    fn generation_cost_is_nanoseconds() {
+        let n = 100_000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(local_reading());
+        }
+        let ns_per = t.elapsed().as_nanos() as f64 / f64::from(n);
+        println!("local_reading: {ns_per:.0} ns/op over {n} draws");
+        assert!(ns_per < 10_000.0, "{ns_per} ns/op is not local-cheap");
+    }
+
+    #[tokio::test]
+    async fn stream_yields_spin_then_reading() {
+        let mut eb = EightBall::from_settings(&Config::default());
+        let stream = eb.stream().unwrap();
+        futures::pin_mut!(stream);
+        assert!(request(), "flag should start clear");
+        let t = std::time::Instant::now();
+        let spin = stream.next().await.unwrap().unwrap();
+        let reading = stream.next().await.unwrap().unwrap();
+        let elapsed = t.elapsed();
+        complete();
+        // The reading holds longer than the spin, so its timeout budget is
+        // strictly larger; both carry the +3s scheduling slack.
+        assert!(spin.expected_duration() < reading.expected_duration());
+        // No network in the path: the pair lands within a few poll ticks.
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+        println!("request -> spin -> reading in {elapsed:?}");
     }
 }
